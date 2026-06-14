@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the backend with the ParaS compiler.
 #
-#   scripts/build.sh [cpu|cuda] [Release|Debug]
+#   scripts/build.sh [cpu|cuda]
 #
 # Build trees: build/<flavor>. The produced extension is copied to
 # python/torch_paras/_C.so, so the most recently built flavor is the one
