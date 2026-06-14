@@ -1,4 +1,4 @@
-# torch-paras
+# Torch-ParaS
 
 A PyTorch out-of-tree backend for the ParaS SYCL compiler. It registers a
 `paras` device with PyTorch, so existing models run on the ParaS runtime
