@@ -504,10 +504,6 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
         torch::CppFunction::makeFromBoxedFunction<&ptsycl::fallback>());
 }
 
-// Ops invoked on tensors that require grad dispatch through the autograd key
-// first; without a fallthrough there, even inference-only calls (e.g.
-// Module.to() moving parameters) fail before reaching the backend kernels.
-// Specific autograd implementations registered elsewhere take precedence.
 TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
     m.fallback(torch::CppFunction::makeFallthrough());
 }
