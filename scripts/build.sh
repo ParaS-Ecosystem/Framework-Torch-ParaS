@@ -24,8 +24,12 @@ BUILD_DIR="${REPO_ROOT}/build/${FLAVOR}"
 mkdir -p "${BUILD_DIR}"
 
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
-if ! command -v "${CMAKE_BIN}" >/dev/null; then
-    CMAKE_BIN=/storage/aniket/binaries/cmake-3.30.9/bin/cmake
+
+if ! command -v "${CMAKE_BIN}" >/dev/null 2>&1; then
+    echo "Error: CMake not found."
+    echo "Please install CMake or set CMAKE_BIN to the CMake executable."
+    echo "Example: export CMAKE_BIN=/path/to/cmake"
+    exit 1
 fi
 
 "${CMAKE_BIN}" -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
