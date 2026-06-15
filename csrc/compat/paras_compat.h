@@ -1,20 +1,19 @@
 // -----------------------------------------------------------------------------
-// This file is part of Torch_ParaS, an out-of-tree PyTorch backend for the
-// ParaS SYCL Compiler.
+// Copyright (c) 2026 Centre for Development of Advanced Computing (C-DAC)
 //
-// Torch_ParaS extends PyTorch with a `paras` device, enabling existing
-// PyTorch models and workloads to execute on ParaS-supported devices through
-// the ParaS runtime without requiring application code changes.
+// This file is part of Torch_ParaS, a component of the ParaS Ecosystem
 //
-// By providing seamless integration between PyTorch and the ParaS Compiler,
-// Torch_ParaS enables portable, scalable, and high-performance execution
-// across heterogeneous computing platforms.
+// This library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License (LGPL)
+// version 3 as published by the Free Software Foundation.
 //
-// Copyright (C) The Torch_ParaS Contributors
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU Lesser General Public License for more details.
 //
-// Torch_ParaS is distributed under the GNU Lesser General Public License
-// (LGPL) v3. See the LICENSE file in the project root directory for complete
-// license terms and conditions.
+// You should have received a copy of the GNU Lesser General Public License
+// along with this library. If not, see <https://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
 
