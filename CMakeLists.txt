@@ -1,13 +1,10 @@
-# PyTorch backend for the ParaS SYCL compiler.
+# PyTorch backend for the ParaS compiler.
 #
 # The C++ compiler must be parascc; scripts/build.sh sets it together with
 # the toolchain environment. Two build flavors exist:
 #
 #   -DPTSYCL_DEVICE=cpu          ParaS CPU engine (kem threadpool)
 #   -DPTSYCL_DEVICE=cuda:sm_70   CUDA kernels through -parasdevice
-#
-# parascc writes second-resolution temp files under /tmp, so compile jobs
-# must not run in parallel (build.sh enforces -j1).
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -91,8 +88,6 @@ target_compile_definitions(torch_paras_C PRIVATE
     TORCH_EXTENSION_NAME=_C
 )
 
-# parascc compiles a preprocessed copy of each source from /tmp, which breaks
-# source-relative quoted includes; all project includes are rooted at csrc/.
 target_include_directories(torch_paras_C PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
 )
@@ -133,8 +128,6 @@ if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_CUDA")
     target_link_directories(torch_paras_C PRIVATE "${PTSYCL_CUDA_HOME}/lib64")
     target_link_libraries(torch_paras_C PRIVATE cudart)
     list(APPEND PTSYCL_RPATHS "${PTSYCL_CUDA_HOME}/lib64")
-    # The link step must also run in -parasdevice mode so the driver keeps
-    # the CUDA runtime pieces consistent with the objects.
     target_link_options(torch_paras_C PRIVATE ${PTSYCL_DEVICE_FLAGS})
 endif()
 
