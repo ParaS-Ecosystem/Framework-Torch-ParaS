@@ -1,3 +1,23 @@
+// -----------------------------------------------------------------------------
+// This file is part of Torch_ParaS, an out-of-tree PyTorch backend for the
+// ParaS SYCL Compiler.
+//
+// Torch_ParaS extends PyTorch with a `paras` device, enabling existing
+// PyTorch models and workloads to execute on ParaS-supported devices through
+// the ParaS runtime without requiring application code changes.
+//
+// By providing seamless integration between PyTorch and the ParaS Compiler,
+// Torch_ParaS enables portable, scalable, and high-performance execution
+// across heterogeneous computing platforms.
+//
+// Copyright (C) The Torch_ParaS Contributors
+//
+// Torch_ParaS is distributed under the GNU Lesser General Public License
+// (LGPL) v3. See the LICENSE file in the project root directory for complete
+// license terms and conditions.
+// -----------------------------------------------------------------------------
+
+
 #pragma once
 
 
