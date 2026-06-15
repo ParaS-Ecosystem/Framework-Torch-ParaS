@@ -10,9 +10,6 @@
 # must not run in parallel (build.sh enforces -j1).
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
-
-# parascc cannot link the cmake try-compile test binary without the full
-# runtime environment; compile a static archive for the sanity check instead.
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 project(torch_paras LANGUAGES CXX)
