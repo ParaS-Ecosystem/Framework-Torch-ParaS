@@ -209,6 +209,54 @@ def test_bitwise_not(device):
              lambda: torch.bitwise_not(da))
 
 
+# --- softmax ------------------------------------------------------------------
+
+def test_softmax_dim1(device):
+    a, _, da, _ = _pair(device)
+    check_op("softmax.dim1", lambda: torch.softmax(a, dim=1),
+             lambda: torch.softmax(da, dim=1))
+
+
+def test_softmax_dim0(device):
+    a, _, da, _ = _pair(device)
+    check_op("softmax.dim0", lambda: torch.softmax(a, dim=0),
+             lambda: torch.softmax(da, dim=0))
+
+
+def test_softmax_last_dim_3d(device):
+    a = torch.randn(2, 3, 7)
+    da = a.to(device)
+    check_op("softmax.3d", lambda: torch.softmax(a, dim=-1),
+             lambda: torch.softmax(da, dim=-1))
+
+
+def test_softmax_negative_dim(device):
+    a, _, da, _ = _pair(device)
+    check_op("softmax.neg_dim", lambda: torch.softmax(a, dim=-1),
+             lambda: torch.softmax(da, dim=-1))
+
+
+def test_softmax_backward(device):
+    a = torch.randn(4, 5, requires_grad=True)
+    da = a.detach().to(device).requires_grad_(True)
+
+    torch.softmax(a, dim=1).sum().backward()
+    torch.softmax(da, dim=1).sum().backward()
+
+    check_op("softmax.backward", lambda: a.grad, lambda: da.grad)
+
+
+def test_softmax_backward_nontrivial_grad(device):
+    a = torch.randn(3, 6, requires_grad=True)
+    da = a.detach().to(device).requires_grad_(True)
+    upstream = torch.randn(3, 6)
+
+    torch.softmax(a, dim=1).backward(upstream)
+    torch.softmax(da, dim=1).backward(upstream.to(device))
+
+    check_op("softmax.backward_nontrivial", lambda: a.grad, lambda: da.grad)
+
+
 # --- structure ----------------------------------------------------------------
 
 def test_cat(device):

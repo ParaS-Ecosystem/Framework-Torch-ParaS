@@ -108,6 +108,53 @@ def test_large_tensor_roundtrip(device):
     assert_close(cpu.to(device).cpu(), cpu, "1M roundtrip")
 
 
+def test_embedding(device):
+    weight = torch.randn(10, 4, dtype=torch.float32)
+    indices = torch.tensor([1, 2, 2, 5, 0, 9])
+    dev_out = torch.nn.functional.embedding(
+        indices.to(device), weight.to(device))
+    cpu_out = torch.nn.functional.embedding(indices, weight)
+    assert_close(dev_out, cpu_out, "embedding")
+
+
+def test_embedding_multi_dim_indices(device):
+    weight = torch.randn(8, 3, dtype=torch.float32)
+    indices = torch.tensor([[0, 1], [2, 3], [4, 5]])
+    dev_out = torch.nn.functional.embedding(
+        indices.to(device), weight.to(device))
+    cpu_out = torch.nn.functional.embedding(indices, weight)
+    assert_close(dev_out, cpu_out, "embedding (multi-dim indices)")
+
+
+def test_embedding_backward(device):
+    indices = torch.tensor([1, 2, 2, 5, 1, 0, 9])
+
+    w_cpu = torch.randn(10, 4, dtype=torch.float32, requires_grad=True)
+    torch.nn.functional.embedding(indices, w_cpu).sum().backward()
+
+    w_dev = w_cpu.detach().to(device).requires_grad_(True)
+    torch.nn.functional.embedding(indices.to(device), w_dev).sum().backward()
+
+    assert_close(w_dev.grad, w_cpu.grad, "embedding backward")
+
+
+def test_embedding_padding_idx_and_freq_scaling(device):
+    indices = torch.tensor([1, 2, 2, 5, 1, 0, 9])
+
+    w_cpu = torch.randn(10, 4, dtype=torch.float32, requires_grad=True)
+    torch.nn.functional.embedding(
+        indices, w_cpu, padding_idx=0, scale_grad_by_freq=True
+    ).sum().backward()
+
+    w_dev = w_cpu.detach().to(device).requires_grad_(True)
+    torch.nn.functional.embedding(
+        indices.to(device), w_dev, padding_idx=0, scale_grad_by_freq=True
+    ).sum().backward()
+
+    assert_close(w_dev.grad, w_cpu.grad,
+                 "embedding backward (padding_idx + scale_grad_by_freq)")
+
+
 def test_cross_device_copy(device):
     import torch_paras
     n = torch_paras.device_count()

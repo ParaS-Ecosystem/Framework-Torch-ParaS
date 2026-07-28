@@ -456,6 +456,104 @@ const Tensor& resize_(const Tensor& self, c10::SymIntArrayRef size,
     return self;
 }
 
+// -----------------------------------------------------------------------------
+// Embedding
+// -----------------------------------------------------------------------------
+Tensor embedding(const Tensor& weight, const Tensor& indices,
+                 c10::SymInt padding_idx, bool /*scale_grad_by_freq*/,
+                 bool sparse) {
+    PTSYCL_TRACE_OP("embedding");
+    TORCH_CHECK(!sparse,
+                "paras: sparse gradients for embedding are not supported");
+    TORCH_CHECK(weight.dim() == 2, "paras embedding: weight must be 2-D");
+    (void)padding_idx; // padding_idx only affects embedding_dense_backward
+
+    auto& q = queue_for(weight);
+    Tensor w   = weight.contiguous();
+    Tensor idx = indices.contiguous();
+    if (idx.scalar_type() != c10::kLong) idx = idx.to(c10::kLong);
+
+    const int64_t dim = w.size(1);
+    const int64_t n   = idx.numel();
+
+    std::vector<int64_t> out_sizes(idx.sizes().begin(), idx.sizes().end());
+    out_sizes.push_back(dim);
+    Tensor out = at::empty(out_sizes, w.options());
+    if (n == 0 || dim == 0) return out;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, w.scalar_type(), "ptsycl_embedding", [&] {
+            const scalar_t* pw = data_ptr<scalar_t>(w);
+            const int64_t*  pi = data_ptr<int64_t>(idx);
+            scalar_t*       po = data_ptr<scalar_t>(out);
+            launch_flat(q, n * dim, [=](std::size_t flat) {
+                const int64_t row   = static_cast<int64_t>(flat) / dim;
+                const int64_t col   = static_cast<int64_t>(flat) % dim;
+                const int64_t w_row = pi[row];
+                po[row * dim + col] = pw[w_row * dim + col];
+            });
+        });
+    return out;
+}
+
+// grad_output has shape indices.sizes() + [dim]; grad_weight has shape
+// [num_weights, dim]. Parallelizing over weight rows (rather than over
+// indices) means every thread owns a disjoint output row, so contributions
+// can be accumulated with a plain read-loop and no atomics are needed. This
+// is O(num_weights * n) and favors correctness over throughput; a
+// sorted-scatter kernel would be the natural follow-up for large
+// vocabularies.
+Tensor embedding_dense_backward(const Tensor& grad_output,
+                                const Tensor& indices,
+                                c10::SymInt num_weights_sym,
+                                c10::SymInt padding_idx_sym,
+                                bool scale_grad_by_freq) {
+    PTSYCL_TRACE_OP("embedding_dense_backward");
+    const int64_t num_weights = num_weights_sym.guard_int(__FILE__, __LINE__);
+    const int64_t padding_idx = padding_idx_sym.guard_int(__FILE__, __LINE__);
+
+    auto& q    = queue_for(grad_output);
+    Tensor go  = grad_output.contiguous();
+    Tensor idx = indices.contiguous();
+    if (idx.scalar_type() != c10::kLong) idx = idx.to(c10::kLong);
+
+    const int64_t dim = go.size(-1);
+    const int64_t n   = idx.numel();
+
+    Tensor grad_weight = at::zeros({num_weights, dim}, go.options());
+    if (n == 0 || dim == 0 || num_weights == 0) return grad_weight;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, go.scalar_type(),
+        "ptsycl_embedding_backward", [&] {
+            const scalar_t* pg = data_ptr<scalar_t>(go);
+            const int64_t*  pi = data_ptr<int64_t>(idx);
+            scalar_t*       pw = data_ptr<scalar_t>(grad_weight);
+
+            launch_flat(q, num_weights, [=](std::size_t flat) {
+                const int64_t w = static_cast<int64_t>(flat);
+                if (w == padding_idx) return;
+
+                int64_t count = 0;
+                for (int64_t i = 0; i < n; ++i)
+                    if (pi[i] == w) ++count;
+                if (count == 0) return;
+
+                const double scale =
+                    scale_grad_by_freq ? 1.0 / static_cast<double>(count)
+                                       : 1.0;
+                for (int64_t col = 0; col < dim; ++col) {
+                    double acc = 0.0;
+                    for (int64_t i = 0; i < n; ++i)
+                        if (pi[i] == w)
+                            acc += static_cast<double>(pg[i * dim + col]);
+                    pw[w * dim + col] = static_cast<scalar_t>(acc * scale);
+                }
+            });
+        });
+    return grad_weight;
+}
+
 bool _has_compatible_shallow_copy_type(const Tensor& self,
                                        const Tensor& from) {
     auto dense = [](c10::DispatchKeySet ks) {
@@ -497,6 +595,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::resize_", &ptsycl::resize_);
     m.impl("aten::_has_compatible_shallow_copy_type",
            &ptsycl::_has_compatible_shallow_copy_type);
+    m.impl("aten::embedding", &ptsycl::embedding);
+    m.impl("aten::embedding_dense_backward",
+           &ptsycl::embedding_dense_backward);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
@@ -507,3 +608,9 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
 TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
     m.fallback(torch::CppFunction::makeFallthrough());
 }
+
+
+
+
+
+

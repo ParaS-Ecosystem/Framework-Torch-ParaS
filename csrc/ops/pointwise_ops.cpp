@@ -904,6 +904,153 @@ Tensor& argmax_out(const Tensor& self, std::optional<int64_t> dim,
     return out;
 }
 
+// --- softmax --------------------------------------------------------------------
+// _softmax(self, dim, half_to_float): numerically-stable softmax along one
+// dim. half_to_float means self is fp16/bf16 and the result must be fp32;
+// otherwise output dtype matches input dtype. Reuses the same kept/red
+// StridedSpec split as the reductions above, computed separately for the
+// input and output tensors since they can have different strides (and, in
+// the half_to_float case, different dtypes/sizes-in-bytes).
+Tensor& softmax_out(const Tensor& self, int64_t dim, bool /*half_to_float*/,
+                    Tensor& out) {
+    PTSYCL_TRACE_OP("_softmax.out");
+    auto& q = queue_for(self);
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    const auto rs_in  = split_dims(self, {d});
+    const auto rs_out = split_dims(out, {d});
+    TORCH_CHECK(rs_in.out_n == rs_out.out_n && rs_in.red_n == rs_out.red_n,
+                "paras softmax: output shape must match input shape");
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_softmax_in",
+        [&] {
+            using in_t = scalar_t;
+            const in_t* pin = data_ptr<in_t>(self);
+            const auto kin = rs_in.kept;
+            const auto rin = rs_in.red;
+            const int64_t red_n = rs_in.red_n;
+            const int64_t out_n = rs_in.out_n;
+
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                c10::kHalf, c10::kBFloat16, out.scalar_type(),
+                "ptsycl_softmax_out", [&] {
+                    using out_t = scalar_t;
+                    out_t* pout = data_ptr<out_t>(out);
+                    const auto kout = rs_out.kept;
+                    const auto rout = rs_out.red;
+
+                    launch_flat(q, out_n, [=](std::size_t o_) {
+                        const int64_t o = static_cast<int64_t>(o_);
+                        const int64_t base_in  = kin.index(o);
+                        const int64_t base_out = kout.index(o);
+
+                        double m = -std::numeric_limits<double>::infinity();
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double v = static_cast<double>(
+                                pin[base_in + rin.index(j)]);
+                            if (v > m) m = v;
+                        }
+                        double sum = 0.0;
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double v = static_cast<double>(
+                                pin[base_in + rin.index(j)]);
+                            sum += std::exp(v - m);
+                        }
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double v = static_cast<double>(
+                                pin[base_in + rin.index(j)]);
+                            pout[base_out + rout.index(j)] =
+                                static_cast<out_t>(std::exp(v - m) / sum);
+                        }
+                    });
+                });
+        });
+    return out;
+}
+
+Tensor softmax(const Tensor& self, int64_t dim, bool half_to_float) {
+    PTSYCL_TRACE_OP("_softmax");
+    const auto out_dtype =
+        half_to_float ? c10::kFloat : self.scalar_type();
+    Tensor out = at::empty(self.sizes(), self.options().dtype(out_dtype));
+    return ptsycl::softmax_out(self, dim, half_to_float, out);
+}
+
+// d(softmax)/dx = y * (dy - sum(dy * y, dim, keepdim=True)); input_dtype is
+// the dtype of the original (pre-upcast) input and is what grad_input must
+// be written back as.
+Tensor& softmax_backward_out(const Tensor& grad_output, const Tensor& output,
+                             int64_t dim, c10::ScalarType /*input_dtype*/,
+                             Tensor& grad_input) {
+    PTSYCL_TRACE_OP("_softmax_backward_data.out");
+    auto& q = queue_for(grad_output);
+    const int64_t d = c10::maybe_wrap_dim(dim, grad_output.dim());
+    const auto rs_go = split_dims(grad_output, {d});
+    const auto rs_y  = split_dims(output, {d});
+    const auto rs_gi = split_dims(grad_input, {d});
+    TORCH_CHECK(rs_go.out_n == rs_y.out_n && rs_go.red_n == rs_y.red_n &&
+                    rs_go.out_n == rs_gi.out_n &&
+                    rs_go.red_n == rs_gi.red_n,
+                "paras softmax backward: shape mismatch");
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, grad_output.scalar_type(),
+        "ptsycl_softmax_bwd_in", [&] {
+            using acc_t = scalar_t;
+            const acc_t* pgo = data_ptr<acc_t>(grad_output);
+            const acc_t* py  = data_ptr<acc_t>(output);
+            const auto kgo = rs_go.kept;
+            const auto rgo = rs_go.red;
+            const auto ky  = rs_y.kept;
+            const auto ry  = rs_y.red;
+            const int64_t red_n = rs_go.red_n;
+            const int64_t out_n = rs_go.out_n;
+
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                c10::kHalf, c10::kBFloat16, grad_input.scalar_type(),
+                "ptsycl_softmax_bwd_out", [&] {
+                    using gi_t = scalar_t;
+                    gi_t* pgi = data_ptr<gi_t>(grad_input);
+                    const auto kgi = rs_gi.kept;
+                    const auto rgi = rs_gi.red;
+
+                    launch_flat(q, out_n, [=](std::size_t o_) {
+                        const int64_t o = static_cast<int64_t>(o_);
+                        const int64_t base_go = kgo.index(o);
+                        const int64_t base_y  = ky.index(o);
+                        const int64_t base_gi = kgi.index(o);
+
+                        double dot = 0.0;
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double dy = static_cast<double>(
+                                pgo[base_go + rgo.index(j)]);
+                            const double y = static_cast<double>(
+                                py[base_y + ry.index(j)]);
+                            dot += dy * y;
+                        }
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double dy = static_cast<double>(
+                                pgo[base_go + rgo.index(j)]);
+                            const double y = static_cast<double>(
+                                py[base_y + ry.index(j)]);
+                            pgi[base_gi + rgi.index(j)] =
+                                static_cast<gi_t>(y * (dy - dot));
+                        }
+                    });
+                });
+        });
+    return grad_input;
+}
+
+Tensor softmax_backward(const Tensor& grad_output, const Tensor& output,
+                        int64_t dim, c10::ScalarType input_dtype) {
+    PTSYCL_TRACE_OP("_softmax_backward_data");
+    Tensor grad_input =
+        at::empty(grad_output.sizes(), grad_output.options().dtype(input_dtype));
+    return ptsycl::softmax_backward_out(grad_output, output, dim,
+                                        input_dtype, grad_input);
+}
+
 // --- concatenation ------------------------------------------------------------------
 Tensor& cat_out(const at::ITensorListRef& tensors, int64_t dim, Tensor& out) {
     PTSYCL_TRACE_OP("cat.out");
@@ -1036,4 +1183,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 
     m.impl("aten::cat.out", &ptsycl::cat_out);
     m.impl("aten::cat", &ptsycl::cat);
+    m.impl("aten::_softmax", &ptsycl::softmax);
+    m.impl("aten::_softmax.out", &ptsycl::softmax_out);
+    m.impl("aten::_softmax_backward_data", &ptsycl::softmax_backward);
+    m.impl("aten::_softmax_backward_data.out",
+           &ptsycl::softmax_backward_out);
 }
