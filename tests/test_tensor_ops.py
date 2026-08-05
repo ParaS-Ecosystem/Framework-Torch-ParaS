@@ -155,6 +155,64 @@ def test_embedding_padding_idx_and_freq_scaling(device):
                  "embedding backward (padding_idx + scale_grad_by_freq)")
 
 
+def test_masked_fill__scalar(device):
+    a = torch.randn(4, 5, dtype=torch.float32)
+    mask = torch.rand(4, 5) > 0.5
+    dev_a = a.to(device)
+    dev_mask = mask.to(device)
+    a.masked_fill_(mask, -1.5)
+    dev_a.masked_fill_(dev_mask, -1.5)
+    assert_close(dev_a, a, "masked_fill_ (scalar)")
+
+
+def test_masked_fill__broadcast_mask(device):
+    a = torch.randn(4, 5, dtype=torch.float32)
+    mask = torch.rand(5) > 0.5  # broadcasts along dim 0
+    dev_a = a.to(device)
+    dev_mask = mask.to(device)
+    a.masked_fill_(mask, 2.25)
+    dev_a.masked_fill_(dev_mask, 2.25)
+    assert_close(dev_a, a, "masked_fill_ (broadcast mask)")
+
+
+def test_masked_fill__tensor_value(device):
+    a = torch.randn(3, 4, dtype=torch.float32)
+    mask = torch.rand(3, 4) > 0.5
+    value = torch.tensor(3.14)
+    dev_a = a.to(device)
+    dev_mask = mask.to(device)
+    a.masked_fill_(mask, value)
+    dev_a.masked_fill_(dev_mask, value.to(device))
+    assert_close(dev_a, a, "masked_fill_ (tensor value)")
+
+
+def test_scatter_src(device):
+    a = torch.randn(5, 6, dtype=torch.float32)
+    index = torch.randint(0, 5, (3, 6))
+    src = torch.randn(3, 6, dtype=torch.float32)
+    cpu_out = torch.scatter(a, 0, index, src)
+    dev_out = torch.scatter(a.to(device), 0, index.to(device), src.to(device))
+    assert_close(dev_out, cpu_out, "scatter (src)")
+
+
+def test_scatter_value(device):
+    a = torch.randn(5, 6, dtype=torch.float32)
+    index = torch.randint(0, 6, (5, 3))
+    cpu_out = torch.scatter(a, 1, index, 7.0)
+    dev_out = torch.scatter(a.to(device), 1, index.to(device), 7.0)
+    assert_close(dev_out, cpu_out, "scatter (value)")
+
+
+def test_scatter__in_place(device):
+    a = torch.randn(5, 6, dtype=torch.float32)
+    index = torch.randint(0, 6, (5, 3))
+    a_cpu = a.clone()
+    a_dev = a.to(device)
+    a_cpu.scatter_(1, index, 7.0)
+    a_dev.scatter_(1, index.to(device), 7.0)
+    assert_close(a_dev, a_cpu, "scatter_ (in-place)")
+
+
 def test_cross_device_copy(device):
     import torch_paras
     n = torch_paras.device_count()
