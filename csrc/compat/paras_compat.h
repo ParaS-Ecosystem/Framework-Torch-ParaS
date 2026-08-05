@@ -25,19 +25,41 @@
 #include <string>
 #include <vector>
 
-#if !defined(PTSYCL_BACKEND_CUDA) && !defined(PTSYCL_BACKEND_CPU)
-#error "Define exactly one of PTSYCL_BACKEND_CUDA / PTSYCL_BACKEND_CPU"
+#if !defined(PTSYCL_BACKEND_CUDA) && !defined(PTSYCL_BACKEND_CPU) && !defined(PTSYCL_BACKEND_HIP)
+#error "Define exactly one of PTSYCL_BACKEND_CUDA / PTSYCL_BACKEND_HIP / PTSYCL_BACKEND_CPU"
+#endif
+
+#if (defined(PTSYCL_BACKEND_CUDA) + defined(PTSYCL_BACKEND_HIP) + defined(PTSYCL_BACKEND_CPU)) > 1
+#error "Define exactly one of PTSYCL_BACKEND_CUDA / PTSYCL_BACKEND_HIP / PTSYCL_BACKEND_CPU"
 #endif
 
 #if defined(PTSYCL_BACKEND_CUDA)
 #include <cuda_runtime.h>
 #endif
 
+#if defined(PTSYCL_BACKEND_HIP)
+#include <hip/hip_runtime.h>
+#endif
+
 
 #if defined(PTSYCL_BACKEND_CUDA) && (defined(__CUDACC__) || defined(__CUDA__))
 #define PTSYCL_HOST_DEVICE __host__ __device__
+#elif defined(PTSYCL_BACKEND_HIP) && (defined(__HIPCC__) || defined(__HIP__))
+#define PTSYCL_HOST_DEVICE __host__ __device__
 #else
 #define PTSYCL_HOST_DEVICE
+#endif
+
+// PARAS_GPU_BACKEND is the ParaS-side signal for which GPU backend is active.
+// It is set independently of __HIP_DEVICE_COMPILE__ / __CUDA_ARCH__ because
+// parascc invokes clang directly (bypassing hipcc/nvcc), so those compiler-
+// driver-injected macros cannot be relied on to detect device-side compilation.
+#if defined(PTSYCL_BACKEND_HIP)
+#define PARAS_GPU_BACKEND 2
+#elif defined(PTSYCL_BACKEND_CUDA)
+#define PARAS_GPU_BACKEND 1
+#else
+#define PARAS_GPU_BACKEND 0
 #endif
 
 namespace ptsycl {
@@ -52,7 +74,7 @@ namespace compat {
 struct DeviceInfo {
     std::string name;
     bool        is_gpu        = false;
-    int         native_id     = -1;   // CUDA ordinal when is_gpu
+    int         native_id     = -1;   // CUDA/HIP device ordinal when is_gpu
     int         compute_units = 0;
     std::size_t global_mem    = 0;
     bool        fp64          = true;
@@ -97,6 +119,25 @@ void throw_on_cuda_error(int err, const char* what);
 
 } // namespace detail
 #endif // PTSYCL_BACKEND_CUDA
+
+#if defined(PTSYCL_BACKEND_HIP)
+
+namespace detail {
+
+inline constexpr unsigned kBlockSize = 256;
+inline constexpr unsigned kMaxBlocks = 4096;
+
+template <typename F>
+__global__ void flat_kernel(std::size_t n, F f) {
+    std::size_t i      = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    std::size_t stride = gridDim.x * static_cast<std::size_t>(blockDim.x);
+    for (; i < n; i += stride) f(i);
+}
+
+void throw_on_hip_error(int err, const char* what);
+
+} // namespace detail
+#endif // PTSYCL_BACKEND_HIP
 
 
 class Queue {
@@ -144,18 +185,34 @@ public:
             return;
         }
 #endif
+#if defined(PTSYCL_BACKEND_HIP)
+        if (is_gpu_) {
+            detail::throw_on_hip_error(hipSetDevice(native_id_),
+                                       "hipSetDevice(parallel_for)");
+            unsigned blocks = static_cast<unsigned>(
+                (n + detail::kBlockSize - 1) / detail::kBlockSize);
+            if (blocks > detail::kMaxBlocks) blocks = detail::kMaxBlocks;
+            detail::flat_kernel<<<blocks, detail::kBlockSize, 0, stream()>>>(n, f);
+            detail::throw_on_hip_error(hipGetLastError(),
+                                       "flat_kernel launch");
+            return;
+        }
+#endif
         host_parallel_for(n, f);
     }
 
 #if defined(PTSYCL_BACKEND_CUDA)
     cudaStream_t stream() const { return static_cast<cudaStream_t>(stream_); }
 #endif
+#if defined(PTSYCL_BACKEND_HIP)
+    hipStream_t stream() const { return static_cast<hipStream_t>(stream_); }
+#endif
 
 private:
     bool initialized_ = false;
     bool is_gpu_      = false;
     int  native_id_   = -1;
-    void* stream_     = nullptr; // cudaStream_t under PTSYCL_BACKEND_CUDA
+    void* stream_     = nullptr; // cudaStream_t / hipStream_t depending on backend
 };
 
 

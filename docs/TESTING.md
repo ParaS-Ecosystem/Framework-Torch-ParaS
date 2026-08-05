@@ -9,7 +9,7 @@ The suite lives in `tests/` and needs nothing beyond the built package
 source scripts/env.sh
 
 python tests/run_all.py                    # paras:0, the host CPU engine
-python tests/run_all.py --device paras:1   # first GPU (cuda builds)
+python tests/run_all.py --device paras:1   # first GPU (cuda or hip builds)
 python tests/run_all.py --all-devices      # every enumerated device
 ```
 

@@ -115,6 +115,24 @@ std::vector<DeviceInfo> enumerate_devices() {
         out.push_back(std::move(gpu));
     }
 #endif
+
+#if defined(PTSYCL_BACKEND_HIP)
+    int hip_count = 0;
+    hipError_t herr = hipGetDeviceCount(&hip_count);
+    if (herr != hipSuccess) hip_count = 0; // no GPUs visible: CPU-only table
+    for (int i = 0; i < hip_count; ++i) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, i) != hipSuccess) continue;
+        DeviceInfo gpu;
+        gpu.name          = prop.name;
+        gpu.is_gpu        = true;
+        gpu.native_id     = i;
+        gpu.compute_units = prop.multiProcessorCount;
+        gpu.global_mem    = prop.totalGlobalMem;
+        gpu.fp64          = true;
+        out.push_back(std::move(gpu));
+    }
+#endif
     return out;
 }
 
@@ -185,6 +203,21 @@ void throw_on_cuda_error(int err, const char* what) {
 #endif
 
 // -----------------------------------------------------------------------------
+// HIP/ROCm helpers
+// -----------------------------------------------------------------------------
+#if defined(PTSYCL_BACKEND_HIP)
+namespace detail {
+void throw_on_hip_error(int err, const char* what) {
+    if (err != hipSuccess) {
+        std::ostringstream os;
+        os << what << ": " << hipGetErrorString(static_cast<hipError_t>(err));
+        fail(os.str());
+    }
+}
+} // namespace detail
+#endif
+
+// -----------------------------------------------------------------------------
 // Queue
 // -----------------------------------------------------------------------------
 void Queue::init(const DeviceInfo& dev) {
@@ -199,6 +232,14 @@ void Queue::init(const DeviceInfo& dev) {
             cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "cudaStreamCreate");
         stream_ = s;
     }
+#elif defined(PTSYCL_BACKEND_HIP)
+    if (is_gpu_) {
+        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(init)");
+        hipStream_t s = nullptr;
+        detail::throw_on_hip_error(
+            hipStreamCreateWithFlags(&s, hipStreamNonBlocking), "hipStreamCreate");
+        stream_ = s;
+    }
 #else
     if (is_gpu_) fail("GPU device requested in a CPU-only build");
 #endif
@@ -209,6 +250,11 @@ Queue::~Queue() {
 #if defined(PTSYCL_BACKEND_CUDA)
     if (stream_ != nullptr) {
         cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+        stream_ = nullptr;
+    }
+#elif defined(PTSYCL_BACKEND_HIP)
+    if (stream_ != nullptr) {
+        hipStreamDestroy(static_cast<hipStream_t>(stream_));
         stream_ = nullptr;
     }
 #endif
@@ -225,6 +271,20 @@ void* Queue::alloc(std::size_t nbytes) {
             std::ostringstream os;
             os << "cudaMallocManaged(" << nbytes << " bytes) on cuda:" << native_id_
                << ": " << cudaGetErrorString(err);
+            fail(os.str());
+        }
+        return p;
+    }
+#endif
+#if defined(PTSYCL_BACKEND_HIP)
+    if (is_gpu_) {
+        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(alloc)");
+        void* p = nullptr;
+        hipError_t err = hipMallocManaged(&p, nbytes);
+        if (err != hipSuccess) {
+            std::ostringstream os;
+            os << "hipMallocManaged(" << nbytes << " bytes) on hip:" << native_id_
+               << ": " << hipGetErrorString(err);
             fail(os.str());
         }
         return p;
@@ -247,6 +307,12 @@ void Queue::dealloc(void* ptr) {
         return;
     }
 #endif
+#if defined(PTSYCL_BACKEND_HIP)
+    if (is_gpu_) {
+        hipFree(ptr);
+        return;
+    }
+#endif
     std::free(ptr);
 }
 
@@ -259,6 +325,17 @@ void Queue::copy(void* dst, const void* src, std::size_t nbytes, bool blocking) 
         detail::throw_on_cuda_error(
             cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDefault, stream()),
             "cudaMemcpyAsync");
+        if (blocking) synchronize();
+        return;
+    }
+#endif
+#if defined(PTSYCL_BACKEND_HIP)
+    if (is_gpu_) {
+        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(copy)");
+        // hipMemcpyDefault resolves host/managed/device pointers via unified addressing.
+        detail::throw_on_hip_error(
+            hipMemcpyAsync(dst, src, nbytes, hipMemcpyDefault, stream()),
+            "hipMemcpyAsync");
         if (blocking) synchronize();
         return;
     }
@@ -277,6 +354,14 @@ void Queue::memset(void* ptr, int value, std::size_t nbytes) {
         return;
     }
 #endif
+#if defined(PTSYCL_BACKEND_HIP)
+    if (is_gpu_) {
+        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(memset)");
+        detail::throw_on_hip_error(
+            hipMemsetAsync(ptr, value, nbytes, stream()), "hipMemsetAsync");
+        return;
+    }
+#endif
     std::memset(ptr, value, nbytes);
 }
 
@@ -288,12 +373,21 @@ void Queue::synchronize() {
             cudaStreamSynchronize(stream()), "cudaStreamSynchronize");
     }
 #endif
+#if defined(PTSYCL_BACKEND_HIP)
+    if (is_gpu_) {
+        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(sync)");
+        detail::throw_on_hip_error(
+            hipStreamSynchronize(stream()), "hipStreamSynchronize");
+    }
+#endif
     
 }
 
 const char* backend_name() {
 #if defined(PTSYCL_BACKEND_CUDA)
     return "paras-cuda";
+#elif defined(PTSYCL_BACKEND_HIP)
+    return "paras-hip";
 #else
     return "paras-cpu";
 #endif
