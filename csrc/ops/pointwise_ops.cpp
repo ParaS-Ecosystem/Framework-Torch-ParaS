@@ -1051,6 +1051,147 @@ Tensor softmax_backward(const Tensor& grad_output, const Tensor& output,
                                         input_dtype, grad_input);
 }
 
+// --- log_softmax ------------------------------------------------------------
+// y = x - m - log(sum(exp(x - m))), m = max(x); same numerically-stable
+// shape as softmax above, and the same split_dims/dual-dtype-dispatch
+// approach for the half_to_float upcast path.
+Tensor& log_softmax_out(const Tensor& self, int64_t dim,
+                        bool /*half_to_float*/, Tensor& out) {
+    PTSYCL_TRACE_OP("_log_softmax.out");
+    auto& q = queue_for(self);
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    const auto rs_in  = split_dims(self, {d});
+    const auto rs_out = split_dims(out, {d});
+    TORCH_CHECK(rs_in.out_n == rs_out.out_n && rs_in.red_n == rs_out.red_n,
+                "paras log_softmax: output shape must match input shape");
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, self.scalar_type(),
+        "ptsycl_log_softmax_in", [&] {
+            using in_t = scalar_t;
+            const in_t* pin = data_ptr<in_t>(self);
+            const auto kin = rs_in.kept;
+            const auto rin = rs_in.red;
+            const int64_t red_n = rs_in.red_n;
+            const int64_t out_n = rs_in.out_n;
+
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                c10::kHalf, c10::kBFloat16, out.scalar_type(),
+                "ptsycl_log_softmax_out", [&] {
+                    using out_t = scalar_t;
+                    out_t* pout = data_ptr<out_t>(out);
+                    const auto kout = rs_out.kept;
+                    const auto rout = rs_out.red;
+
+                    launch_flat(q, out_n, [=](std::size_t o_) {
+                        const int64_t o = static_cast<int64_t>(o_);
+                        const int64_t base_in  = kin.index(o);
+                        const int64_t base_out = kout.index(o);
+
+                        double m = -std::numeric_limits<double>::infinity();
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double v = static_cast<double>(
+                                pin[base_in + rin.index(j)]);
+                            if (v > m) m = v;
+                        }
+                        double sum = 0.0;
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double v = static_cast<double>(
+                                pin[base_in + rin.index(j)]);
+                            sum += std::exp(v - m);
+                        }
+                        const double log_sum = std::log(sum);
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double v = static_cast<double>(
+                                pin[base_in + rin.index(j)]);
+                            pout[base_out + rout.index(j)] =
+                                static_cast<out_t>(v - m - log_sum);
+                        }
+                    });
+                });
+        });
+    return out;
+}
+
+Tensor log_softmax(const Tensor& self, int64_t dim, bool half_to_float) {
+    PTSYCL_TRACE_OP("_log_softmax");
+    const auto out_dtype = half_to_float ? c10::kFloat : self.scalar_type();
+    Tensor out = at::empty(self.sizes(), self.options().dtype(out_dtype));
+    return ptsycl::log_softmax_out(self, dim, half_to_float, out);
+}
+
+// d(log_softmax)/dx = dy - exp(y) * sum(dy, dim, keepdim=True), where y is
+// the forward's output (already log_softmax'd).
+Tensor& log_softmax_backward_out(const Tensor& grad_output,
+                                 const Tensor& output, int64_t dim,
+                                 c10::ScalarType /*input_dtype*/,
+                                 Tensor& grad_input) {
+    PTSYCL_TRACE_OP("_log_softmax_backward_data.out");
+    auto& q = queue_for(grad_output);
+    const int64_t d = c10::maybe_wrap_dim(dim, grad_output.dim());
+    const auto rs_go = split_dims(grad_output, {d});
+    const auto rs_y  = split_dims(output, {d});
+    const auto rs_gi = split_dims(grad_input, {d});
+    TORCH_CHECK(rs_go.out_n == rs_y.out_n && rs_go.red_n == rs_y.red_n &&
+                    rs_go.out_n == rs_gi.out_n &&
+                    rs_go.red_n == rs_gi.red_n,
+                "paras log_softmax backward: shape mismatch");
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, grad_output.scalar_type(),
+        "ptsycl_log_softmax_bwd_in", [&] {
+            using acc_t = scalar_t;
+            const acc_t* pgo = data_ptr<acc_t>(grad_output);
+            const acc_t* py  = data_ptr<acc_t>(output);
+            const auto kgo = rs_go.kept;
+            const auto rgo = rs_go.red;
+            const auto ky  = rs_y.kept;
+            const auto ry  = rs_y.red;
+            const int64_t red_n = rs_go.red_n;
+            const int64_t out_n = rs_go.out_n;
+
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                c10::kHalf, c10::kBFloat16, grad_input.scalar_type(),
+                "ptsycl_log_softmax_bwd_out", [&] {
+                    using gi_t = scalar_t;
+                    gi_t* pgi = data_ptr<gi_t>(grad_input);
+                    const auto kgi = rs_gi.kept;
+                    const auto rgi = rs_gi.red;
+
+                    launch_flat(q, out_n, [=](std::size_t o_) {
+                        const int64_t o = static_cast<int64_t>(o_);
+                        const int64_t base_go = kgo.index(o);
+                        const int64_t base_y  = ky.index(o);
+                        const int64_t base_gi = kgi.index(o);
+
+                        double sum_dy = 0.0;
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            sum_dy += static_cast<double>(
+                                pgo[base_go + rgo.index(j)]);
+                        }
+                        for (int64_t j = 0; j < red_n; ++j) {
+                            const double dy = static_cast<double>(
+                                pgo[base_go + rgo.index(j)]);
+                            const double y = static_cast<double>(
+                                py[base_y + ry.index(j)]);
+                            pgi[base_gi + rgi.index(j)] = static_cast<gi_t>(
+                                dy - std::exp(y) * sum_dy);
+                        }
+                    });
+                });
+        });
+    return grad_input;
+}
+
+Tensor log_softmax_backward(const Tensor& grad_output, const Tensor& output,
+                            int64_t dim, c10::ScalarType input_dtype) {
+    PTSYCL_TRACE_OP("_log_softmax_backward_data");
+    Tensor grad_input = at::empty(grad_output.sizes(),
+                                  grad_output.options().dtype(input_dtype));
+    return ptsycl::log_softmax_backward_out(grad_output, output, dim,
+                                            input_dtype, grad_input);
+}
+
 // --- cumsum ---------------------------------------------------------------------
 // Row-parallel prefix sum: one thread per kept-position runs a sequential
 // scan over its red_n elements. Not a work-efficient parallel scan, but
@@ -1377,6 +1518,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::_softmax_backward_data", &ptsycl::softmax_backward);
     m.impl("aten::_softmax_backward_data.out",
            &ptsycl::softmax_backward_out);
+    m.impl("aten::_log_softmax", &ptsycl::log_softmax);
+    m.impl("aten::_log_softmax.out", &ptsycl::log_softmax_out);
+    m.impl("aten::_log_softmax_backward_data", &ptsycl::log_softmax_backward);
+    m.impl("aten::_log_softmax_backward_data.out",
+           &ptsycl::log_softmax_backward_out);
     m.impl("aten::cumsum", &ptsycl::cumsum);
     m.impl("aten::cumsum.out", &ptsycl::cumsum_out);
     m.impl("aten::cumsum_", &ptsycl::cumsum_);

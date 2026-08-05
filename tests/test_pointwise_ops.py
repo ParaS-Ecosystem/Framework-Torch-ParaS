@@ -257,6 +257,58 @@ def test_softmax_backward_nontrivial_grad(device):
     check_op("softmax.backward_nontrivial", lambda: a.grad, lambda: da.grad)
 
 
+# --- log_softmax --------------------------------------------------------------
+
+def test_log_softmax_dim1(device):
+    a, _, da, _ = _pair(device)
+    check_op("log_softmax.dim1", lambda: torch.log_softmax(a, dim=1),
+             lambda: torch.log_softmax(da, dim=1))
+
+
+def test_log_softmax_last_dim_3d(device):
+    a = torch.randn(2, 3, 7)
+    da = a.to(device)
+    check_op("log_softmax.3d", lambda: torch.log_softmax(a, dim=-1),
+             lambda: torch.log_softmax(da, dim=-1))
+
+
+def test_log_softmax_backward(device):
+    a = torch.randn(4, 5, requires_grad=True)
+    da = a.detach().to(device).requires_grad_(True)
+
+    torch.log_softmax(a, dim=1).sum().backward()
+    torch.log_softmax(da, dim=1).sum().backward()
+
+    check_op("log_softmax.backward", lambda: a.grad, lambda: da.grad)
+
+
+def test_log_softmax_backward_nontrivial_grad(device):
+    a = torch.randn(3, 6, requires_grad=True)
+    da = a.detach().to(device).requires_grad_(True)
+    upstream = torch.randn(3, 6)
+
+    torch.log_softmax(a, dim=1).backward(upstream)
+    torch.log_softmax(da, dim=1).backward(upstream.to(device))
+
+    check_op("log_softmax.backward_nontrivial", lambda: a.grad, lambda: da.grad)
+
+
+def test_log_softmax_matches_cross_entropy(device):
+    # This is the whole point of log_softmax: nn.CrossEntropyLoss calls it
+    # directly rather than softmax()+log(), so verify the composed result
+    # matches on-device too.
+    x = torch.randn(4, 8, 6)
+    target = torch.randint(0, 8, (4, 6))
+    dx = x.to(device)
+    dtarget = target.to(device)
+
+    ref = torch.nn.functional.nll_loss(
+        torch.log_softmax(x, dim=1), target)
+    dev = torch.nn.functional.nll_loss(
+        torch.log_softmax(dx, dim=1), dtarget)
+    check_op("log_softmax.nll_loss_chain", lambda: ref, lambda: dev)
+
+
 # --- cumsum -------------------------------------------------------------------
 
 def test_cumsum_dim1(device):
