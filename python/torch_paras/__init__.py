@@ -6,11 +6,13 @@ Importing this package registers the ``paras`` device with PyTorch:
     import torch_paras
 
     x = torch.randn(64, 64, device="paras")        # device 0 = host CPU engine
-    y = torch.randn(64, 64, device="paras:1")      # device 1.. = CUDA GPUs
+    y = torch.randn(64, 64, device="paras:1")      # device 1.. = CUDA/HIP GPUs
     z = (x @ x).relu().cpu()
 
 Device 0 always exists and executes on the host through the ParaS CPU
-engine. In CUDA-enabled builds, devices 1..N map to the visible GPUs.
+engine. In CUDA- or HIP-enabled builds, devices 1..N map to the visible
+NVIDIA or AMD GPUs, respectively (a single build is one flavor or the
+other, never both).
 """
 
 import types
@@ -40,7 +42,7 @@ def is_available() -> bool:
 
 
 def backend_name() -> str:
-    """Active compat flavor: 'paras-cpu' or 'paras-cuda'."""
+    """Active compat flavor: 'paras-cpu', 'paras-cuda', or 'paras-hip'."""
     return _C.backend_name()
 
 
