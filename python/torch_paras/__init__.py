@@ -96,6 +96,7 @@ def _register() -> None:
     mod.empty_cache = empty_cache
     mod.device_name = device_name
     mod.is_bad_fork = _C.is_bad_fork
+    mod._is_in_bad_fork = _C.is_bad_fork
     torch._register_device_module("paras", mod)
 
     # tensor.paras() / module.paras() / tensor.is_paras
