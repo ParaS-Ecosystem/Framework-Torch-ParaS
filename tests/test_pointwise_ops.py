@@ -257,6 +257,152 @@ def test_softmax_backward_nontrivial_grad(device):
     check_op("softmax.backward_nontrivial", lambda: a.grad, lambda: da.grad)
 
 
+# --- log_softmax --------------------------------------------------------------
+
+def test_log_softmax_dim1(device):
+    a, _, da, _ = _pair(device)
+    check_op("log_softmax.dim1", lambda: torch.log_softmax(a, dim=1),
+             lambda: torch.log_softmax(da, dim=1))
+
+
+def test_log_softmax_last_dim_3d(device):
+    a = torch.randn(2, 3, 7)
+    da = a.to(device)
+    check_op("log_softmax.3d", lambda: torch.log_softmax(a, dim=-1),
+             lambda: torch.log_softmax(da, dim=-1))
+
+
+def test_log_softmax_backward(device):
+    a = torch.randn(4, 5, requires_grad=True)
+    da = a.detach().to(device).requires_grad_(True)
+
+    torch.log_softmax(a, dim=1).sum().backward()
+    torch.log_softmax(da, dim=1).sum().backward()
+
+    check_op("log_softmax.backward", lambda: a.grad, lambda: da.grad)
+
+
+def test_log_softmax_backward_nontrivial_grad(device):
+    a = torch.randn(3, 6, requires_grad=True)
+    da = a.detach().to(device).requires_grad_(True)
+    upstream = torch.randn(3, 6)
+
+    torch.log_softmax(a, dim=1).backward(upstream)
+    torch.log_softmax(da, dim=1).backward(upstream.to(device))
+
+    check_op("log_softmax.backward_nontrivial", lambda: a.grad, lambda: da.grad)
+
+
+def test_log_softmax_matches_cross_entropy(device):
+    # This is the whole point of log_softmax: nn.CrossEntropyLoss calls it
+    # directly rather than softmax()+log(), so verify the composed result
+    # matches on-device too.
+    x = torch.randn(4, 8, 6)
+    target = torch.randint(0, 8, (4, 6))
+    dx = x.to(device)
+    dtarget = target.to(device)
+
+    ref = torch.nn.functional.nll_loss(
+        torch.log_softmax(x, dim=1), target)
+    dev = torch.nn.functional.nll_loss(
+        torch.log_softmax(dx, dim=1), dtarget)
+    check_op("log_softmax.nll_loss_chain", lambda: ref, lambda: dev)
+
+
+# --- cumsum -------------------------------------------------------------------
+
+def test_cumsum_dim1(device):
+    a, _, da, _ = _pair(device)
+    check_op("cumsum.dim1", lambda: torch.cumsum(a, dim=1),
+             lambda: torch.cumsum(da, dim=1))
+
+
+def test_cumsum_dim0(device):
+    a, _, da, _ = _pair(device)
+    check_op("cumsum.dim0", lambda: torch.cumsum(a, dim=0),
+             lambda: torch.cumsum(da, dim=0))
+
+
+def test_cumsum_negative_dim(device):
+    a = torch.randn(2, 3, 4)
+    da = a.to(device)
+    check_op("cumsum.neg_dim", lambda: torch.cumsum(a, dim=-1),
+             lambda: torch.cumsum(da, dim=-1))
+
+
+def test_cumsum_int64_exact(device):
+    a = torch.tensor([2**62, 1, 1, 1, 1], dtype=torch.int64)
+    da = a.to(device)
+    check_op("cumsum.int64_exact", lambda: torch.cumsum(a, dim=0),
+             lambda: torch.cumsum(da, dim=0))
+
+
+def test_cumsum_bool_promotes_to_long(device):
+    a = torch.tensor([True, False, True, True])
+    da = a.to(device)
+    dev_out = torch.cumsum(da, dim=0)
+    assert dev_out.dtype == torch.int64
+    check_op("cumsum.bool_promotion", lambda: torch.cumsum(a, dim=0),
+             lambda: dev_out)
+
+
+def test_cumsum_(device):
+    a = torch.randn(4, 5)
+    da = a.to(device)
+    a.cumsum_(dim=1)
+    da.cumsum_(dim=1)
+    check_op("cumsum_", lambda: a, lambda: da)
+
+
+# --- topk ---------------------------------------------------------------------
+
+def test_topk_largest(device):
+    a = torch.randn(3, 20)
+    da = a.to(device)
+    ref_v, ref_i = torch.topk(a, k=5, dim=1)
+    dev_v, dev_i = torch.topk(da, k=5, dim=1)
+    check_op("topk.largest.values", lambda: ref_v, lambda: dev_v)
+    check_op("topk.largest.indices", lambda: ref_i, lambda: dev_i)
+
+
+def test_topk_smallest(device):
+    a = torch.randn(3, 20)
+    da = a.to(device)
+    ref_v, ref_i = torch.topk(a, k=4, dim=1, largest=False)
+    dev_v, dev_i = torch.topk(da, k=4, dim=1, largest=False)
+    check_op("topk.smallest.values", lambda: ref_v, lambda: dev_v)
+    check_op("topk.smallest.indices", lambda: ref_i, lambda: dev_i)
+
+
+def test_topk_dim0(device):
+    a = torch.randn(10, 4)
+    da = a.to(device)
+    ref_v, ref_i = torch.topk(a, k=3, dim=0)
+    dev_v, dev_i = torch.topk(da, k=3, dim=0)
+    check_op("topk.dim0.values", lambda: ref_v, lambda: dev_v)
+    check_op("topk.dim0.indices", lambda: ref_i, lambda: dev_i)
+
+
+def test_topk_full_size(device):
+    a = torch.randn(3, 20)
+    da = a.to(device)
+    ref_v, ref_i = torch.topk(a, k=20, dim=1)
+    dev_v, dev_i = torch.topk(da, k=20, dim=1)
+    check_op("topk.full.values", lambda: ref_v, lambda: dev_v)
+    check_op("topk.full.indices", lambda: ref_i, lambda: dev_i)
+
+
+def test_topk_values_only_with_ties(device):
+    # PyTorch doesn't guarantee a particular tie-break index order for
+    # duplicate values (only that values come back sorted), so we only
+    # check the value sequence here, not exact indices.
+    a = torch.tensor([[5.0, 3.0, 5.0, 5.0, 1.0, 3.0]])
+    da = a.to(device)
+    ref_v, _ = torch.topk(a, k=4, dim=1)
+    dev_v, _ = torch.topk(da, k=4, dim=1)
+    check_op("topk.ties.values", lambda: ref_v, lambda: dev_v)
+
+
 # --- structure ----------------------------------------------------------------
 
 def test_cat(device):
