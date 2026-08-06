@@ -11,6 +11,13 @@ work but I have not tried them.
 - Optional: NVIDIA GPU for the CUDA flavor. I test on Tesla V100 (sm_70).
   Set `PTSYCL_CUDA_ARCH` if your GPU has a different compute capability,
   e.g. `cuda:sm_80` for A100.
+- Optional: AMD GPU for the HIP flavor. `scripts/build.sh hip` auto-detects
+  your GPU's architecture via `rocm_agent_enumerator` (confirm your own
+  card's ISA with `rocminfo | grep gfx` if you want to double check, e.g.
+  `gfx942` for MI300-class, `gfx90a` for MI200-class). Set
+  `PTSYCL_HIP_ARCH=hip:gfxXXX` explicitly to override auto-detection, or
+  if you have multiple GPU architectures visible and need to pick one.
+  A single build targets CUDA or HIP, not both.
 
 ## 2. Toolchain
 
@@ -21,6 +28,7 @@ The ParaS compiler driver (`parascc`) is clang-based and needs:
 | LLVM/clang | 21.1 | parascc execs clang++ for its sub-steps |
 | GCC | 13.4 | C++ standard headers and libstdc++ (GLIBCXX_3.4.30) |
 | CUDA toolkit | 12.2 | CUDA flavor only |
+| ROCm | 6.x | HIP flavor only |
 | CMake | >= 3.18 | build system |
 | Python | 3.10 | matches the PyTorch build below |
 | PyTorch | 2.5.1 | the backend links against libtorch from this install |
@@ -60,6 +68,7 @@ export PARAS_HOME=/opt/paras/install
 export PTSYCL_GCC_TOOLCHAIN=/opt/gcc-13.4.0
 export PTSYCL_LLVM_DIR=/opt/llvm-21.1
 export PTSYCL_CUDA_HOME=/usr/local/cuda-12.2
+export PTSYCL_ROCM_HOME=/opt/rocm-6.2.0
 export PTSYCL_PYTHON=$(which python3)        # the conda env's python
 source scripts/env.sh
 ```
@@ -73,17 +82,23 @@ sets PATH / LD_LIBRARY_PATH so parascc and the runtime resolve.
 scripts/build.sh cpu             # CPU engine only
 scripts/build.sh cuda            # CPU engine + NVIDIA GPUs
 scripts/build.sh cuda Debug      # debug build
+scripts/build.sh hip             # CPU engine + AMD GPUs
 ```
 
 Notes:
 
 - The build is intentionally serial (`-j1`). parascc names its temporary
   files with second resolution, so parallel compiles would race on them.
-  A full CUDA build takes around 15 minutes on our machine.
+  A full CUDA or HIP build takes around 15 minutes on our machine.
 - The built extension is copied to `python/torch_paras/_C.so`. Whichever
   flavor you built last is the one `import torch_paras` loads.
-- Build trees live under `build/cpu` and `build/cuda`; incremental builds
-  only recompile what changed.
+- Build trees live under `build/cpu`, `build/cuda`, and `build/hip`;
+  incremental builds only recompile what changed.
+- `PTSYCL_DEVICE` values are `cpu`, `cuda:sm_XX`, or `hip:gfxXXX` —
+  `scripts/build.sh` picks the right one for `cuda`/`hip` from
+  `PTSYCL_CUDA_ARCH` (default: `cuda:sm_70`) or `PTSYCL_HIP_ARCH`
+  (auto-detected from the visible GPU via `rocm_agent_enumerator` if
+  unset).
 
 ## 6. Check it works
 

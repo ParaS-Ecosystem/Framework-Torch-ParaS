@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the backend with the ParaS compiler.
 #
-#   scripts/build.sh [cpu|cuda]
+#   scripts/build.sh [cpu|cuda|hip]
 #
 # Build trees: build/<flavor>. The produced extension is copied to
 # python/torch_paras/_C.so, so the most recently built flavor is the one
@@ -17,7 +17,32 @@ source "${REPO_ROOT}/scripts/env.sh"
 case "${FLAVOR}" in
     cpu)  DEVICE="cpu" ;;
     cuda) DEVICE="${PTSYCL_CUDA_ARCH:-cuda:sm_70}" ;;
-    *) echo "usage: build.sh [cpu|cuda] [Release|Debug]" >&2; exit 1 ;;
+    hip)
+        if [[ -n "${PTSYCL_HIP_ARCH:-}" ]]; then
+            DEVICE="${PTSYCL_HIP_ARCH}"
+        elif command -v rocm_agent_enumerator >/dev/null 2>&1; then
+            # rocm_agent_enumerator lists one gfx target per visible agent,
+            # including a "gfx000" line for the host CPU which we must skip.
+            mapfile -t _ptsycl_gfx_agents < <(rocm_agent_enumerator | grep -v '^gfx000$' | sort -u)
+            if [[ ${#_ptsycl_gfx_agents[@]} -eq 0 ]]; then
+                echo "error: rocm_agent_enumerator found no AMD GPU agents." >&2
+                echo "       Set PTSYCL_HIP_ARCH=hip:gfxXXX explicitly." >&2
+                exit 1
+            elif [[ ${#_ptsycl_gfx_agents[@]} -gt 1 ]]; then
+                echo "error: multiple distinct GPU architectures detected (${_ptsycl_gfx_agents[*]})." >&2
+                echo "       This build targets one architecture; set PTSYCL_HIP_ARCH=hip:gfxXXX" >&2
+                echo "       to pick which one, e.g. PTSYCL_HIP_ARCH=hip:${_ptsycl_gfx_agents[0]}" >&2
+                exit 1
+            fi
+            DEVICE="hip:${_ptsycl_gfx_agents[0]}"
+            echo "[build.sh] auto-detected HIP arch: ${DEVICE}"
+        else
+            echo "error: rocm_agent_enumerator not found and PTSYCL_HIP_ARCH not set." >&2
+            echo "       Set PTSYCL_HIP_ARCH=hip:gfxXXX explicitly (check with: rocminfo | grep gfx)." >&2
+            exit 1
+        fi
+        ;;
+    *) echo "usage: build.sh [cpu|cuda|hip] [Release|Debug]" >&2; exit 1 ;;
 esac
 
 BUILD_DIR="${REPO_ROOT}/build/${FLAVOR}"
@@ -39,6 +64,7 @@ fi
     -DPTSYCL_GCC_TOOLCHAIN="${PTSYCL_GCC_TOOLCHAIN}" \
     -DPTSYCL_TORCH_DIR="${PTSYCL_TORCH_DIR}" \
     -DPTSYCL_CUDA_HOME="${PTSYCL_CUDA_HOME}" \
+    -DPTSYCL_ROCM_HOME="${PTSYCL_ROCM_HOME}" \
     -DPARAS_HOME="${PARAS_HOME}" \
     -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
 

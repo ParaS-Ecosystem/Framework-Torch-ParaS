@@ -5,6 +5,7 @@
 #
 #   -DPTSYCL_DEVICE=cpu          ParaS CPU engine (kem threadpool)
 #   -DPTSYCL_DEVICE=cuda:sm_70   CUDA kernels through -parasdevice
+#   -DPTSYCL_DEVICE=hip:gfx90a   HIP/ROCm kernels through -parasdevice
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -26,7 +27,9 @@ set(PTSYCL_DEVICE "cpu" CACHE STRING "Target: cpu or cuda:sm_XX")
 set(PTSYCL_GCC_TOOLCHAIN "" CACHE PATH "GCC toolchain root for parascc")
 set(PTSYCL_TORCH_DIR "" CACHE PATH "PyTorch installation (site-packages/torch)")
 set(PTSYCL_CUDA_HOME "" CACHE PATH "CUDA toolkit root (cuda flavor only)")
+set(PTSYCL_ROCM_HOME "" CACHE PATH "ROCm installation root (hip flavor only)")
 set(PARAS_HOME "$ENV{PARAS_HOME}" CACHE PATH "ParaS compiler installation")
+set(PTSYCL_LLVM_DIR "$ENV{PTSYCL_LLVM_DIR}" CACHE PATH "LLVM/clang installation used by parascc")
 
 foreach(var PTSYCL_GCC_TOOLCHAIN PTSYCL_TORCH_DIR PARAS_HOME)
     if(NOT ${var})
@@ -35,6 +38,18 @@ foreach(var PTSYCL_GCC_TOOLCHAIN PTSYCL_TORCH_DIR PARAS_HOME)
 endforeach()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+    OUTPUT_VARIABLE PTSYCL_CXX11_ABI
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT PTSYCL_CXX11_ABI MATCHES "^[01]$")
+    message(FATAL_ERROR "Could not determine torch._C._GLIBCXX_USE_CXX11_ABI from "
+                         "${Python3_EXECUTABLE} (got '${PTSYCL_CXX11_ABI}'). Is "
+                         "PTSYCL_TORCH_DIR's python env active / importable?")
+endif()
+message(STATUS "Torch C++11 ABI : ${PTSYCL_CXX11_ABI}")
 
 # ------------------------------------------------------------------------------
 # Flavor selection
@@ -48,14 +63,25 @@ elseif(PTSYCL_DEVICE MATCHES "^cuda:sm_[0-9]+$")
     if(NOT PTSYCL_CUDA_HOME)
         message(FATAL_ERROR "PTSYCL_CUDA_HOME required for ${PTSYCL_DEVICE}")
     endif()
+elseif(PTSYCL_DEVICE MATCHES "^hip:gfx[0-9a-zA-Z]+$")
+    set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_HIP)
+    set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_DEVICE}")
+    if(NOT PTSYCL_ROCM_HOME)
+        message(FATAL_ERROR "PTSYCL_ROCM_HOME required for ${PTSYCL_DEVICE}")
+    endif()
 else()
-    message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu' or 'cuda:sm_XX', got '${PTSYCL_DEVICE}'")
+    message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu', 'cuda:sm_XX', or 'hip:gfxXXX', got '${PTSYCL_DEVICE}'")
 endif()
 
 message(STATUS "ParaS home      : ${PARAS_HOME}")
 message(STATUS "Device flavor   : ${PTSYCL_DEVICE} (${PTSYCL_FLAVOR_DEFINE})")
 message(STATUS "Torch           : ${PTSYCL_TORCH_DIR}")
 message(STATUS "Python          : ${Python3_EXECUTABLE}")
+if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_CUDA")
+    message(STATUS "CUDA home       : ${PTSYCL_CUDA_HOME}")
+elseif(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")
+    message(STATUS "ROCm home       : ${PTSYCL_ROCM_HOME}")
+endif()
 
 # ------------------------------------------------------------------------------
 # Sources
@@ -83,7 +109,7 @@ set_target_properties(torch_paras_C PROPERTIES
 
 target_compile_definitions(torch_paras_C PRIVATE
     ${PTSYCL_FLAVOR_DEFINE}
-    _GLIBCXX_USE_CXX11_ABI=0      # match the PyTorch build
+    _GLIBCXX_USE_CXX11_ABI=${PTSYCL_CXX11_ABI}
     TORCH_API_INCLUDE_EXTENSION_H
     TORCH_EXTENSION_NAME=_C
 )
@@ -99,6 +125,10 @@ target_include_directories(torch_paras_C SYSTEM PRIVATE
     "${PARAS_HOME}/include"
 )
 
+if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")
+    target_include_directories(torch_paras_C SYSTEM PRIVATE "${PTSYCL_ROCM_HOME}/include")
+endif()
+
 target_compile_options(torch_paras_C PRIVATE
     --gcc-toolchain=${PTSYCL_GCC_TOOLCHAIN}
     ${PTSYCL_DEVICE_FLAGS}
@@ -112,11 +142,40 @@ target_link_directories(torch_paras_C PRIVATE
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )
 
+# parascc's own clang resource dir may not ship compiler-rt (a "clang+llvm
+# only" build skips the separate runtimes project), and older GCC libgcc
+# archives are missing some newer soft-float builtins (e.g. __truncsfbf2,
+# for float->bfloat16 truncation, only landed in GCC 13). If so, fall back
+# to any system/vendor clang's compiler-rt builtins archive of a matching
+# major version to backfill just those symbols.
+set(PTSYCL_CLANG_RT_BUILTINS "" CACHE FILEPATH
+    "Override: path to a libclang_rt.builtins*.a providing soft-float builtins")
+if(NOT PTSYCL_CLANG_RT_BUILTINS)
+    file(GLOB _ptsycl_rt_candidates
+        "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/*/libclang_rt.builtins*.a"
+        "/usr/lib/clang/*/lib/*/libclang_rt.builtins*.a"
+        "/usr/lib64/clang/*/lib/*/libclang_rt.builtins*.a"
+    )
+    if(_ptsycl_rt_candidates)
+        list(GET _ptsycl_rt_candidates 0 PTSYCL_CLANG_RT_BUILTINS)
+    endif()
+endif()
+if(PTSYCL_CLANG_RT_BUILTINS)
+    message(STATUS "clang_rt.builtins : ${PTSYCL_CLANG_RT_BUILTINS}")
+else()
+    message(STATUS "clang_rt.builtins : not found (ok unless you hit missing "
+                    "soft-float builtin symbols like __truncsfbf2 at link time)")
+endif()
+
 target_link_libraries(torch_paras_C PRIVATE
     torch torch_cpu torch_python c10
     ${Python3_LIBRARIES}
     pthread
 )
+
+if(PTSYCL_CLANG_RT_BUILTINS)
+    target_link_libraries(torch_paras_C PRIVATE "${PTSYCL_CLANG_RT_BUILTINS}")
+endif()
 
 set(PTSYCL_RPATHS
     "${PTSYCL_TORCH_DIR}/lib"
@@ -128,6 +187,13 @@ if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_CUDA")
     target_link_directories(torch_paras_C PRIVATE "${PTSYCL_CUDA_HOME}/lib64")
     target_link_libraries(torch_paras_C PRIVATE cudart)
     list(APPEND PTSYCL_RPATHS "${PTSYCL_CUDA_HOME}/lib64")
+    target_link_options(torch_paras_C PRIVATE ${PTSYCL_DEVICE_FLAGS})
+endif()
+
+if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")
+    target_link_directories(torch_paras_C PRIVATE "${PTSYCL_ROCM_HOME}/lib")
+    target_link_libraries(torch_paras_C PRIVATE amdhip64)
+    list(APPEND PTSYCL_RPATHS "${PTSYCL_ROCM_HOME}/lib")
     target_link_options(torch_paras_C PRIVATE ${PTSYCL_DEVICE_FLAGS})
 endif()
 
