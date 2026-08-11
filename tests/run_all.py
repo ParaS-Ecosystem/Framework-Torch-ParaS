@@ -26,6 +26,8 @@ from common import run_module, target_device  # noqa: E402
 MODULES = [
     "test_tensor_ops",
     "test_pointwise_ops",
+    "test_indexing_ops",
+    "test_fused_ops",
     "test_random_ops",
 ]
 
