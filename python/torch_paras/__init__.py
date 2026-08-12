@@ -20,6 +20,7 @@ import types
 import torch
 
 from . import _C
+from . import nn  # noqa: F401
 
 __all__ = [
     "device_count",
@@ -29,6 +30,7 @@ __all__ = [
     "empty_cache",
     "device_name",
     "backend_name",
+    "nn",
 ]
 
 

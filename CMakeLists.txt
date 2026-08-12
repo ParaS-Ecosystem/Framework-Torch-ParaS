@@ -93,6 +93,9 @@ add_library(torch_paras_C SHARED
     csrc/core/registration.cpp
     csrc/ops/tensor_ops.cpp
     csrc/ops/pointwise_ops.cpp
+    csrc/ops/scatter_ops.cpp
+    csrc/ops/indexing_ops.cpp
+    csrc/ops/fused_ops.cpp
     csrc/ops/random_ops.cpp
     csrc/ops/loss_ops.cpp
     csrc/ops/norm_ops.cpp

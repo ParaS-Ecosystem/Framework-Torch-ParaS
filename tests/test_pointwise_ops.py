@@ -35,6 +35,16 @@ def test_sqrt(device):
              lambda: torch.sqrt(torch.abs(da) + 1.0))
 
 
+def test_sin(device):
+    a, _, da, _ = _pair(device)
+    check_op("sin", lambda: torch.sin(a), lambda: torch.sin(da))
+
+
+def test_cos(device):
+    a, _, da, _ = _pair(device)
+    check_op("cos", lambda: torch.cos(a), lambda: torch.cos(da))
+
+
 def test_sigmoid(device):
     a, _, da, _ = _pair(device)
     check_op("sigmoid", lambda: torch.sigmoid(a), lambda: torch.sigmoid(da))

@@ -355,8 +355,20 @@ Tensor& sqrt_out(const Tensor& self, Tensor& out) {
     unary_kernel(self, out, [](double v) { return ::sqrt(v); });
     return out;
 }
+Tensor& sin_out(const Tensor& self, Tensor& out) {
+    unary_kernel(self, out, [](double v) { return ::sin(v); });
+    return out;
+}
+Tensor& cos_out(const Tensor& self, Tensor& out) {
+    unary_kernel(self, out, [](double v) { return ::cos(v); });
+    return out;
+}
 Tensor& neg_out(const Tensor& self, Tensor& out) {
     unary_kernel(self, out, [](double v) { return -v; });
+    return out;
+}
+Tensor& rsqrt_out(const Tensor& self, Tensor& out) {
+    unary_kernel(self, out, [](double v) { return 1.0 / ::sqrt(v); });
     return out;
 }
 Tensor& reciprocal_out(const Tensor& self, Tensor& out) {
@@ -1432,7 +1444,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::exp.out", &ptsycl::exp_out);
     m.impl("aten::log.out", &ptsycl::log_out);
     m.impl("aten::sqrt.out", &ptsycl::sqrt_out);
+    m.impl("aten::sin.out", &ptsycl::sin_out);
+    m.impl("aten::cos.out", &ptsycl::cos_out);
     m.impl("aten::neg.out", &ptsycl::neg_out);
+    m.impl("aten::rsqrt.out", &ptsycl::rsqrt_out);
     m.impl("aten::reciprocal.out", &ptsycl::reciprocal_out);
     m.impl("aten::ceil.out", &ptsycl::ceil_out);
     m.impl("aten::round.out", &ptsycl::round_out);
