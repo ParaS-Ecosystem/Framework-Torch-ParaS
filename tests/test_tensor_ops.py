@@ -223,3 +223,122 @@ def test_cross_device_copy(device):
     moved = cpu.to(device).to(other)
     assert moved.device.type == "paras"
     assert_close(moved, cpu, "cross-device copy")
+
+
+def test_transpose(device):
+    x = torch.randn(3, 4, 5, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_out = torch.transpose(x, 0, 2)
+    dev_out = torch.transpose(dev_x, 0, 2)
+    assert dev_out.shape == cpu_out.shape
+    assert dev_out.stride() == cpu_out.stride()
+    assert_close(dev_out, cpu_out, "transpose")
+
+
+def test_permute(device):
+    x = torch.randn(2, 3, 4, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_out = torch.permute(x, (2, 0, 1))
+    dev_out = torch.permute(dev_x, (2, 0, 1))
+    assert dev_out.shape == cpu_out.shape
+    assert dev_out.stride() == cpu_out.stride()
+    assert_close(dev_out, cpu_out, "permute")
+
+
+def test_expand(device):
+    x = torch.randn(1, 4, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_out = x.expand(3, 4)
+    dev_out = dev_x.expand(3, 4)
+    assert dev_out.shape == cpu_out.shape
+    assert dev_out.stride() == cpu_out.stride()
+    assert_close(dev_out, cpu_out, "expand")
+
+
+def test_repeat(device):
+    x = torch.randn(2, 3, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_out = x.repeat(2, 4)
+    dev_out = dev_x.repeat(2, 4)
+    assert dev_out.shape == cpu_out.shape
+    assert_close(dev_out, cpu_out, "repeat")
+
+
+def test_repeat_interleave_int(device):
+    # Test 8 -> 32 KV head expansion pattern for GQA/MHA
+    kv_heads = torch.randn(2, 8, 16, dtype=torch.float32)
+    dev_kv = kv_heads.to(device)
+    cpu_out = torch.repeat_interleave(kv_heads, 4, dim=1)
+    dev_out = torch.repeat_interleave(dev_kv, 4, dim=1)
+    assert dev_out.shape == (2, 32, 16)
+    assert_close(dev_out, cpu_out, "repeat_interleave (8 -> 32 heads)")
+
+
+def test_repeat_interleave_tensor(device):
+    x = torch.tensor([10.0, 20.0, 30.0], dtype=torch.float32)
+    repeats = torch.tensor([2, 3, 1], dtype=torch.int64)
+    dev_x = x.to(device)
+    dev_repeats = repeats.to(device)
+    cpu_out = torch.repeat_interleave(x, repeats)
+    dev_out = torch.repeat_interleave(dev_x, dev_repeats)
+    assert_close(dev_out, cpu_out, "repeat_interleave (tensor repeats)")
+
+
+def test_split(device):
+    x = torch.arange(10, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_splits = torch.split(x, 3)
+    dev_splits = torch.split(dev_x, 3)
+    assert len(dev_splits) == len(cpu_splits)
+    for d, c in zip(dev_splits, cpu_splits):
+        assert_close(d, c, "split")
+
+    cpu_splits_sizes = torch.split(x, [2, 5, 3])
+    dev_splits_sizes = torch.split(dev_x, [2, 5, 3])
+    assert len(dev_splits_sizes) == len(cpu_splits_sizes)
+    for d, c in zip(dev_splits_sizes, cpu_splits_sizes):
+        assert_close(d, c, "split_with_sizes")
+
+
+def test_chunk(device):
+    x = torch.arange(11, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_chunks = torch.chunk(x, 3)
+    dev_chunks = torch.chunk(dev_x, 3)
+    assert len(dev_chunks) == len(cpu_chunks)
+    for d, c in zip(dev_chunks, cpu_chunks):
+        assert_close(d, c, "chunk")
+
+
+def test_contiguous(device):
+    x = torch.randn(4, 5, dtype=torch.float32).t()
+    dev_x = x.to(device)
+    assert not dev_x.is_contiguous()
+    dev_contig = dev_x.contiguous()
+    assert dev_contig.is_contiguous()
+    assert_close(dev_contig, x.contiguous(), "contiguous")
+
+
+def test_squeeze(device):
+    x = torch.randn(1, 3, 1, 4, dtype=torch.float32)
+    dev_x = x.to(device)
+    assert_close(torch.squeeze(dev_x), torch.squeeze(x), "squeeze all")
+    assert_close(torch.squeeze(dev_x, 0), torch.squeeze(x, 0), "squeeze dim")
+    assert_close(torch.squeeze(dev_x, (0, 2)), torch.squeeze(x, (0, 2)), "squeeze dims")
+
+
+def test_unsqueeze(device):
+    x = torch.randn(3, 4, dtype=torch.float32)
+    dev_x = x.to(device)
+    assert_close(torch.unsqueeze(dev_x, 0), torch.unsqueeze(x, 0), "unsqueeze dim 0")
+    assert_close(torch.unsqueeze(dev_x, 1), torch.unsqueeze(x, 1), "unsqueeze dim 1")
+    assert_close(torch.unsqueeze(dev_x, 2), torch.unsqueeze(x, 2), "unsqueeze dim 2")
+
+
+def test_narrow(device):
+    x = torch.randn(5, 6, dtype=torch.float32)
+    dev_x = x.to(device)
+    cpu_out = torch.narrow(x, 1, 2, 3)
+    dev_out = torch.narrow(dev_x, 1, 2, 3)
+    assert_close(dev_out, cpu_out, "narrow")
+

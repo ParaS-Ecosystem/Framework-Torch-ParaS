@@ -17,6 +17,7 @@
 // -----------------------------------------------------------------------------
 
 
+#include <ATen/ExpandUtils.h>
 #include <ATen/InferSize.h>
 #include <ATen/native/CPUFallback.h>
 #include <c10/core/DeviceGuard.h>
@@ -565,6 +566,333 @@ bool _has_compatible_shallow_copy_type(const Tensor& self,
 }
 
 // -----------------------------------------------------------------------------
+// Shape / Movement Operations
+// -----------------------------------------------------------------------------
+Tensor transpose(const Tensor& self, int64_t dim0, int64_t dim1) {
+    PTSYCL_TRACE_OP("transpose");
+    const int64_t ndim = self.dim();
+    const int64_t d0 = c10::maybe_wrap_dim(dim0, ndim);
+    const int64_t d1 = c10::maybe_wrap_dim(dim1, ndim);
+    if (d0 == d1) return self;
+    auto sizes = self.sizes().vec();
+    auto strides = self.strides().vec();
+    std::swap(sizes[d0], sizes[d1]);
+    std::swap(strides[d0], strides[d1]);
+    return ptsycl::as_strided(self, sizes, strides, self.storage_offset());
+}
+
+Tensor permute(const Tensor& self, c10::IntArrayRef dims) {
+    PTSYCL_TRACE_OP("permute");
+    const int64_t ndim = self.dim();
+    TORCH_CHECK(dims.size() == static_cast<size_t>(ndim),
+                "permute: number of dimensions in dims must match tensor dimensions");
+    std::vector<int64_t> new_sizes(ndim);
+    std::vector<int64_t> new_strides(ndim);
+    std::vector<bool> seen(ndim, false);
+    for (int64_t i = 0; i < ndim; ++i) {
+        const int64_t d = c10::maybe_wrap_dim(dims[i], ndim);
+        TORCH_CHECK(!seen[d], "permute: duplicate dimension in dims");
+        seen[d] = true;
+        new_sizes[i] = self.size(d);
+        new_strides[i] = self.stride(d);
+    }
+    return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
+}
+
+Tensor expand(const Tensor& self, c10::SymIntArrayRef size, bool /*implicit*/) {
+    PTSYCL_TRACE_OP("expand");
+    auto target_sizes = c10::asIntArrayRefUnchecked(size);
+    auto result = at::infer_expand_geometry(self.sizes(), self.strides(), target_sizes);
+    return ptsycl::as_strided(self, result.sizes, result.strides, self.storage_offset());
+}
+
+Tensor repeat(const Tensor& self, c10::SymIntArrayRef repeats_sym) {
+    PTSYCL_TRACE_OP("repeat");
+    auto repeats = c10::asIntArrayRefUnchecked(repeats_sym);
+    const int64_t self_dim = self.dim();
+    const int64_t repeats_dim = repeats.size();
+    TORCH_CHECK(repeats_dim >= self_dim,
+                "Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor");
+
+    Tensor src = self;
+    if (repeats_dim > self_dim) {
+        std::vector<int64_t> new_sizes(repeats_dim - self_dim, 1);
+        new_sizes.insert(new_sizes.end(), self.sizes().begin(), self.sizes().end());
+        src = ptsycl::view(self, new_sizes);
+    }
+
+    std::vector<int64_t> target_sizes(repeats_dim);
+    std::vector<int64_t> expanded_sizes;
+    std::vector<int64_t> expanded_strides;
+    expanded_sizes.reserve(repeats_dim * 2);
+    expanded_strides.reserve(repeats_dim * 2);
+
+    for (int64_t i = 0; i < repeats_dim; ++i) {
+        const int64_t r = repeats[i];
+        const int64_t s = src.size(i);
+        const int64_t st = src.stride(i);
+        target_sizes[i] = r * s;
+        expanded_sizes.push_back(r);
+        expanded_sizes.push_back(s);
+        expanded_strides.push_back(0);
+        expanded_strides.push_back(st);
+    }
+
+    Tensor expanded = ptsycl::as_strided(src, expanded_sizes, expanded_strides, src.storage_offset());
+    Tensor out = ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
+    ptsycl::_copy_from(expanded, out, /*non_blocking=*/false);
+    return out;
+}
+
+Tensor narrow(const Tensor& self, int64_t dim, c10::SymInt start_sym, c10::SymInt length_sym) {
+    PTSYCL_TRACE_OP("narrow.default");
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    const int64_t start = start_sym.expect_int();
+    const int64_t length = length_sym.expect_int();
+    const int64_t cur_size = self.size(d);
+    TORCH_CHECK(start >= 0 && start <= cur_size, "narrow: start out of range");
+    TORCH_CHECK(length >= 0 && start + length <= cur_size, "narrow: length out of range");
+
+    auto new_sizes = self.sizes().vec();
+    new_sizes[d] = length;
+    const int64_t new_offset = self.storage_offset() + start * self.stride(d);
+    return ptsycl::as_strided(self, new_sizes, self.strides(), new_offset);
+}
+
+Tensor contiguous(const Tensor& self, c10::MemoryFormat memory_format) {
+    PTSYCL_TRACE_OP("contiguous");
+    TORCH_CHECK(memory_format == c10::MemoryFormat::Contiguous,
+                "paras contiguous supports only Contiguous memory format");
+    if (self.is_contiguous(memory_format)) return self;
+    Tensor result = ptsycl::allocate_empty(self.sizes(), self.scalar_type(),
+                                           c10::kStrided, self.device(),
+                                           std::nullopt, std::nullopt);
+    ptsycl::_copy_from(self, result, /*non_blocking=*/false);
+    return result;
+}
+
+Tensor reshape(const Tensor& self, c10::IntArrayRef shape) {
+    PTSYCL_TRACE_OP("reshape");
+    auto inferred = at::infer_size_dv(shape, self.numel());
+    auto stride = at::detail::computeStride(self.sizes(), self.strides(), inferred);
+    if (stride.has_value()) {
+        return ptsycl::view(self, inferred);
+    }
+    return ptsycl::view(ptsycl::contiguous(self, c10::MemoryFormat::Contiguous), inferred);
+}
+
+Tensor repeat_interleave_int(const Tensor& self, c10::SymInt repeats_sym,
+                             std::optional<int64_t> dim,
+                             std::optional<int64_t> /*output_size*/) {
+    PTSYCL_TRACE_OP("repeat_interleave.self_int");
+    const int64_t repeats = repeats_sym.expect_int();
+    TORCH_CHECK(repeats >= 0, "repeat_interleave: repeats must be non-negative");
+
+    Tensor src = self;
+    int64_t d = 0;
+    if (!dim.has_value()) {
+        src = ptsycl::reshape(self, {self.numel()});
+        d = 0;
+    } else {
+        d = c10::maybe_wrap_dim(*dim, self.dim());
+    }
+
+    const int64_t size_at_d = src.size(d);
+    std::vector<int64_t> target_sizes = src.sizes().vec();
+    target_sizes[d] = size_at_d * repeats;
+
+    if (repeats == 0 || src.numel() == 0) {
+        return ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
+    }
+
+    std::vector<int64_t> exp_sizes;
+    std::vector<int64_t> exp_strides;
+    for (int64_t i = 0; i < src.dim(); ++i) {
+        if (i == d) {
+            exp_sizes.push_back(size_at_d);
+            exp_sizes.push_back(repeats);
+            exp_strides.push_back(src.stride(i));
+            exp_strides.push_back(0);
+        } else {
+            exp_sizes.push_back(src.size(i));
+            exp_strides.push_back(src.stride(i));
+        }
+    }
+
+    Tensor expanded = ptsycl::as_strided(src, exp_sizes, exp_strides, src.storage_offset());
+    Tensor out = ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
+    ptsycl::_copy_from(expanded, out, /*non_blocking=*/false);
+    return out;
+}
+
+Tensor repeat_interleave_tensor(const Tensor& self, const Tensor& repeats,
+                                std::optional<int64_t> dim,
+                                std::optional<int64_t> /*output_size*/) {
+    PTSYCL_TRACE_OP("repeat_interleave.self_Tensor");
+    Tensor rep = repeats.to(c10::kCPU).to(c10::kLong).contiguous();
+    const int64_t n_rep = rep.numel();
+
+    Tensor src = self;
+    int64_t d = 0;
+    if (!dim.has_value()) {
+        src = ptsycl::reshape(self, {self.numel()});
+        d = 0;
+    } else {
+        d = c10::maybe_wrap_dim(*dim, self.dim());
+    }
+
+    TORCH_CHECK(n_rep == src.size(d), "repeat_interleave: repeats length does not match dim size");
+    const int64_t* p_rep = rep.data_ptr<int64_t>();
+
+    int64_t total_out_dim = 0;
+    std::vector<int64_t> offsets(n_rep + 1, 0);
+    for (int64_t i = 0; i < n_rep; ++i) {
+        TORCH_CHECK(p_rep[i] >= 0, "repeat_interleave: repeats must be non-negative");
+        offsets[i] = total_out_dim;
+        total_out_dim += p_rep[i];
+    }
+    offsets[n_rep] = total_out_dim;
+
+    std::vector<int64_t> target_sizes = src.sizes().vec();
+    target_sizes[d] = total_out_dim;
+
+    Tensor out = ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
+    if (total_out_dim == 0 || src.numel() == 0) return out;
+
+    for (int64_t i = 0; i < n_rep; ++i) {
+        const int64_t count = p_rep[i];
+        if (count > 0) {
+            Tensor src_slice = ptsycl::narrow(src, d, i, 1);
+            Tensor dst_slice = ptsycl::narrow(out, d, offsets[i], count);
+            Tensor rep_src = ptsycl::repeat_interleave_int(src_slice, c10::SymInt(count), d, std::nullopt);
+            ptsycl::_copy_from(rep_src, dst_slice, /*non_blocking=*/false);
+        }
+    }
+    return out;
+}
+
+std::vector<Tensor> split_with_sizes(const Tensor& self, c10::SymIntArrayRef split_sizes_sym, int64_t dim) {
+    PTSYCL_TRACE_OP("split_with_sizes");
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    auto split_sizes = c10::asIntArrayRefUnchecked(split_sizes_sym);
+    const int64_t dim_size = self.size(d);
+
+    int64_t total_size = 0;
+    for (auto size : split_sizes) {
+        TORCH_CHECK(size >= 0, "split_with_sizes: split size must be non-negative");
+        total_size += size;
+    }
+    TORCH_CHECK(total_size == dim_size,
+                "split_with_sizes: sum of split sizes must equal dim size");
+
+    std::vector<Tensor> splits;
+    splits.reserve(split_sizes.size());
+    int64_t start = 0;
+    for (auto length : split_sizes) {
+        splits.push_back(ptsycl::narrow(self, d, start, length));
+        start += length;
+    }
+    return splits;
+}
+
+std::vector<Tensor> split(const Tensor& self, c10::SymInt split_size_sym, int64_t dim) {
+    PTSYCL_TRACE_OP("split.Tensor");
+    const int64_t split_size = split_size_sym.expect_int();
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    const int64_t dim_size = self.size(d);
+    TORCH_CHECK(split_size > 0, "split: split_size must be positive");
+
+    std::vector<int64_t> split_sizes;
+    int64_t remaining = dim_size;
+    while (remaining > 0) {
+        const int64_t current_size = std::min(split_size, remaining);
+        split_sizes.push_back(current_size);
+        remaining -= current_size;
+    }
+    if (split_sizes.empty()) split_sizes.push_back(0);
+    return ptsycl::split_with_sizes(self, split_sizes, d);
+}
+
+std::vector<Tensor> chunk(const Tensor& self, int64_t chunks, int64_t dim) {
+    PTSYCL_TRACE_OP("chunk");
+    TORCH_CHECK(chunks > 0, "chunk: chunks must be positive");
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    const int64_t dim_size = self.size(d);
+    const int64_t split_size = (dim_size + chunks - 1) / chunks;
+    return ptsycl::split(self, c10::SymInt(split_size > 0 ? split_size : 1), d);
+}
+
+Tensor squeeze_all(const Tensor& self) {
+    PTSYCL_TRACE_OP("squeeze");
+    std::vector<int64_t> new_sizes;
+    std::vector<int64_t> new_strides;
+    for (int64_t d = 0; d < self.dim(); ++d) {
+        if (self.size(d) != 1) {
+            new_sizes.push_back(self.size(d));
+            new_strides.push_back(self.stride(d));
+        }
+    }
+    return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
+}
+
+Tensor squeeze_dim(const Tensor& self, int64_t dim) {
+    PTSYCL_TRACE_OP("squeeze.dim");
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    if (self.dim() > 0 && self.size(d) == 1) {
+        std::vector<int64_t> new_sizes;
+        std::vector<int64_t> new_strides;
+        for (int64_t i = 0; i < self.dim(); ++i) {
+            if (i != d) {
+                new_sizes.push_back(self.size(i));
+                new_strides.push_back(self.stride(i));
+            }
+        }
+        return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
+    }
+    return self;
+}
+
+Tensor squeeze_dims(const Tensor& self, c10::IntArrayRef dims) {
+    PTSYCL_TRACE_OP("squeeze.dims");
+    const int64_t ndim = self.dim();
+    std::vector<bool> to_squeeze(ndim, false);
+    for (auto d : dims) {
+        const int64_t wrapped = c10::maybe_wrap_dim(d, ndim);
+        if (self.size(wrapped) == 1) {
+            to_squeeze[wrapped] = true;
+        }
+    }
+    std::vector<int64_t> new_sizes;
+    std::vector<int64_t> new_strides;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (!to_squeeze[i]) {
+            new_sizes.push_back(self.size(i));
+            new_strides.push_back(self.stride(i));
+        }
+    }
+    return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
+}
+
+Tensor unsqueeze(const Tensor& self, int64_t dim) {
+    PTSYCL_TRACE_OP("unsqueeze");
+    const int64_t new_dim = self.dim() + 1;
+    const int64_t d = c10::maybe_wrap_dim(dim, new_dim);
+    std::vector<int64_t> new_sizes(new_dim);
+    std::vector<int64_t> new_strides(new_dim);
+    for (int64_t i = 0, j = 0; i < new_dim; ++i) {
+        if (i == d) {
+            new_sizes[i] = 1;
+            new_strides[i] = (i < new_dim - 1 && j < self.dim()) ? self.size(j) * self.stride(j) : 1;
+        } else {
+            new_sizes[i] = self.size(j);
+            new_strides[i] = self.stride(j);
+            ++j;
+        }
+    }
+    return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
+}
+
+// -----------------------------------------------------------------------------
 // Boxed CPU fallback for everything not implemented natively.
 // -----------------------------------------------------------------------------
 void fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
@@ -598,6 +926,22 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::embedding", &ptsycl::embedding);
     m.impl("aten::embedding_dense_backward",
            &ptsycl::embedding_dense_backward);
+    m.impl("aten::transpose.int", &ptsycl::transpose);
+    m.impl("aten::permute", &ptsycl::permute);
+    m.impl("aten::expand", &ptsycl::expand);
+    m.impl("aten::repeat", &ptsycl::repeat);
+    m.impl("aten::repeat_interleave.self_int", &ptsycl::repeat_interleave_int);
+    m.impl("aten::repeat_interleave.self_Tensor", &ptsycl::repeat_interleave_tensor);
+    m.impl("aten::split.Tensor", &ptsycl::split);
+    m.impl("aten::split_with_sizes", &ptsycl::split_with_sizes);
+    m.impl("aten::chunk", &ptsycl::chunk);
+    m.impl("aten::contiguous", &ptsycl::contiguous);
+    m.impl("aten::reshape", &ptsycl::reshape);
+    m.impl("aten::squeeze", &ptsycl::squeeze_all);
+    m.impl("aten::squeeze.dim", &ptsycl::squeeze_dim);
+    m.impl("aten::squeeze.dims", &ptsycl::squeeze_dims);
+    m.impl("aten::unsqueeze", &ptsycl::unsqueeze);
+    m.impl("aten::narrow.default", &ptsycl::narrow);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
