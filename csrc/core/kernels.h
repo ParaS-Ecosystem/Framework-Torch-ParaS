@@ -67,6 +67,28 @@ inline StridedSpec make_spec(const at::Tensor& t) {
 // Elementwise helpers
 // -----------------------------------------------------------------------------
 
+template <typename T>
+PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
+#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_HIP)) && (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__))
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
+                  std::is_same_v<T, int> || std::is_same_v<T, unsigned int>) {
+        atomicAdd(address, val);
+    } else if constexpr (sizeof(T) == 8 && std::is_integral_v<T>) {
+        atomicAdd(reinterpret_cast<unsigned long long*>(address), static_cast<unsigned long long>(val));
+    } else if constexpr (std::is_same_v<T, bool>) {
+        if (val) *address = true;
+    } else {
+        *address += val;
+    }
+#else
+    if constexpr (std::is_same_v<T, bool>) {
+        if (val) *address = true;
+    } else {
+        *address += val;
+    }
+#endif
+}
+
 template <typename F>
 inline void launch_flat(compat::Queue& q, int64_t n, F fn) {
     if (n <= 0) return;

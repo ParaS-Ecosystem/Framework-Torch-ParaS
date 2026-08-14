@@ -895,6 +895,76 @@ Tensor unsqueeze(const Tensor& self, int64_t dim) {
     return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
 }
 
+Tensor slice(const Tensor& self, int64_t dim,
+             std::optional<c10::SymInt> start_sym,
+             std::optional<c10::SymInt> end_sym,
+             c10::SymInt step_sym) {
+    PTSYCL_TRACE_OP("slice.Tensor");
+    const int64_t ndim = self.dim();
+    if (ndim == 0) {
+        TORCH_CHECK(dim == 0 || dim == -1, "slice: dim ", dim, " on 0-d tensor");
+        return self.alias();
+    }
+    const int64_t d    = c10::maybe_wrap_dim(dim, ndim);
+    const int64_t len  = self.size(d);
+    const int64_t step = step_sym.expect_int();
+    TORCH_CHECK(step > 0, "slice: step must be > 0, got ", step);
+
+    int64_t start = start_sym.has_value() ? start_sym->expect_int() : 0;
+    int64_t end   = end_sym.has_value() ? end_sym->expect_int() : len;
+    if (start < 0) start += len;
+    if (end < 0)   end   += len;
+    start = std::clamp(start, int64_t(0), len);
+    end   = std::clamp(end,   start,      len);
+
+    auto new_sizes   = self.sizes().vec();
+    auto new_strides = self.strides().vec();
+    new_sizes[d]   = (end - start + step - 1) / step;
+    new_strides[d] = self.stride(d) * step;
+    const int64_t new_offset = self.storage_offset() + start * self.stride(d);
+
+    return ptsycl::as_strided(self, new_sizes, new_strides, new_offset);
+}
+
+Tensor _to_copy(
+    const Tensor& self,
+    std::optional<c10::ScalarType> dtype,
+    std::optional<c10::Layout> layout,
+    std::optional<c10::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<c10::MemoryFormat> memory_format) {
+    PTSYCL_TRACE_OP("_to_copy");
+
+    auto target_dtype  = dtype.value_or(self.scalar_type());
+    auto target_device = device.value_or(self.device());
+    auto target_format = memory_format.value_or(at::MemoryFormat::Preserve);
+    const bool preserve_strides = (target_format == at::MemoryFormat::Preserve) && self.is_non_overlapping_and_dense();
+    const auto alloc_format = (target_format == at::MemoryFormat::Preserve) ? at::MemoryFormat::Contiguous : target_format;
+
+    Tensor dst;
+    if (target_device.is_cpu()) {
+        if (preserve_strides) {
+            dst = at::empty_strided(self.sizes(), self.strides().vec(),
+                                    at::TensorOptions().dtype(target_dtype).device(c10::kCPU).pinned_memory(pin_memory.value_or(false)));
+        } else {
+            dst = at::empty(self.sizes(),
+                            at::TensorOptions().dtype(target_dtype).device(c10::kCPU).pinned_memory(pin_memory.value_or(false)),
+                            alloc_format);
+        }
+    } else {
+        if (preserve_strides) {
+            auto strides = self.strides().vec();
+            dst = ptsycl::empty_strided(self.sizes(), strides, target_dtype, layout, target_device, pin_memory);
+        } else {
+            dst = ptsycl::allocate_empty(self.sizes(), target_dtype, layout.value_or(c10::kStrided), target_device, pin_memory, alloc_format);
+        }
+    }
+
+    ptsycl::_copy_from(self, dst, non_blocking);
+    return dst;
+}
+
 // -----------------------------------------------------------------------------
 // Boxed CPU fallback for everything not implemented natively.
 // -----------------------------------------------------------------------------
@@ -917,6 +987,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::as_strided", &ptsycl::as_strided);
     m.impl("aten::_copy_from", &ptsycl::_copy_from);
     m.impl("aten::_copy_from_and_resize", &ptsycl::_copy_from_and_resize);
+    m.impl("aten::_to_copy", &ptsycl::_to_copy);
     m.impl("aten::fill_.Scalar", &ptsycl::fill_);
     m.impl("aten::zero_", &ptsycl::zero_);
     m.impl("aten::_local_scalar_dense", &ptsycl::_local_scalar_dense);
@@ -945,6 +1016,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::squeeze.dims", &ptsycl::squeeze_dims);
     m.impl("aten::unsqueeze", &ptsycl::unsqueeze);
     m.impl("aten::narrow", &ptsycl::narrow);
+    m.impl("aten::slice.Tensor", &ptsycl::slice);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
