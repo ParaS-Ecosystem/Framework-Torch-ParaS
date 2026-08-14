@@ -212,7 +212,9 @@ private:
     bool initialized_ = false;
     bool is_gpu_      = false;
     int  native_id_   = -1;
+#if defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_HIP)
     void* stream_     = nullptr; // cudaStream_t / hipStream_t depending on backend
+#endif
 };
 
 

@@ -29,6 +29,7 @@ MODULES = [
     "test_indexing_ops",
     "test_fused_ops",
     "test_random_ops",
+    "test_vision_ops",
 ]
 
 

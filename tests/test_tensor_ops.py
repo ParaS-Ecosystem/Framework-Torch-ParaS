@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 
 from common import assert_close
@@ -342,3 +344,46 @@ def test_narrow(device):
     dev_out = torch.narrow(dev_x, 1, 2, 3)
     assert_close(dev_out, cpu_out, "narrow")
 
+
+def test_shape_edge_cases(device):
+    empty = torch.empty((0, 3), dtype=torch.float32)
+    dev_empty = empty.to(device)
+    assert_close(dev_empty.expand(2, 0, 3), empty.expand(2, 0, 3),
+                 "expand empty")
+
+    split_cpu = torch.empty((0,), dtype=torch.float32)
+    split_dev = split_cpu.to(device)
+    cpu_parts = torch.split(split_cpu, 4)
+    dev_parts = torch.split(split_dev, 4)
+    assert len(dev_parts) == len(cpu_parts) == 1
+    assert_close(dev_parts[0], cpu_parts[0], "split empty")
+
+    x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    dev_x = x.to(device)
+    assert_close(dev_x.permute(2, 0, 1).reshape(4, 6),
+                 x.permute(2, 0, 1).reshape(4, 6),
+                 "reshape noncontiguous")
+
+
+def test_large_parallel_dispatch_stress(device):
+    x = torch.linspace(-2.0, 2.0, 1_000_000, dtype=torch.float32)
+    y = torch.linspace(1.0, 3.0, 1_000_000, dtype=torch.float32)
+    dev_x = x.to(device)
+    dev_y = y.to(device)
+    out = None
+    for _ in range(100):
+        out = torch.relu(dev_x + dev_y)
+    assert out is not None
+    assert_close(out, torch.relu(x + y), "large repeated parallel dispatch")
+
+
+def test_concurrent_parallel_dispatch(device):
+    def work(value):
+        x = torch.full((250_000,), float(value), device=device)
+        for _ in range(20):
+            x = torch.relu(x + 1.0)
+        return float(x[0])
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(work, range(4)))
+    assert results == [20.0, 21.0, 22.0, 23.0]
