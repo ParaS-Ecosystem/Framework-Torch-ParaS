@@ -19,19 +19,15 @@
 
 #include "compat/paras_compat.h"
 
+#include <ATen/Parallel.h>
+
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
-
-#if defined(PTSYCL_BACKEND_CPU)
-
-#include <kem/threadpool.hpp>
-#endif
 
 namespace ptsycl {
 namespace compat {
@@ -77,7 +73,9 @@ unsigned host_thread_count() {
             int v = std::atoi(env);
             if (v > 0) return static_cast<unsigned>(v);
         }
-        unsigned hc = std::thread::hardware_concurrency();
+        const int torch_threads = at::get_num_threads();
+        if (torch_threads > 0) return static_cast<unsigned>(torch_threads);
+        const unsigned hc = std::thread::hardware_concurrency();
         return hc == 0 ? 4u : hc;
     }();
     return n;
@@ -139,53 +137,62 @@ std::vector<DeviceInfo> enumerate_devices() {
 // -----------------------------------------------------------------------------
 // Host execution engine
 // -----------------------------------------------------------------------------
-#if defined(PTSYCL_BACKEND_CPU)
+namespace {
 
+extern "C" void GOMP_parallel(void (*fn)(void*), void* data,
+                              unsigned num_threads, unsigned flags);
 
-static threadpool& kem_pool() {
-    static threadpool pool;
-    return pool;
+std::size_t host_grain_size() {
+    static const std::size_t value = [] {
+        if (const char* env = std::getenv("PTSYCL_CPU_GRAIN_SIZE")) {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(env, &end, 10);
+            if (end != env && *end == '\0' && parsed > 0)
+                return static_cast<std::size_t>(parsed);
+        }
+        return std::size_t{16384};
+    }();
+    return value;
+}
+
+struct HostParallelJob {
+    std::size_t n;
+    std::size_t chunks;
+    std::size_t per;
+    host_chunk_fn body;
+    void* ctx;
+    std::atomic<std::size_t> next{0};
+};
+
+void run_host_parallel_job(void* raw_job) {
+    auto& job = *static_cast<HostParallelJob*>(raw_job);
+    while (true) {
+        const std::size_t chunk =
+            job.next.fetch_add(1, std::memory_order_relaxed);
+        if (chunk >= job.chunks) return;
+        const std::size_t begin = chunk * job.per;
+        const std::size_t end = std::min(begin + job.per, job.n);
+        if (begin < end) job.body(job.ctx, begin, end);
+    }
+}
+
 }
 
 void host_parallel_chunks(std::size_t n, host_chunk_fn body, void* ctx) {
     if (n == 0) return;
-    const std::size_t nt = host_thread_count();
-    if (n < 4096 || nt <= 1) { // not worth fanning out
+    const std::size_t thread_count = host_thread_count();
+    const std::size_t grain = host_grain_size();
+    if (thread_count <= 1 || n <= grain || at::in_parallel_region()) {
         body(ctx, 0, n);
         return;
     }
-    const std::size_t chunks = nt;
-    const std::size_t per    = (n + chunks - 1) / chunks;
-    // Each "index" the ParaS pool executes is one chunk of the real range.
-    kem_pool().execute_1D(sycl::range<1>(chunks), [=](sycl::id<1> c) {
-        const std::size_t b = c[0] * per;
-        const std::size_t e = b + per < n ? b + per : n;
-        if (b < e) body(ctx, b, e);
-    });
+    const std::size_t chunks =
+        std::min(thread_count, (n + grain - 1) / grain);
+    const std::size_t per = (n + chunks - 1) / chunks;
+    HostParallelJob job{n, chunks, per, body, ctx};
+    GOMP_parallel(run_host_parallel_job, &job,
+                  static_cast<unsigned>(chunks), 0);
 }
-
-#else 
-
-void host_parallel_chunks(std::size_t n, host_chunk_fn body, void* ctx) {
-    if (n == 0) return;
-    const std::size_t nt = host_thread_count();
-    if (n < 4096 || nt <= 1) {
-        body(ctx, 0, n);
-        return;
-    }
-    const std::size_t per = (n + nt - 1) / nt;
-    std::vector<std::thread> workers;
-    workers.reserve(nt);
-    for (std::size_t t = 0; t < nt; ++t) {
-        const std::size_t b = t * per;
-        const std::size_t e = b + per < n ? b + per : n;
-        if (b >= e) break;
-        workers.emplace_back([=] { body(ctx, b, e); });
-    }
-    for (auto& w : workers) w.join();
-}
-
-#endif
 
 // -----------------------------------------------------------------------------
 // CUDA helpers

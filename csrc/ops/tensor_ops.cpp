@@ -602,8 +602,10 @@ Tensor permute(const Tensor& self, c10::IntArrayRef dims) {
 Tensor expand(const Tensor& self, c10::SymIntArrayRef size, bool /*implicit*/) {
     PTSYCL_TRACE_OP("expand");
     auto target_sizes = c10::asIntArrayRefUnchecked(size);
-    auto result = at::infer_expand_geometry(self.sizes(), self.strides(), target_sizes);
-    return ptsycl::as_strided(self, result.sizes, result.strides, self.storage_offset());
+    const auto result =
+        at::inferExpandGeometry(self.sizes(), self.strides(), target_sizes);
+    return ptsycl::as_strided(self, std::get<0>(result), std::get<1>(result),
+                              self.storage_offset());
 }
 
 Tensor repeat(const Tensor& self, c10::SymIntArrayRef repeats_sym) {
@@ -671,8 +673,9 @@ Tensor contiguous(const Tensor& self, c10::MemoryFormat memory_format) {
     return result;
 }
 
-Tensor reshape(const Tensor& self, c10::IntArrayRef shape) {
+Tensor reshape(const Tensor& self, c10::SymIntArrayRef shape_sym) {
     PTSYCL_TRACE_OP("reshape");
+    const auto shape = c10::asIntArrayRefUnchecked(shape_sym);
     auto inferred = at::infer_size_dv(shape, self.numel());
     auto stride = at::detail::computeStride(self.sizes(), self.strides(), inferred);
     if (stride.has_value()) {
@@ -683,7 +686,7 @@ Tensor reshape(const Tensor& self, c10::IntArrayRef shape) {
 
 Tensor repeat_interleave_int(const Tensor& self, c10::SymInt repeats_sym,
                              std::optional<int64_t> dim,
-                             std::optional<int64_t> /*output_size*/) {
+                             std::optional<c10::SymInt> /*output_size*/) {
     PTSYCL_TRACE_OP("repeat_interleave.self_int");
     const int64_t repeats = repeats_sym.expect_int();
     TORCH_CHECK(repeats >= 0, "repeat_interleave: repeats must be non-negative");
@@ -727,7 +730,7 @@ Tensor repeat_interleave_int(const Tensor& self, c10::SymInt repeats_sym,
 
 Tensor repeat_interleave_tensor(const Tensor& self, const Tensor& repeats,
                                 std::optional<int64_t> dim,
-                                std::optional<int64_t> /*output_size*/) {
+                                std::optional<c10::SymInt> /*output_size*/) {
     PTSYCL_TRACE_OP("repeat_interleave.self_Tensor");
     Tensor rep = repeats.to(c10::kCPU).to(c10::kLong).contiguous();
     const int64_t n_rep = rep.numel();
@@ -802,14 +805,14 @@ std::vector<Tensor> split(const Tensor& self, c10::SymInt split_size_sym, int64_
     const int64_t dim_size = self.size(d);
     TORCH_CHECK(split_size > 0, "split: split_size must be positive");
 
-    std::vector<int64_t> split_sizes;
+    std::vector<c10::SymInt> split_sizes;
     int64_t remaining = dim_size;
     while (remaining > 0) {
         const int64_t current_size = std::min(split_size, remaining);
-        split_sizes.push_back(current_size);
+        split_sizes.emplace_back(current_size);
         remaining -= current_size;
     }
-    if (split_sizes.empty()) split_sizes.push_back(0);
+    if (split_sizes.empty()) split_sizes.emplace_back(0);
     return ptsycl::split_with_sizes(self, split_sizes, d);
 }
 
@@ -941,7 +944,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::squeeze.dim", &ptsycl::squeeze_dim);
     m.impl("aten::squeeze.dims", &ptsycl::squeeze_dims);
     m.impl("aten::unsqueeze", &ptsycl::unsqueeze);
-    m.impl("aten::narrow.default", &ptsycl::narrow);
+    m.impl("aten::narrow", &ptsycl::narrow);
 }
 
 TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
@@ -952,9 +955,6 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
 TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
     m.fallback(torch::CppFunction::makeFallthrough());
 }
-
-
-
 
 
 

@@ -145,6 +145,14 @@ target_link_directories(torch_paras_C PRIVATE
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )
 
+find_library(PTSYCL_GOMP_LIBRARY NAMES gomp
+    HINTS "${PTSYCL_GCC_TOOLCHAIN}/lib64" "${PTSYCL_GCC_TOOLCHAIN}/lib")
+if(NOT PTSYCL_GOMP_LIBRARY)
+    message(FATAL_ERROR "GNU OpenMP runtime (libgomp) not found under "
+                        "PTSYCL_GCC_TOOLCHAIN=${PTSYCL_GCC_TOOLCHAIN}")
+endif()
+message(STATUS "GNU OpenMP     : ${PTSYCL_GOMP_LIBRARY}")
+
 # parascc's own clang resource dir may not ship compiler-rt (a "clang+llvm
 # only" build skips the separate runtimes project), and older GCC libgcc
 # archives are missing some newer soft-float builtins (e.g. __truncsfbf2,
@@ -154,10 +162,22 @@ target_link_directories(torch_paras_C PRIVATE
 set(PTSYCL_CLANG_RT_BUILTINS "" CACHE FILEPATH
     "Override: path to a libclang_rt.builtins*.a providing soft-float builtins")
 if(NOT PTSYCL_CLANG_RT_BUILTINS)
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _ptsycl_host_processor)
+    if(_ptsycl_host_processor MATCHES "^(x86_64|amd64)$")
+        set(_ptsycl_rt_arch "x86_64*")
+    elseif(_ptsycl_host_processor MATCHES "^(aarch64|arm64)$")
+        set(_ptsycl_rt_arch "aarch64*")
+    elseif(_ptsycl_host_processor MATCHES "^(i[3-6]86|x86)$")
+        set(_ptsycl_rt_arch "i386*")
+    else()
+        message(WARNING "Unknown host processor '${CMAKE_SYSTEM_PROCESSOR}'; "
+                        "set PTSYCL_CLANG_RT_BUILTINS explicitly if linking fails")
+        set(_ptsycl_rt_arch "*")
+    endif()
     file(GLOB _ptsycl_rt_candidates
-        "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/*/libclang_rt.builtins*.a"
-        "/usr/lib/clang/*/lib/*/libclang_rt.builtins*.a"
-        "/usr/lib64/clang/*/lib/*/libclang_rt.builtins*.a"
+        "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
+        "/usr/lib/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
+        "/usr/lib64/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
     )
     if(_ptsycl_rt_candidates)
         list(GET _ptsycl_rt_candidates 0 PTSYCL_CLANG_RT_BUILTINS)
@@ -174,6 +194,7 @@ target_link_libraries(torch_paras_C PRIVATE
     torch torch_cpu torch_python c10
     ${Python3_LIBRARIES}
     pthread
+    "${PTSYCL_GOMP_LIBRARY}"
 )
 
 if(PTSYCL_CLANG_RT_BUILTINS)

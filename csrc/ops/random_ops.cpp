@@ -90,7 +90,9 @@ void fill_random(Tensor& self, Gen gen) {
 Tensor& uniform_(Tensor& self, double from, double to,
                  std::optional<at::Generator> /*generator*/) {
     PTSYCL_TRACE_OP("uniform_");
-    const auto [seed, seq] = draw_state(self, self.numel());
+    const auto state = draw_state(self, self.numel());
+    const uint64_t seed = state.first;
+    const uint64_t seq = state.second;
     const float lo = static_cast<float>(from);
     const float hi = static_cast<float>(to);
     fill_random(self, [=](int64_t i) {
@@ -104,7 +106,9 @@ Tensor& uniform_(Tensor& self, double from, double to,
 Tensor& normal_(Tensor& self, double mean, double std,
                 std::optional<at::Generator> /*generator*/) {
     PTSYCL_TRACE_OP("normal_");
-    const auto [seed, seq] = draw_state(self, self.numel());
+    const auto state = draw_state(self, self.numel());
+    const uint64_t seed = state.first;
+    const uint64_t seq = state.second;
     const float m = static_cast<float>(mean);
     const float s = static_cast<float>(std);
     fill_random(self, [=](int64_t i) {
@@ -121,7 +125,9 @@ Tensor& normal_(Tensor& self, double mean, double std,
 Tensor& bernoulli_(Tensor& self, double p,
                    std::optional<at::Generator> /*generator*/) {
     PTSYCL_TRACE_OP("bernoulli_");
-    const auto [seed, seq] = draw_state(self, self.numel());
+    const auto state = draw_state(self, self.numel());
+    const uint64_t seed = state.first;
+    const uint64_t seq = state.second;
     const float fp = static_cast<float>(p);
     fill_random(self, [=](int64_t i) {
         uint32_t r0, r1;
@@ -147,7 +153,9 @@ std::tuple<Tensor, Tensor> native_dropout(const Tensor& input, double p,
     Tensor mask  = at::empty(in_c.sizes(),
                              in_c.options().dtype(c10::kBool));
     const int64_t n = in_c.numel();
-    const auto [seed, seq] = draw_state(input, n);
+    const auto state = draw_state(input, n);
+    const uint64_t seed = state.first;
+    const uint64_t seq = state.second;
     const float keep  = static_cast<float>(1.0 - p);
     const float scale = 1.0f / keep;
 

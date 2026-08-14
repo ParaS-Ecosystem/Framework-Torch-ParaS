@@ -25,7 +25,7 @@ PyTorch dispatcher --- looks at tensor device ---
 ## Device Registration
 
 - Device 0 (`paras` / `paras:0`) always exists and executes on the host
-  CPU through the ParaS runtime's threadpool engine (`kem`).
+  CPU. Large flat kernels use an OpenMP team; small kernels stay serial.
 - In CUDA-enabled builds, devices `paras:1..N` map to the visible NVIDIA
   GPUs (enumerated the same way CUDA enumerates them).
 - Device registration and enumeration lives in `csrc/core`; the
@@ -65,9 +65,11 @@ responsible for:
 
 ## Streams and Execution
 
-- Kernel launches go through the ParaS runtime's execution primitives —
-  the CPU threadpool engine (`kem`) for device 0, and the ParaS
-  compiler-generated device code for GPU devices.
+- CPU flat-kernel launches use the host OpenMP runtime to reuse worker
+  threads instead of creating threads per operation. `PTSYCL_CPU_THREADS`
+  overrides the default PyTorch intra-op thread count and
+  `PTSYCL_CPU_GRAIN_SIZE` controls the parallelization threshold.
+- GPU launches use ParaS compiler-generated device code.
 - Device-guard and stream/event abstractions in `csrc/core` are kept
   symmetric between CPU and CUDA code paths, so code above this layer
   doesn't need to branch on device type to launch work correctly.
