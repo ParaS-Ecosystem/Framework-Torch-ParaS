@@ -59,10 +59,16 @@ if(PTSYCL_DEVICE STREQUAL "cpu")
     set(PTSYCL_DEVICE_FLAGS "")
 elseif(PTSYCL_DEVICE MATCHES "^cuda:sm_[0-9]+$")
     set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_CUDA)
-    set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_DEVICE}")
     if(NOT PTSYCL_CUDA_HOME)
         message(FATAL_ERROR "PTSYCL_CUDA_HOME required for ${PTSYCL_DEVICE}")
     endif()
+    # parascc is clang-based; drive its native CUDA/NVPTX path directly.
+    # (The historical "-parasdevice cuda:sm_XX" spelling is not a real parascc
+    #  flag in the installed toolchain, so the CUDA flavor never built. These
+    #  standard clang-CUDA flags do compile & emit sm_XX device code.)
+    string(REGEX REPLACE "^cuda:" "" PTSYCL_CUDA_ARCH "${PTSYCL_DEVICE}")
+    set(PTSYCL_DEVICE_FLAGS
+        "-x;cuda;--cuda-gpu-arch=${PTSYCL_CUDA_ARCH};--cuda-path=${PTSYCL_CUDA_HOME};-Wno-unknown-cuda-version")
 elseif(PTSYCL_DEVICE MATCHES "^hip:gfx[0-9a-zA-Z]+$")
     set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_HIP)
     set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_DEVICE}")
@@ -211,7 +217,9 @@ if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_CUDA")
     target_link_directories(torch_paras_C PRIVATE "${PTSYCL_CUDA_HOME}/lib64")
     target_link_libraries(torch_paras_C PRIVATE cudart)
     list(APPEND PTSYCL_RPATHS "${PTSYCL_CUDA_HOME}/lib64")
-    target_link_options(torch_paras_C PRIVATE ${PTSYCL_DEVICE_FLAGS})
+    # Link is an ordinary host link: each .o already carries its embedded
+    # sm_XX fatbin + CUDA registration stubs. Do NOT pass "-x cuda" here.
+    target_link_options(torch_paras_C PRIVATE "--cuda-path=${PTSYCL_CUDA_HOME}")
 endif()
 
 if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")

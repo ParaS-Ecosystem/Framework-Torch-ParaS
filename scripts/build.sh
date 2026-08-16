@@ -14,9 +14,20 @@ BUILD_TYPE="${2:-Release}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/env.sh"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 case "${FLAVOR}" in
-    cpu)  DEVICE="cpu" ;;
-    cuda) DEVICE="${PTSYCL_CUDA_ARCH:-cuda:sm_70}" ;;
+    # CPU flavor: parascc wrapper (adds clang resource-dir / include -isystem).
+    cpu)  DEVICE="cpu"
+          CXX_COMPILER="${SCRIPT_DIR}/parascc-cpu"
+          # parascc names its /tmp intermediates with second resolution; parallel
+          # compiles would race on them, so the CPU build is serial by design.
+          BUILD_JOBS="1" ;;
+    # CUDA flavor: clang++ driven directly (bypasses parascc's expfinder, which
+    # miscompiles X-macro lambdas). No /tmp race, so it can build in parallel.
+    cuda) DEVICE="${PTSYCL_CUDA_ARCH:-cuda:sm_70}"
+          CXX_COMPILER="${SCRIPT_DIR}/parascc-cuda"
+          BUILD_JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}" ;;
     hip)
         if [[ -n "${PTSYCL_HIP_ARCH:-}" ]]; then
             DEVICE="${PTSYCL_HIP_ARCH}"
@@ -41,6 +52,9 @@ case "${FLAVOR}" in
             echo "       Set PTSYCL_HIP_ARCH=hip:gfxXXX explicitly (check with: rocminfo | grep gfx)." >&2
             exit 1
         fi
+        CXX_COMPILER="${PARAS_HOME}/bin/parascc"
+        # HIP still goes through parascc -parasdevice, so keep it serial.
+        BUILD_JOBS="1"
         ;;
     *) echo "usage: build.sh [cpu|cuda|hip] [Release|Debug]" >&2; exit 1 ;;
 esac
@@ -59,7 +73,7 @@ fi
 
 "${CMAKE_BIN}" -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-    -DCMAKE_CXX_COMPILER="${PARAS_HOME}/bin/parascc" \
+    -DCMAKE_CXX_COMPILER="${CXX_COMPILER}" \
     -DPTSYCL_DEVICE="${DEVICE}" \
     -DPTSYCL_GCC_TOOLCHAIN="${PTSYCL_GCC_TOOLCHAIN}" \
     -DPTSYCL_TORCH_DIR="${PTSYCL_TORCH_DIR}" \
@@ -68,9 +82,7 @@ fi
     -DPARAS_HOME="${PARAS_HOME}" \
     -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
 
-# parascc names its /tmp intermediates with second resolution; parallel
-# compiles would race on them, so the build is serial by design.
-"${CMAKE_BIN}" --build "${BUILD_DIR}" -- -j1
+"${CMAKE_BIN}" --build "${BUILD_DIR}" -- -j"${BUILD_JOBS}"
 
 cp "${BUILD_DIR}/lib/_C.so" "${REPO_ROOT}/python/torch_paras/_C.so"
 echo "[build.sh] installed ${FLAVOR} flavor -> python/torch_paras/_C.so"

@@ -35,6 +35,15 @@
 
 #if defined(PTSYCL_BACKEND_CUDA)
 #include <cuda_runtime.h>
+// CUDA's <crt/host_defines.h> defines __noinline__ as a function-style macro
+// (-> __attribute__((noinline))) whenever __CUDACC__ is set. libstdc++ 13.x
+// spells its own attribute as __attribute__((__noinline__)) in <memory>, so the
+// macro expansion turns that into __attribute__((__attribute__((noinline)))) and
+// fails to compile. We never use the __noinline__ specifier in device code, so
+// dropping the macro right after the CUDA runtime header is safe and local.
+#ifdef __noinline__
+#undef __noinline__
+#endif
 #endif
 
 #if defined(PTSYCL_BACKEND_HIP)
