@@ -1,14 +1,14 @@
 # Building torch-paras
 
 This guide goes from a bare Linux machine to a working `paras` device in
-PyTorch. I keep the exact versions I built and tested with; newer ones may
-work but I have not tried them.
+PyTorch. The exact versions below are the ones it was built and tested
+with; newer ones may work but are untested.
 
 ## 1. Hardware and OS
 
 - Linux x86_64 (built on RHEL 8, kernel 4.18)
 - Intel CPU (any reasonably modern Xeon/Core works)
-- Optional: NVIDIA GPU for the CUDA flavor. I test on Tesla V100 (sm_70).
+- Optional: NVIDIA GPU for the CUDA flavor. Tested on Tesla V100 (sm_70).
   Set `PTSYCL_CUDA_ARCH` if your GPU has a different compute capability,
   e.g. `cuda:sm_80` for A100.
 - Optional: AMD GPU for the HIP flavor. `scripts/build.sh hip` auto-detects
@@ -30,7 +30,7 @@ The ParaS compiler driver (`parascc`) is clang-based and needs:
 | CUDA toolkit | 12.2 | CUDA flavor only |
 | ROCm | 6.x | HIP flavor only |
 | CMake | >= 3.18 | build system |
-| Python | 3.10 | matches the PyTorch build below |
+| Python | 3.10 / 3.11 / 3.12 | 3.10 for V100 and CPU, 3.11 for H200, 3.12 for MI300X |
 | PyTorch | 2.5.1 | the backend links against libtorch from this install |
 
 PyTorch comes from a normal conda env:
@@ -89,7 +89,7 @@ Notes:
 
 - The build is intentionally serial (`-j1`). parascc names its temporary
   files with second resolution, so parallel compiles would race on them.
-  A full CUDA or HIP build takes around 15 minutes on our machine.
+  A full CUDA or HIP build takes around 15 minutes on the reference machine.
 - The built extension is copied to `python/torch_paras/_C.so`. Whichever
   flavor you built last is the one `import torch_paras` loads.
 - Build trees live under `build/cpu`, `build/cuda`, and `build/hip`;
@@ -118,11 +118,6 @@ benchmark scripts already do this themselves).
 
 ## 7. Run the benchmarks
 
-```bash
-python benchmarks/bench_ops.py --device paras:1 --json ops.json
-python benchmarks/bench_models.py --json models.json
-python benchmarks/make_report.py --ops ops.json --models models.json
-```
-
-The last command regenerates the figures and tables in docs/benchmarks/.
-See docs/BENCHMARKS.md for the numbers from our reference machine.
+See [benchmark/super-resolution/GUIDE.md](../benchmark/super-resolution/GUIDE.md)
+for the super-resolution suite: datasets, the three measured arms, and how
+to read the output.

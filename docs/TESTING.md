@@ -29,6 +29,10 @@ The exit code is the number of failed tests, so it slots into CI as is.
   statistical properties, not exact values.
 - `test_vision_ops.py` — adaptive pooling, linear, and nearest-neighbor
   upsampling, ensuring the large vision translation unit is linked.
+- `test_fused_ops.py` — RMS norm, SwiGLU, and rotate-half, forward and
+  backward.
+- `test_indexing_ops.py` — gather, index_select, index_copy_, index_put_
+  (including accumulate), indexing by tensor, where, triu, tril.
 
 Each test function takes the device string as its one argument, so adding
 a test means adding a `test_*` function to the right module. The harness

@@ -1,9 +1,8 @@
 # Operator Coverage
 
 What runs natively on `paras`, what falls back to CPU, and what's tested.
-This is hand-maintained until CI can generate it automatically (see
-Roadmap Milestone 1/5) — update it in the same PR that adds or changes a
-kernel.
+This is hand-maintained until CI can generate it automatically — update it
+in the same PR that adds or changes a kernel.
 
 ## Status Legend
 
@@ -36,6 +35,9 @@ confirmed — this table currently tracks category-level status only.
 | RNG (Philox counter-based) | Native | Yes | `test_random_ops.py` | Statistical checks, not exact-value |
 | Dropout (train/eval, backward) | Native | Yes | `test_random_ops.py` | |
 | Multi-head attention | Native | **No** | — | Kernel exists per README; no dedicated parity test yet |
+| RMS norm, SwiGLU, rotate-half (fwd + bwd) | Native | Yes | `test_fused_ops.py` | |
+| Indexing (`gather`, `index_select`, `index_copy_`, `index_put_`) | Native | Yes | `test_indexing_ops.py` | Includes accumulate mode |
+| `where`, `triu`, `tril` | Native | Yes | `test_indexing_ops.py` | |
 | Anything not listed above | Fallback | N/A | — | Runs via boxed CPU fallback automatically |
 
 ## Known Gaps
@@ -43,8 +45,7 @@ confirmed — this table currently tracks category-level status only.
 - No per-operator (as opposed to per-category) tracking yet — e.g. we
   don't currently distinguish `conv1d` vs `conv2d` vs `conv3d` coverage.
   Break this table out further as gaps are found.
-- No fallback-ratio measurement tooling yet for full models (tracked in
-  `docs/MODEL_VALIDATION.md` and Roadmap Milestone 3).
+- No fallback-ratio measurement tooling yet for full models.
 - Autograd (backward-pass) coverage isn't tracked separately from forward
   coverage here yet — worth splitting into its own column once backward
   tests exist for more than dropout.
