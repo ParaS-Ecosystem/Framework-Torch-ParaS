@@ -36,12 +36,16 @@ NVIDIA or AMD GPUs, respectively (a single build is one flavor or the
 other, never both).
 """
 
+import dataclasses
+import sys
 import types
 
 import torch
 
 from . import _C
 from . import nn  # noqa: F401
+from .optimizer import (OptimizationSpec, OptimizedModule, autotune,
+                        calibrate_fp8, capability_matrix)
 
 __all__ = [
     "device_count",
@@ -52,7 +56,39 @@ __all__ = [
     "device_name",
     "backend_name",
     "nn",
+    "OptimizationSpec",
+    "OptimizedModule",
+    "autotune",
+    "calibrate_fp8",
+    "capability_matrix",
+    "extension_selection",
 ]
+
+__version__ = "2026.8.0.2.0"
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtensionSelection:
+    """Which native extension this import is running against."""
+
+    platform: str
+    python_abi: str
+    plugin: str | None
+    error: str | None = None
+
+
+def extension_selection() -> ExtensionSelection:
+    """Provenance for a result file: what was loaded, and from where.
+
+    A source build has exactly one extension, the one it just compiled, so
+    there is nothing to select between -- but benchmarks record this either
+    way, and an install method should not change the shape of the evidence.
+    """
+    return ExtensionSelection(
+        platform=_C.backend_name(),
+        python_abi=f"cp{sys.version_info.major}{sys.version_info.minor}",
+        plugin=getattr(_C, "__file__", None),
+    )
 
 
 def device_count() -> int:
