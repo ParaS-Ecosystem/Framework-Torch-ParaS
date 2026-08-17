@@ -89,6 +89,16 @@ case "${FLAVOR}" in
     *) echo "usage: build.sh [auto|cpu|cuda|hip] [Release|Debug]" >&2; exit 1 ;;
 esac
 
+# PTSYCL_CXX overrides the driver chosen above. The flavor still decides the
+# device flags and the PTSYCL_BACKEND_* define, so this only swaps which
+# program compiles: useful when the ParaS install on a machine cannot build
+# the flavor you need and hipcc or clang++ can (scripts/parascc-hip-direct
+# is such an adapter).
+if [[ -n "${PTSYCL_CXX:-}" ]]; then
+    CXX_COMPILER="${PTSYCL_CXX}"
+    echo "[build.sh] compiler overridden: ${CXX_COMPILER}"
+fi
+
 BUILD_DIR="${REPO_ROOT}/build/${FLAVOR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -110,7 +120,9 @@ fi
     -DPTSYCL_CUDA_HOME="${PTSYCL_CUDA_HOME}" \
     -DPTSYCL_ROCM_HOME="${PTSYCL_ROCM_HOME}" \
     -DPARAS_HOME="${PARAS_HOME}" \
-    -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
+    -DPython3_EXECUTABLE="${PTSYCL_PYTHON}" \
+    ${PTSYCL_PYTHON_INCLUDE:+-DPython3_INCLUDE_DIR=${PTSYCL_PYTHON_INCLUDE}} \
+    ${PTSYCL_PYTHON_LIBRARY:+-DPython3_LIBRARY=${PTSYCL_PYTHON_LIBRARY}}
 
 "${CMAKE_BIN}" --build "${BUILD_DIR}" -- -j"${BUILD_JOBS}"
 
