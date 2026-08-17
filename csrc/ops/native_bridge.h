@@ -29,7 +29,10 @@ inline at::Tensor as_native(const at::Tensor& t) {
     if (!is_paras_tensor(t)) return t;
     auto& q = queue_for(t);
     c10::Device native_dev = c10::Device(c10::kCPU);
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_HIP)
+    // A ROCm build of PyTorch labels AMD GPUs c10::kCUDA as well, so the same
+    // device type covers both vendors and the aliased tensor dispatches to
+    // cuDNN/cuBLAS or MIOpen/rocBLAS according to how torch itself was built.
     if (q.is_gpu()) native_dev = c10::Device(c10::kCUDA, q.native_id());
 #endif
     return at::from_blob(

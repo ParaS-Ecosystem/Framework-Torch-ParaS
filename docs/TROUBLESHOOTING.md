@@ -17,9 +17,23 @@ this file in the same PR.
   `PARAS_HOME`, `PTSYCL_GCC_TOOLCHAIN`, `PTSYCL_LLVM_DIR`,
   `PTSYCL_CUDA_HOME`, and `PTSYCL_PYTHON` — a stale environment from a
   previous shell session is a common cause of confusing errors.
-- The build is intentionally single-threaded (`-j1`) because `parascc`
-  names temporary files with second-resolution timestamps; a full CUDA
-  build taking ~15 minutes is expected, not a sign something is stuck.
+- The build uses all cores (`-j$(nproc)`). Override with `JOBS`, e.g.
+  `JOBS=1 scripts/build.sh cpu`, if you need a serial build.
+
+### Objects built from the wrong source file
+
+The `cpu` and `hip` flavors go through `parascc`'s source-transformation
+stage, which writes an intermediate `.cpp` per translation unit. Older
+`parascc` builds name that file with a second-resolution timestamp, so
+two compiles starting in the same second write to the same path and the
+objects that come out are built from whichever source won the race. The
+build still succeeds and produces a working `_C.so` that behaves like a
+different translation unit — no error is reported. Symptoms are tests
+failing in ops you did not touch.
+
+Rebuild with `JOBS=1`. If that fixes it, your `parascc` has this race;
+it needs a build whose intermediates carry the pid. The `cuda` flavor is
+unaffected because it does not use that stage.
 
 ### Wrong GPU architecture / CUDA build targets the wrong compute capability
 
