@@ -152,7 +152,8 @@ run to a few seconds while checking a setup.
 | Torch-ParaS | `torch_paras.autotune` — autocast, channels-last, `torch.compile` and explicit CUDA-graph capture, selected per model after a numerical fidelity check |
 
 Both optimized arms are compiled and graph-replayed, so the comparison between
-them is like-for-like.
+them is like-for-like. All three run on the native `cuda`/`hip` device; the
+`paras` device is exercised untimed, by the parity column.
 
 Two ratios are reported: `speedup` against eager, which is deliberately
 unoptimized and so mixes precision and compilation into the result, and
@@ -175,6 +176,7 @@ like-for-like figure. `make_tables.py` also derives **vs PyTorch best**,
 | `speedup_vs_pytorch_optimized` | compiled ÷ Torch-ParaS |
 | `pytorch_optimized_status` | `compiled`, or why not |
 | `fidelity_psnr_db` | agreement with the eager reference |
+| `direct_paras_fp32_parity_max_abs` | the model run on the `paras` device, largest absolute difference from the eager reference — correctness, not latency |
 | `*_peak_allocated_mib` | peak memory per arm |
 
 Where `torch.compile` cannot run, `pytorch_optimized_status` records why and
