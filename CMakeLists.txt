@@ -63,9 +63,12 @@ elseif(PTSYCL_DEVICE MATCHES "^cuda:sm_[0-9]+$")
         message(FATAL_ERROR "PTSYCL_CUDA_HOME required for ${PTSYCL_DEVICE}")
     endif()
     # parascc is clang-based; drive its native CUDA/NVPTX path directly.
-    # (The historical "-parasdevice cuda:sm_XX" spelling is not a real parascc
-    #  flag in the installed toolchain, so the CUDA flavor never built. These
-    #  standard clang-CUDA flags do compile & emit sm_XX device code.)
+    # "-parasdevice cuda:sm_XX" is the intended spelling and current parascc
+    # builds accept it -- the whole backend compiles and passes through it,
+    # producing an extension byte-for-byte equivalent in behaviour. Older
+    # installed toolchains reject the flag outright, so these standard
+    # clang-CUDA flags are used instead: they need nothing from parascc beyond
+    # clang itself, and the CUDA flavor does not use its transformation stage.
     string(REGEX REPLACE "^cuda:" "" PTSYCL_CUDA_ARCH "${PTSYCL_DEVICE}")
     set(PTSYCL_DEVICE_FLAGS
         "-x;cuda;--cuda-gpu-arch=${PTSYCL_CUDA_ARCH};--cuda-path=${PTSYCL_CUDA_HOME};-Wno-unknown-cuda-version")
