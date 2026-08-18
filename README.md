@@ -31,6 +31,25 @@ vendor). Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
   fallback, so models keep working while coverage grows.
 - A binned memory pool per device on top of CUDA or HIP unified memory
   (GPU) or aligned host memory (CPU).
+- `torch_paras.autotune`, a whole-graph inference optimizer. It searches
+  precision, memory format, `torch.compile` and CUDA-graph capture for the
+  model and shape you give it, and keeps the fastest configuration that
+  still matches the eager reference above a PSNR floor.
+
+## Benchmarks
+
+[benchmark/super-resolution/](benchmark/super-resolution/) measures ten
+super-resolution models on five standard datasets, three ways: PyTorch
+eager, PyTorch with `torch.compile`, and `torch_paras.autotune`. On a
+Tesla V100, 40/40 cells, geomean **1.24x** against the `torch.compile`
+arm and **2.8x** against eager. [GUIDE.md](benchmark/super-resolution/GUIDE.md)
+has the install, dataset and run steps.
+
+Both optimized arms are compiled and graph-replayed on the native device,
+so that ratio compares one optimization strategy against PyTorch's own.
+It is not a measurement of the `paras` device, which runs the same models
+untimed in the same pass as a correctness check — the results carry a
+`direct_paras_fp32_parity_max_abs` column for that.
 
 ## Repository layout
 
