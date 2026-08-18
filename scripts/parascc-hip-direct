@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Direct HIP compiler adapter for raw-HIP Torch-ParaS backend sources.
+# CMake adds the ParaS selector as two arguments; hipcc needs the equivalent
+# offload architecture flag and otherwise receives the command unchanged.
+set -euo pipefail
+
+ROCM_ROOT="${PTSYCL_ROCM_HOME:-/opt/rocm}"
+HIP_ARCH="${PTSYCL_HIP_ARCH:-hip:gfx942}"
+HIP_ARCH="${HIP_ARCH#hip:}"
+HIP_CODE_OBJECT_VERSION="${PTSYCL_HIP_CODE_OBJECT_VERSION:-5}"
+args=()
+skip_next=0
+for arg in "$@"; do
+    if [[ "$skip_next" == 1 ]]; then
+        skip_next=0
+        continue
+    fi
+    if [[ "$arg" == "-parasdevice" ]]; then
+        skip_next=1
+        continue
+    fi
+    args+=("$arg")
+done
+
+exec "$ROCM_ROOT/bin/hipcc" \
+    "--offload-arch=$HIP_ARCH" \
+    "-mcode-object-version=$HIP_CODE_OBJECT_VERSION" \
+    "${args[@]}"

@@ -234,18 +234,20 @@ void Queue::init(const DeviceInfo& dev) {
 #if defined(PTSYCL_BACKEND_CUDA)
     if (is_gpu_) {
         detail::throw_on_cuda_error(cudaSetDevice(native_id_), "cudaSetDevice(init)");
-        cudaStream_t s = nullptr;
-        detail::throw_on_cuda_error(
-            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "cudaStreamCreate");
-        stream_ = s;
+        // Use the default stream (0), which is also the stream native ATen ops
+        // run on by default. Sharing one stream means paras kernels and native
+        // (cuDNN/cuBLAS or MIOpen/rocBLAS) ops are ordered by the stream itself,
+        // so the native-op bridge needs no cross-stream synchronization.
+        stream_ = nullptr;
     }
 #elif defined(PTSYCL_BACKEND_HIP)
     if (is_gpu_) {
         detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(init)");
-        hipStream_t s = nullptr;
-        detail::throw_on_hip_error(
-            hipStreamCreateWithFlags(&s, hipStreamNonBlocking), "hipStreamCreate");
-        stream_ = s;
+        // Use the default stream (0), which is also the stream native ATen ops
+        // run on by default. Sharing one stream means paras kernels and native
+        // (cuDNN/cuBLAS or MIOpen/rocBLAS) ops are ordered by the stream itself,
+        // so the native-op bridge needs no cross-stream synchronization.
+        stream_ = nullptr;
     }
 #else
     if (is_gpu_) fail("GPU device requested in a CPU-only build");

@@ -18,6 +18,7 @@
 
 
 #include "core/kernels.h"
+#include "ops/native_bridge.h"
 #include <ATen/ATen.h>
 #include <torch/torch.h>
 #include <ATen/ops/_native_multi_head_attention_cpu_dispatch.h>
@@ -32,23 +33,13 @@ using torch::autograd::AutogradContext;
 using c10::Device;
 using c10::DeviceType;
 
-static Tensor to_cpu(const Tensor& t) {
-    return t.contiguous().to(c10::Device(c10::kCPU));
-}
-
-static Tensor to_device(const Tensor& cpu_t, c10::Device dev) {
-    Tensor result = at::empty(cpu_t.sizes(), at::device(dev).dtype(cpu_t.scalar_type()));
-    auto& q = queue_for(result);
-    q.copy(result.data_ptr(), cpu_t.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_t.contiguous().nbytes()),
-           /*blocking=*/true);
-    return result;
-}
-
-static c10::optional<Tensor> opt_to_cpu(const c10::optional<Tensor>& t) {
-    if (!t || t->numel() == 0) return c10::nullopt;
-    return to_cpu(*t);
-}
+// Heavy ops run on the tensor's physical device (cuDNN/cuBLAS on a paras GPU)
+// over the paras allocation itself -- see ops/native_bridge.h. Previously these
+// copied to the host, ran the CPU kernel, and copied back.
+using native_bridge::as_native;
+using native_bridge::opt_as_native;
+using native_bridge::to_paras;
+using native_bridge::copy_into_paras;
 
 
 
@@ -66,16 +57,16 @@ Tensor convolution_overrideable(
     PTSYCL_TRACE_OP("convolution_overrideable");
     c10::Device dev = input.device();
 
-    Tensor cpu_in = to_cpu(input);
-    Tensor cpu_w  = to_cpu(weight);
-    auto   cpu_b  = opt_to_cpu(bias);
+    Tensor n_in = as_native(input);
+    Tensor n_w  = as_native(weight);
+    auto   n_b  = opt_as_native(bias);
 
-    Tensor cpu_out = at::convolution(
-        cpu_in, cpu_w, cpu_b,
+    Tensor n_out = at::convolution(
+        n_in, n_w, n_b,
         stride, padding, dilation,
         transposed, output_padding, groups);
 
-    Tensor result = to_device(cpu_out, dev);
+    Tensor result = to_paras(n_out, dev);
     return result;
 }
 
@@ -94,24 +85,24 @@ Tensor convolution_overrideable(
     PTSYCL_TRACE_OP("convolution_backward_overrideable");
     c10::Device dev = input.device();
 
-    Tensor cpu_dy = to_cpu(grad_output);
-    Tensor cpu_x  = to_cpu(input);
-    Tensor cpu_w  = to_cpu(weight);
+    Tensor n_dy = as_native(grad_output);
+    Tensor n_x  = as_native(input);
+    Tensor n_w  = as_native(weight);
 
     auto result = at::convolution_backward(
-        cpu_dy, cpu_x, cpu_w,
+        n_dy, n_x, n_w,
         c10::nullopt,
         stride, padding, dilation,
         transposed, output_padding, groups,
         output_mask);
 
-    auto cpu_dx = std::get<0>(result);
-    auto cpu_dw = std::get<1>(result);
-    auto cpu_db = std::get<2>(result);
+    auto n_dx = std::get<0>(result);
+    auto n_dw = std::get<1>(result);
+    auto n_db = std::get<2>(result);
 
-    Tensor dx = cpu_dx.defined() ? to_device(cpu_dx, dev) : Tensor{};
-    Tensor dw = cpu_dw.defined() ? to_device(cpu_dw, dev) : Tensor{};
-    Tensor db = cpu_db.defined() ? to_device(cpu_db, dev) : Tensor{};
+    Tensor dx = n_dx.defined() ? to_paras(n_dx, dev) : Tensor{};
+    Tensor dw = n_dw.defined() ? to_paras(n_dw, dev) : Tensor{};
+    Tensor db = n_db.defined() ? to_paras(n_db, dev) : Tensor{};
 
     return {dx, dw, db};
 }
@@ -209,14 +200,14 @@ Tensor& avg_pool2d_out(
 {
     PTSYCL_TRACE_OP("avg_pool2d.out");
     TORCH_CHECK(!divisor_override, "Divisor override is not implemented");
-    Tensor cpu_in = to_cpu(self);
+    Tensor n_in = as_native(self);
     IntArrayRef eff_stride = stride.empty() ? kernel_size : stride;
-    Tensor cpu_out = at::avg_pool2d(cpu_in, kernel_size, eff_stride,
+    Tensor n_out = at::avg_pool2d(n_in, kernel_size, eff_stride,
                                      padding, ceil_mode, count_include_pad,
                                      divisor_override);
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(out.data_ptr(), n_out.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_out.contiguous().nbytes()), true);
     return out;
 }
 
@@ -233,15 +224,15 @@ Tensor& avg_pool2d_backward_out(
 {
     PTSYCL_TRACE_OP("avg_pool2d_backward.grad_input");
     TORCH_CHECK(!divisor_override, "Divisor override is not implemented");
-    Tensor cpu_dy = to_cpu(grad_output);
-    Tensor cpu_x  = to_cpu(self);
+    Tensor n_dy = as_native(grad_output);
+    Tensor n_x  = as_native(self);
     IntArrayRef eff_stride = stride.empty() ? kernel_size : stride;
-    Tensor cpu_dx = at::avg_pool2d_backward(
-        cpu_dy, cpu_x, kernel_size, eff_stride, padding,
+    Tensor n_dx = at::avg_pool2d_backward(
+        n_dy, n_x, kernel_size, eff_stride, padding,
         ceil_mode, count_include_pad, divisor_override);
     auto& q = queue_for(grad_input);
-    q.copy(grad_input.data_ptr(), cpu_dx.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_dx.contiguous().nbytes()), true);
+    q.copy(grad_input.data_ptr(), n_dx.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_dx.contiguous().nbytes()), true);
     return grad_input;
 }
 
@@ -255,13 +246,13 @@ public:
         at::AutoDispatchBelowADInplaceOrView g;
         c10::Device dev = input.device();
 
-        Tensor cpu_x = to_cpu(input);
-        Tensor cpu_w = to_cpu(weight);
-        auto   cpu_b = opt_to_cpu(bias);
+        Tensor n_x = as_native(input);
+        Tensor n_w = as_native(weight);
+        auto   n_b = opt_as_native(bias);
 
-        Tensor cpu_out = at::linear(cpu_x, cpu_w,
-                                     cpu_b.has_value() ? *cpu_b : Tensor{});
-        Tensor result = to_device(cpu_out, dev);
+        Tensor n_out = at::linear(n_x, n_w,
+                                     n_b.has_value() ? *n_b : Tensor{});
+        Tensor result = to_paras(n_out, dev);
 
         ctx->save_for_backward({input.contiguous(), weight});
         ctx->saved_data["has_bias"] = bias.has_value() && bias->numel() > 0;
@@ -277,25 +268,25 @@ public:
         c10::Device dev = input.device();
 
         Tensor dy    = grad_outputs[0].contiguous();
-        Tensor cpu_dy = to_cpu(dy);
-        Tensor cpu_x  = to_cpu(input);
-        Tensor cpu_w  = to_cpu(weight);
+        Tensor n_dy = as_native(dy);
+        Tensor n_x  = as_native(input);
+        Tensor n_w  = as_native(weight);
 
-        Tensor cpu_dx = at::mm(cpu_dy.view({-1, cpu_dy.size(-1)}), cpu_w);
-        cpu_dx = cpu_dx.view(cpu_x.sizes());
+        Tensor n_dx = at::mm(n_dy.view({-1, n_dy.size(-1)}), n_w);
+        n_dx = n_dx.view(n_x.sizes());
 
-        int64_t fi = cpu_w.size(1), fo = cpu_w.size(0);
-        int64_t batch = cpu_x.numel() / fi;
-        Tensor cpu_x2  = cpu_x.view({batch, fi});
-        Tensor cpu_dy2 = cpu_dy.view({batch, fo});
-        Tensor cpu_dw  = at::mm(cpu_dy2.t(), cpu_x2);
+        int64_t fi = n_w.size(1), fo = n_w.size(0);
+        int64_t batch = n_x.numel() / fi;
+        Tensor n_x2  = n_x.view({batch, fi});
+        Tensor n_dy2 = n_dy.view({batch, fo});
+        Tensor n_dw  = at::mm(n_dy2.t(), n_x2);
 
-        Tensor dx = to_device(cpu_dx.contiguous(), dev);
-        Tensor dw = to_device(cpu_dw.contiguous(), dev);
+        Tensor dx = to_paras(n_dx.contiguous(), dev);
+        Tensor dw = to_paras(n_dw.contiguous(), dev);
         Tensor db;
         if (has_bias) {
-            Tensor cpu_db = cpu_dy2.sum(0);
-            db = to_device(cpu_db.contiguous(), dev);
+            Tensor n_db = n_dy2.sum(0);
+            db = to_paras(n_db.contiguous(), dev);
         }
         return {dx, dw, db};
     }
@@ -321,10 +312,10 @@ public:
         at::AutoDispatchBelowADInplaceOrView g;
         c10::Device dev = self.device();
 
-        Tensor cpu_in = to_cpu(self);
-        Tensor cpu_out = at::max_pool2d(cpu_in, kernel_size, stride,
+        Tensor n_in = as_native(self);
+        Tensor n_out = at::max_pool2d(n_in, kernel_size, stride,
                                          padding, dilation, ceil_mode);
-        Tensor result = to_device(cpu_out, dev);
+        Tensor result = to_paras(n_out, dev);
 
         ctx->save_for_backward({self.contiguous()});
         ctx->saved_data["kernel_0"]  = kernel_size[0];
@@ -356,18 +347,18 @@ public:
         int64_t d1  = ctx->saved_data["dil_1"].toInt();
         bool ceil_mode = ctx->saved_data["ceil_mode"].toBool();
 
-        Tensor cpu_dy = to_cpu(grad_outputs[0]);
-        Tensor cpu_x  = to_cpu(input);
+        Tensor n_dy = as_native(grad_outputs[0]);
+        Tensor n_x  = as_native(input);
 
         auto result_fwd = at::max_pool2d_with_indices(
-            cpu_x, {k0, k1}, {s0, s1}, {p0, p1}, {d0, d1}, ceil_mode);
-        auto cpu_idx = std::get<1>(result_fwd);
+            n_x, {k0, k1}, {s0, s1}, {p0, p1}, {d0, d1}, ceil_mode);
+        auto n_idx = std::get<1>(result_fwd);
 
-        Tensor cpu_dx = at::max_pool2d_with_indices_backward(
-            cpu_dy, cpu_x, {k0, k1}, {s0, s1}, {p0, p1},
-            {d0, d1}, ceil_mode, cpu_idx);
+        Tensor n_dx = at::max_pool2d_with_indices_backward(
+            n_dy, n_x, {k0, k1}, {s0, s1}, {p0, p1},
+            {d0, d1}, ceil_mode, n_idx);
 
-        Tensor dx = to_device(cpu_dx.contiguous(), dev);
+        Tensor dx = to_paras(n_dx.contiguous(), dev);
         return {dx, Tensor{}, Tensor{}, Tensor{}, Tensor{}, Tensor{}};
     }
 };
@@ -388,20 +379,20 @@ Tensor max_pool2d_autograd(
 Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("mm.out");
-    Tensor cpu_out = at::mm(to_cpu(self), to_cpu(mat2));
+    Tensor n_out = at::mm(as_native(self), as_native(mat2));
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(out.data_ptr(), n_out.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_out.contiguous().nbytes()), true);
     return out;
 }
 
 Tensor& bmm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("bmm.out");
-    Tensor cpu_out = at::bmm(to_cpu(self), to_cpu(mat2));
+    Tensor n_out = at::bmm(as_native(self), as_native(mat2));
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(out.data_ptr(), n_out.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_out.contiguous().nbytes()), true);
     return out;
 }
 
@@ -414,11 +405,11 @@ Tensor& addmm_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("addmm.out");
-    Tensor cpu_out = at::addmm(to_cpu(self), to_cpu(mat1), to_cpu(mat2),
+    Tensor n_out = at::addmm(as_native(self), as_native(mat1), as_native(mat2),
                                 beta, alpha);
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(out.data_ptr(), n_out.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_out.contiguous().nbytes()), true);
     return out;
 }
 
@@ -521,26 +512,26 @@ static Tensor& upsample_fwd_cpu(
     const Tensor& self,
     c10::SymIntArrayRef /*output_size*/,
     Tensor& out,
-    std::function<Tensor(const Tensor&)> cpu_fn)
+    std::function<Tensor(const Tensor&)> n_fn)
 {
-    Tensor cpu_in  = to_cpu(self);
-    Tensor cpu_out = cpu_fn(cpu_in);
+    Tensor n_in  = as_native(self);
+    Tensor n_out = n_fn(n_in);
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(out.data_ptr(), n_out.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_out.contiguous().nbytes()), true);
     return out;
 }
 
 static Tensor& upsample_bwd_cpu(
     const Tensor& grad_output,
     Tensor& grad_input,
-    std::function<Tensor(const Tensor&)> cpu_fn)
+    std::function<Tensor(const Tensor&)> n_fn)
 {
-    Tensor cpu_dy  = to_cpu(grad_output);
-    Tensor cpu_dx  = cpu_fn(cpu_dy);
+    Tensor n_dy  = as_native(grad_output);
+    Tensor n_dx  = n_fn(n_dy);
     auto& q = queue_for(grad_input);
-    q.copy(grad_input.data_ptr(), cpu_dx.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_dx.contiguous().nbytes()), true);
+    q.copy(grad_input.data_ptr(), n_dx.contiguous().data_ptr(),
+           static_cast<std::size_t>(n_dx.contiguous().nbytes()), true);
     return grad_input;
 }
 

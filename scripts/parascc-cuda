@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# CUDA-flavor compiler driver for the ParaS PyTorch backend.
+#
+# parascc's front "expfinder"/paras_pp stage is regex-based and corrupts
+# lambdas generated via X-macros (see tensor_ops.cpp's PTSYCL_COPY_TYPES),
+# producing bogus "expected ')'" / "break not in loop" errors. The CUDA flavor
+# does not need that stage: it compiles with standard clang-CUDA (-x cuda), and
+# the LLVM clang++ shipped with the ParaS toolchain does device codegen
+# natively. So drive clang++ directly with the same -isystem flags parascc
+# would supply, skipping paras_pp entirely.
+# The toolchain locations come from the environment; scripts/env.sh sets
+# them. Nothing here is specific to one machine.
+set -euo pipefail
+
+: "${PARAS_HOME:?set PARAS_HOME, or run this through scripts/build.sh}"
+: "${PTSYCL_GCC_TOOLCHAIN:?set PTSYCL_GCC_TOOLCHAIN, or run this through scripts/build.sh}"
+GCC_ROOT="$PTSYCL_GCC_TOOLCHAIN"
+: "${PTSYCL_LLVM_DIR:?set PTSYCL_LLVM_DIR, or run this through scripts/build.sh}"
+LLVM_DIR="$PTSYCL_LLVM_DIR"
+CLANGXX="$LLVM_DIR/bin/clang++"
+CLANG_RES="$("$PARAS_HOME/bin/parascc" -print-resource-dir 2>/dev/null)/include"
+
+export LD_LIBRARY_PATH="$GCC_ROOT/lib64:$GCC_ROOT/lib:$PARAS_HOME/lib:${LD_LIBRARY_PATH:-}"
+
+if [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
+    exec "$CLANGXX" --version
+fi
+
+exec "$CLANGXX" \
+  --gcc-toolchain="$GCC_ROOT" \
+  -isystem "$CLANG_RES" \
+  -isystem "$GCC_ROOT/include" \
+  -isystem "$PARAS_HOME/include" \
+  "$@"

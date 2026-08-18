@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# CPU-flavor compiler driver for the ParaS PyTorch backend.
+#
+# The raw ${PARAS_HOME}/bin/parascc cannot find clang's builtin headers
+# (stddef.h, etc.), so it must be given the clang resource dir plus the GCC and
+# ParaS include roots via -isystem. This wrapper supplies exactly those flags
+# and the LD_LIBRARY_PATH parascc itself needs.
+# The toolchain locations come from the environment; scripts/env.sh sets
+# them. Nothing here is specific to one machine.
+set -euo pipefail
+
+: "${PARAS_HOME:?set PARAS_HOME, or run this through scripts/build.sh}"
+: "${PTSYCL_GCC_TOOLCHAIN:?set PTSYCL_GCC_TOOLCHAIN, or run this through scripts/build.sh}"
+GCC_ROOT="$PTSYCL_GCC_TOOLCHAIN"
+CLANG_RES="$("$PARAS_HOME/bin/parascc" -print-resource-dir 2>/dev/null)/include"
+
+export LD_LIBRARY_PATH="$GCC_ROOT/lib64:$GCC_ROOT/lib:$PARAS_HOME/lib:${LD_LIBRARY_PATH:-}"
+
+# CMake ABI/version probe
+if [[ "${1:-}" == "-v" || "${1:-}" == "--version" ]]; then
+    echo "parascc (clang, gcc-toolchain ${GCC_ROOT##*/})"
+    exit 0
+fi
+
+exec "$PARAS_HOME/bin/parascc" \
+  --gcc-toolchain="$GCC_ROOT" \
+  -isystem "$CLANG_RES" \
+  -isystem "$GCC_ROOT/include" \
+  -isystem "$PARAS_HOME/include" \
+  "$@"

@@ -20,6 +20,7 @@
 #include <cmath>
 
 #include "core/kernels.h"
+#include "ops/native_bridge.h"
 
 namespace ptsycl {
 namespace {
@@ -764,26 +765,20 @@ Tensor& arange_start_out(const c10::Scalar& start, const c10::Scalar& end,
 
 // --- reductions --------------------------------------------------------------------
 Tensor& sum_out(const Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
-                std::optional<c10::ScalarType> /*dtype*/, Tensor& out) {
+                std::optional<c10::ScalarType> dtype, Tensor& out) {
     PTSYCL_TRACE_OP("sum.IntList_out");
-    auto dims = dim.has_value() && !dim->empty()
-                    ? std::vector<int64_t>(dim->begin(), dim->end())
-                    : all_dims(self);
-    reduce_dims_op(self, dims, keepdim, out, ReduceKind::Sum);
-    return out;
+    // Native reduction on the physical device. The strided reduce in
+    // core/kernels.h synchronises and finishes the partials on the host.
+    return native_bridge::copy_into_paras(
+        at::sum(native_bridge::as_native(self), dim, keepdim, dtype), out);
 }
 
 Tensor& mean_out(const Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
-                 std::optional<c10::ScalarType> /*dtype*/, Tensor& out) {
+                 std::optional<c10::ScalarType> dtype, Tensor& out) {
     PTSYCL_TRACE_OP("mean.out");
-    auto dims = dim.has_value() && !dim->empty()
-                    ? std::vector<int64_t>(dim->begin(), dim->end())
-                    : all_dims(self);
-    int64_t count = 1;
-    for (auto d : dims) count *= self.size(c10::maybe_wrap_dim(d, self.dim()));
-    reduce_dims_op(self, dims, keepdim, out, ReduceKind::Sum,
-                   count > 0 ? 1.0 / static_cast<double>(count) : 0.0);
-    return out;
+    // This is the adaptive-average-pool path in channel attention (RCAN, RDN).
+    return native_bridge::copy_into_paras(
+        at::mean(native_bridge::as_native(self), dim, keepdim, dtype), out);
 }
 
 Tensor& prod_out(const Tensor& self, int64_t dim, bool keepdim,
@@ -982,10 +977,11 @@ Tensor& softmax_out(const Tensor& self, int64_t dim, bool /*half_to_float*/,
 
 Tensor softmax(const Tensor& self, int64_t dim, bool half_to_float) {
     PTSYCL_TRACE_OP("_softmax");
-    const auto out_dtype =
-        half_to_float ? c10::kFloat : self.scalar_type();
-    Tensor out = at::empty(self.sizes(), self.options().dtype(out_dtype));
-    return ptsycl::softmax_out(self, dim, half_to_float, out);
+    // Native softmax is one fused kernel; the version above is a multi-pass
+    // max/exp/sum over split_dims and was the single largest attention cost.
+    return native_bridge::to_paras(
+        at::_softmax(native_bridge::as_native(self), dim, half_to_float),
+        self.device());
 }
 
 // d(softmax)/dx = y * (dy - sum(dy * y, dim, keepdim=True)); input_dtype is
@@ -1586,6 +1582,15 @@ Tensor cat(const at::ITensorListRef& tensors, int64_t dim) {
     return out;
 }
 
+// PReLU: unregistered it decomposes into a slow broadcasting where/mul path.
+// Dispatch the internal _prelu_kernel op to native (ESRGAN, SRResNet).
+Tensor _prelu_kernel(const Tensor& self, const Tensor& weight) {
+    PTSYCL_TRACE_OP("_prelu_kernel");
+    using namespace native_bridge;
+    return to_paras(at::_prelu_kernel(as_native(self), as_native(weight)),
+                    self.device());
+}
+
 } // namespace
 } // namespace ptsycl
 
@@ -1620,6 +1625,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::lerp.Scalar_out", &ptsycl::lerp_scalar_out);
 
     m.impl("aten::relu", &ptsycl::relu);
+    m.impl("aten::_prelu_kernel", &ptsycl::_prelu_kernel);
     m.impl("aten::relu_", &ptsycl::relu_);
     m.impl("aten::sigmoid", &ptsycl::sigmoid);
     m.impl("aten::sigmoid_", &ptsycl::sigmoid_);
