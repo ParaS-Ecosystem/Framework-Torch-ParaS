@@ -22,7 +22,8 @@ vendor). Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
 
 - Tensor lifecycle: allocation, strided layouts, views, copies in every
   direction (host/device, cross-device, dtype conversion), resize.
-- Around 130 aten kernels: elementwise math, activations, comparisons,
+- Over 160 aten operators (198 registrations counting overloads):
+  elementwise math, activations, comparisons,
   reductions, matrix multiply (mm/bmm/addmm), convolution, pooling,
   upsampling, batch/layer norm, losses, RNG (Philox counter-based),
   dropout, multi-head attention.
@@ -30,18 +31,39 @@ vendor). Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
   fallback, so models keep working while coverage grows.
 - A binned memory pool per device on top of CUDA or HIP unified memory
   (GPU) or aligned host memory (CPU).
+- `torch_paras.autotune`, a whole-graph inference optimizer. It searches
+  precision, memory format, `torch.compile` and CUDA-graph capture for the
+  model and shape you give it, and keeps the fastest configuration that
+  still matches the eager reference above a PSNR floor.
+
+## Benchmarks
+
+[benchmark/super-resolution/](benchmark/super-resolution/) measures ten
+super-resolution models on five standard datasets, three ways: PyTorch
+eager, PyTorch with `torch.compile`, and `torch_paras.autotune`. On a
+Tesla V100, 40/40 cells, geomean **1.24x** against the `torch.compile`
+arm and **2.8x** against eager. [GUIDE.md](benchmark/super-resolution/GUIDE.md)
+has the install, dataset and run steps.
+
+Both optimized arms are compiled and graph-replayed on the native device,
+so that ratio compares one optimization strategy against PyTorch's own.
+It is not a measurement of the `paras` device, which runs the same models
+untimed in the same pass as a correctness check — the results carry a
+`direct_paras_fp32_parity_max_abs` column for that.
 
 ## Repository layout
 
 ```
 csrc/compat/      compatibility layer, the only code that knows about the
-                  ParaS compiler and CUDA/HIP 
+                  ParaS compiler and CUDA/HIP
 csrc/core/        device context, allocator, kernel launch helpers, registration
 csrc/ops/         the aten kernels, plain C++ lambdas, compiler agnostic
 python/torch_paras/  the python package
 scripts/          env.sh (toolchain paths) and build.sh
+benchmark/        reproducible benchmark suites
 tests/            test suite, run with tests/run_all.py
-docs/             install guide, testing guide
+docs/             install, testing, backend design, operator coverage,
+                  troubleshooting
 ```
 
 ## Quick start
@@ -55,7 +77,16 @@ scripts/build.sh hip           # CPU + AMD GPU build
 python tests/run_all.py --all-devices
 ```
 
-See docs/INSTALL.md for the full toolchain setup, docs/TESTING.md
+## Documentation
+
+| document | what it covers |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | full toolchain setup for a source build |
+| [docs/TESTING.md](docs/TESTING.md) | running the operator suite |
+| [docs/BACKEND_DESIGN.md](docs/BACKEND_DESIGN.md) | how the PrivateUse1 backend is put together |
+| [docs/OPERATOR_COVERAGE.md](docs/OPERATOR_COVERAGE.md) | which aten operators are implemented natively |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | common build and runtime failures |
+| [benchmark/super-resolution/GUIDE.md](benchmark/super-resolution/GUIDE.md) | running the super-resolution benchmark |
 
 
 

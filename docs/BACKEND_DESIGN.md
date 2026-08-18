@@ -26,8 +26,9 @@ PyTorch dispatcher --- looks at tensor device ---
 
 - Device 0 (`paras` / `paras:0`) always exists and executes on the host
   CPU. Large flat kernels use an OpenMP team; small kernels stay serial.
-- In CUDA-enabled builds, devices `paras:1..N` map to the visible NVIDIA
-  GPUs (enumerated the same way CUDA enumerates them).
+- In CUDA builds, devices `paras:1..N` map to the visible NVIDIA GPUs; in
+  HIP builds, to the visible AMD GPUs (enumerated the same way the vendor
+  runtime enumerates them). A single build targets one vendor.
 - Device registration and enumeration lives in `csrc/core`; the
   PyTorch-facing dispatcher glue (the `PrivateUse1` hooks) lives in
   `csrc/compat`, kept separate so PyTorch-version-specific code doesn't
@@ -44,7 +45,7 @@ responsible for:
 - Bridging PyTorch's tensor/storage APIs to the ParaS runtime's memory
   and execution primitives.
 - Isolating any PyTorch-version-specific behavior behind named
-  compatibility checks (see `docs/CODING_CONVENTIONS.md`), so upgrading
+  compatibility checks, so upgrading
   the supported PyTorch version doesn't require touching kernel code.
 
 ## Memory Management
@@ -52,7 +53,8 @@ responsible for:
 - Each device gets its own **binned memory pool**, sized in classes to
   reduce allocator overhead for the small/medium tensor sizes common in
   model workloads.
-- On GPU builds, the pool sits on top of **CUDA unified memory**, so host
+- On GPU builds, the pool sits on top of **CUDA or HIP unified memory**
+  (`cudaMallocManaged` / `hipMallocManaged`), so host
   and device can both address the same allocation without an explicit
   copy step (the runtime still manages transfers/coherency as needed for
   correctness and performance).
@@ -60,8 +62,7 @@ responsible for:
   pool sits on top of **aligned host memory** allocations sized for the
   CPU threadpool engine's access patterns.
 - Pool sizing/reuse behavior is currently fixed at build time; making it
-  tunable at runtime is not yet implemented (candidate for a future
-  Roadmap milestone if it becomes a bottleneck).
+  tunable at runtime is not yet implemented.
 
 ## Streams and Execution
 
@@ -85,8 +86,6 @@ responsible for:
   code. See `docs/OPERATOR_COVERAGE.md` for what's currently native vs.
   fallback.
 - The tradeoff is performance: any fallback op incurs a host round-trip.
-  Reducing fallback ratio on real models is tracked in
-  `docs/MODEL_VALIDATION.md`.
 
 ## Runtime Integration (ParaS Compiler)
 
@@ -101,11 +100,10 @@ responsible for:
 
 ## Open Design Questions
 
-Things not yet settled — flagged here so design discussions have a home
-before they become Roadmap milestones:
+Things not yet settled — flagged here so design discussions have a home:
 
 - Whether/how to expose tunable memory pool sizing to end users.
 - How autograd (backward-pass) registration will be organized as more
-  operators grow backward support (see Roadmap Milestone 4).
-- Long-term plan for non-NVIDIA GPU / non-x86 CPU targets (see Roadmap
-  Milestone 7) and how much of `csrc/core` can stay backend-agnostic.
+  operators grow backward support.
+- Long-term plan for non-x86 CPU targets, and how much of `csrc/core` can
+  stay backend-agnostic.

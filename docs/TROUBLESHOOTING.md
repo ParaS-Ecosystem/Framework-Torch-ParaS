@@ -1,10 +1,9 @@
 # Troubleshooting
 
 Common build, import, runtime, and device issues, and what to check first.
-If you hit something not covered here, please open an issue using the
-`build_failure` or `bug_report` template (see `.github/ISSUE_TEMPLATE/`)
-rather than a duplicate — and consider adding what you learned back to
-this file in the same PR.
+If you hit something not covered here, please open an issue rather than a
+duplicate — and consider adding what you learned back to this file in the
+same PR.
 
 ## Build Issues
 
@@ -80,36 +79,39 @@ or check `build/cpu` vs `build/cuda` to see which was built most recently.
   (it *is* CPU behavior); a mismatch there is more likely a copy/dtype
   bug at the fallback boundary than a kernel bug.
 - For native kernels, check whether the operator has a parity test yet.
-  If not, that's the gap — file a bug report with a minimal repro (see
-  `.github/ISSUE_TEMPLATE/bug_report.md`) including exact shapes/dtypes.
+  If not, that's the gap — file a bug report with a minimal repro,
+  including exact shapes and dtypes.
 
 ### Performance is much worse than expected
 
 - Check the fallback ratio for your model/workload — a high proportion
   of fallback ops (each incurring a host round-trip) is a common and
   expected cause during early coverage, not necessarily a bug. See
-  `docs/MODEL_VALIDATION.md` and `docs/OPERATOR_COVERAGE.md`.
-- If a *native* kernel regressed, see `docs/BENCHMARKS.md` and consider
-  filing a performance-regression issue.
+  `docs/OPERATOR_COVERAGE.md`.
+- If a *native* kernel regressed, see
+  `benchmark/super-resolution/GUIDE.md` and consider filing a
+  performance-regression issue.
 
 ## Device Issues
 
 ### Only device 0 (`paras:0`) is available, no GPU devices show up
 
-- Confirm you built with `scripts/build.sh cuda`, not `scripts/build.sh
-  cpu` — the CPU-only build only ever exposes device 0.
-- Confirm the NVIDIA driver and CUDA toolkit are visible in the
-  environment `scripts/env.sh` configured (`PTSYCL_CUDA_HOME` etc.).
+- Confirm you built with `scripts/build.sh cuda` (NVIDIA) or
+  `scripts/build.sh hip` (AMD), not `scripts/build.sh cpu` — the CPU-only
+  build only ever exposes device 0.
+- Confirm the vendor driver and toolkit are visible in the environment
+  `scripts/env.sh` configured (`PTSYCL_CUDA_HOME`, or `PTSYCL_ROCM_HOME`
+  for HIP builds).
 
 ### Wrong number of GPU devices enumerated, or wrong device mapping
 
-- Devices `paras:1..N` map to whatever NVIDIA GPUs are visible in the
-  process's environment, the same way CUDA enumerates them — check
-  `CUDA_VISIBLE_DEVICES` if the mapping looks different from what you
-  expect.
+- Devices `paras:1..N` map to whatever GPUs are visible in the process's
+  environment, the same way the vendor runtime enumerates them — check
+  `CUDA_VISIBLE_DEVICES` on NVIDIA, or `ROCR_VISIBLE_DEVICES` /
+  `HIP_VISIBLE_DEVICES` on AMD, if the mapping looks different from what
+  you expect.
 
 ## Still Stuck?
 
-Open an issue with the `build_failure`, `bug_report`, or `model_failure`
-template (whichever fits) and include your environment details — see
-`docs/SUPPORT_MATRIX.md` for what's currently tested and what's best-effort.
+Open an issue and include your environment details — see `docs/INSTALL.md`
+section 1 for the hardware and toolchain that are currently tested.
