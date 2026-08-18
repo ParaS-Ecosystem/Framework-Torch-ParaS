@@ -51,6 +51,7 @@ __all__ = [
     "empty_cache",
     "device_name",
     "backend_name",
+    "get_amp_supported_dtype",
     "nn",
 ]
 
@@ -109,6 +110,10 @@ def memory_cached(device: int = 0) -> int:
     return _C.cached_bytes(device)
 
 
+def get_amp_supported_dtype() -> list[torch.dtype]:
+    return [torch.float16, torch.float32]
+
+
 def _register() -> None:
     torch.utils.rename_privateuse1_backend("paras")
 
@@ -122,6 +127,7 @@ def _register() -> None:
     mod.device_name = device_name
     mod.is_bad_fork = _C.is_bad_fork
     mod._is_in_bad_fork = _C.is_bad_fork
+    mod.get_amp_supported_dtype = get_amp_supported_dtype
     torch._register_device_module("paras", mod)
 
     # tensor.paras() / module.paras() / tensor.is_paras
