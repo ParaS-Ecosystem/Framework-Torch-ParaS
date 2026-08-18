@@ -351,7 +351,7 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
                     rem /= sspec.sizes[dd];
                     self_off += c * sspec.strides[dd];
                 }
-                if (accumulate) pself[self_off] = pself[self_off] + pval[flat];
+                if (accumulate) atomic_add(&pself[self_off], pval[flat]);
                 else pself[self_off] = pval[flat];
             });
         });
