@@ -322,13 +322,25 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
 
     const int64_t n = v.numel();
     if (n == 0) return self;
-    const int64_t tail_n = n / (ai.bn > 0 ? ai.bn : 1);
+    const int64_t bn     = ai.bn > 0 ? ai.bn : 1;
+    const int64_t tail_n = n / bn;
 
     const auto self_spec = make_spec(self);
     IndexPtrs pidx;
     for (int64_t i = 0; i < ai.k; ++i) pidx.p[i] = data_ptr<int64_t>(ai.idx[i]);
     const int64_t k = ai.k;
 
+    // NOTE: duplicate leading indices (pidx.p[i][b] equal for two different
+    // b) are common and expected under accumulate=True (e.g. gradients from
+    // advanced-indexing backward), and even under accumulate=False the
+    // outcome must at least be deterministic. Parallelizing over the flat
+    // (b, t) pair used to let two GPU threads race on the same self_off with
+    // a non-atomic read-modify-write, silently dropping contributions.
+    // Instead we parallelize only over the tail offset t: t always maps to
+    // a disjoint self_off across threads, so each thread safely owns a
+    // private serial loop over every b, accumulating duplicates in-order
+    // with no atomics needed -- mirrors the approach already used in
+    // embedding_dense_backward.
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
         "ptsycl_index_put", [&] {
@@ -336,23 +348,26 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
             const scalar_t* pval  = data_ptr<scalar_t>(v);
             const auto sspec = self_spec;
 
-            launch_flat(q, n, [=](std::size_t flat_) {
-                const int64_t flat = static_cast<int64_t>(flat_);
-                const int64_t b    = flat / tail_n;
-                const int64_t t    = flat % tail_n;
+            launch_flat(q, tail_n, [=](std::size_t t_) {
+                const int64_t t = static_cast<int64_t>(t_);
 
-                int64_t self_off = 0;
-                for (int64_t i = 0; i < k; ++i)
-                    self_off += pidx.p[i][b] * sspec.strides[i];
-
+                int64_t tail_off = 0;
                 int64_t rem = t;
                 for (int dd = sspec.ndim - 1; dd >= static_cast<int>(k); --dd) {
                     const int64_t c = rem % sspec.sizes[dd];
                     rem /= sspec.sizes[dd];
-                    self_off += c * sspec.strides[dd];
+                    tail_off += c * sspec.strides[dd];
                 }
-                if (accumulate) pself[self_off] = pself[self_off] + pval[flat];
-                else pself[self_off] = pval[flat];
+
+                for (int64_t b = 0; b < bn; ++b) {
+                    const int64_t flat = b * tail_n + t;
+                    int64_t self_off = tail_off;
+                    for (int64_t i = 0; i < k; ++i)
+                        self_off += pidx.p[i][b] * sspec.strides[i];
+
+                    if (accumulate) pself[self_off] = pself[self_off] + pval[flat];
+                    else pself[self_off] = pval[flat];
+                }
             });
         });
     return self;

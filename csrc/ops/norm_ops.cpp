@@ -31,10 +31,11 @@ static Tensor to_cpu(const Tensor& t) {
 }
 
 static Tensor to_device(const Tensor& cpu_t, c10::Device dev) {
-    Tensor result = at::empty(cpu_t.sizes(), at::device(dev).dtype(cpu_t.scalar_type()));
+    Tensor cpu_c = cpu_t.contiguous();
+    Tensor result = at::empty(cpu_c.sizes(), at::device(dev).dtype(cpu_c.scalar_type()));
     auto& q = queue_for(result);
-    q.copy(result.data_ptr(), cpu_t.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_t.contiguous().nbytes()),
+    q.copy(result.data_ptr(), cpu_c.data_ptr(),
+           static_cast<std::size_t>(cpu_c.nbytes()),
            /*blocking=*/true);
     return result;
 }

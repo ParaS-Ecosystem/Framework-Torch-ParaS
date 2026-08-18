@@ -1393,6 +1393,44 @@ std::tuple<Tensor, Tensor> topk(const Tensor& self, c10::SymInt k,
     return {values, indices};
 }
 
+// --- sort / argsort -----------------------------------------------------------------
+// A full sort is topk with k == the dimension's size; topk_out's tie-break
+// (earlier index wins) already makes it a stable order, so sort's `stable`
+// flag doesn't change the kernel used.
+std::tuple<Tensor&, Tensor&> sort_out(const Tensor& self, int64_t dim,
+                                      bool descending, Tensor& values,
+                                      Tensor& indices) {
+    PTSYCL_TRACE_OP("sort.values");
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    const int64_t n = self.size(d);
+    return ptsycl::topk_out(self, c10::SymInt(n), d, descending,
+                            /*sorted=*/true, values, indices);
+}
+
+std::tuple<Tensor&, Tensor&> sort_values_stable_out(
+    const Tensor& self, c10::optional<bool> /*stable*/, int64_t dim,
+    bool descending, Tensor& values, Tensor& indices) {
+    PTSYCL_TRACE_OP("sort.values_stable");
+    return ptsycl::sort_out(self, dim, descending, values, indices);
+}
+
+std::tuple<Tensor, Tensor> sort(const Tensor& self, int64_t dim,
+                                bool descending) {
+    PTSYCL_TRACE_OP("sort");
+    Tensor values  = at::empty_like(self);
+    Tensor indices = at::empty(self.sizes(), self.options().dtype(c10::kLong));
+    ptsycl::sort_out(self, dim, descending, values, indices);
+    return {values, indices};
+}
+
+std::tuple<Tensor, Tensor> sort_stable(const Tensor& self,
+                                       c10::optional<bool> /*stable*/,
+                                       int64_t dim, bool descending) {
+    PTSYCL_TRACE_OP("sort.stable");
+    return ptsycl::sort(self, dim, descending);
+}
+
+
 // --- concatenation ------------------------------------------------------------------
 Tensor& cat_out(const at::ITensorListRef& tensors, int64_t dim, Tensor& out) {
     PTSYCL_TRACE_OP("cat.out");
@@ -1543,4 +1581,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::cumsum_", &ptsycl::cumsum_);
     m.impl("aten::topk", &ptsycl::topk);
     m.impl("aten::topk.values", &ptsycl::topk_out);
-}
+    m.impl("aten::sort", &ptsycl::sort);
+    m.impl("aten::sort.values", &ptsycl::sort_out);
+    m.impl("aten::sort.stable", &ptsycl::sort_stable);
+    m.impl("aten::sort.values_stable", &ptsycl::sort_values_stable_out);
+    }

@@ -51,6 +51,23 @@ def test_index_put_accumulate(device):
                                            accumulate=True))
 
 
+def test_index_put_accumulate_many_duplicates(device):
+    # Large batch of indices with heavy duplication and a wide tail dim, so
+    # that on a real GPU this spans many concurrent threads/blocks -- this
+    # is the shape that exposes a racing (non-atomic) accumulate.
+    rows, cols = 32, 256
+    a = torch.zeros(rows, cols)
+    da = a.to(device)
+    idx = torch.randint(0, rows, (4096,))
+    values = torch.randn(4096, cols)
+    check_op(
+        "index_put_accumulate_many_duplicates",
+        lambda: a.clone().index_put_((idx,), values, accumulate=True),
+        lambda: da.clone().index_put_((idx.to(device),), values.to(device),
+                                      accumulate=True),
+    )
+
+
 def test_index_tensor(device):
     a, _, da, _ = _pair(device)
     idx = torch.randint(0, 4, (6,))

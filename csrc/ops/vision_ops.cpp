@@ -37,10 +37,11 @@ static Tensor to_cpu(const Tensor& t) {
 }
 
 static Tensor to_device(const Tensor& cpu_t, c10::Device dev) {
-    Tensor result = at::empty(cpu_t.sizes(), at::device(dev).dtype(cpu_t.scalar_type()));
+    Tensor cpu_c = cpu_t.contiguous();
+    Tensor result = at::empty(cpu_c.sizes(), at::device(dev).dtype(cpu_c.scalar_type()));
     auto& q = queue_for(result);
-    q.copy(result.data_ptr(), cpu_t.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_t.contiguous().nbytes()),
+    q.copy(result.data_ptr(), cpu_c.data_ptr(),
+           static_cast<std::size_t>(cpu_c.nbytes()),
            /*blocking=*/true);
     return result;
 }
@@ -50,6 +51,25 @@ static c10::optional<Tensor> opt_to_cpu(const c10::optional<Tensor>& t) {
     return to_cpu(*t);
 }
 
+// -----------------------------------------------------------------------------
+// GEMM: one thread per output element, fp64 accumulation regardless of input
+// dtype, optional fused beta*bias + alpha*(A@B) epilogue for addmm. Naive
+// (untiled, no shared-memory blocking) but runs entirely on-device -- no
+// to_cpu round-trip. A real tiled bf16/fp32-accum kernel with a shared-memory
+// blocking scheme is follow-on work; this replaces the CPU fallback with a
+// correct device kernel first.
+// -----------------------------------------------------------------------------
+template <typename Fn>
+void launch_gemm(compat::Queue& q, int64_t batch, int64_t M, int64_t N, Fn body) {
+    launch_flat(q, batch * M * N, [=](std::size_t idx_) {
+        const int64_t idx = static_cast<int64_t>(idx_);
+        const int64_t b   = idx / (M * N);
+        const int64_t rem = idx % (M * N);
+        const int64_t i   = rem / N;
+        const int64_t j   = rem % N;
+        body(b, i, j);
+    });
+}
 
 
 Tensor convolution_overrideable(
@@ -245,69 +265,6 @@ Tensor& avg_pool2d_backward_out(
     return grad_input;
 }
 
-class LinearFunction : public torch::autograd::Function<LinearFunction> {
-public:
-    static Tensor forward(AutogradContext* ctx,
-                          const Tensor& input,
-                          const Tensor& weight,
-                          const c10::optional<Tensor>& bias)
-    {
-        at::AutoDispatchBelowADInplaceOrView g;
-        c10::Device dev = input.device();
-
-        Tensor cpu_x = to_cpu(input);
-        Tensor cpu_w = to_cpu(weight);
-        auto   cpu_b = opt_to_cpu(bias);
-
-        Tensor cpu_out = at::linear(cpu_x, cpu_w,
-                                     cpu_b.has_value() ? *cpu_b : Tensor{});
-        Tensor result = to_device(cpu_out, dev);
-
-        ctx->save_for_backward({input.contiguous(), weight});
-        ctx->saved_data["has_bias"] = bias.has_value() && bias->numel() > 0;
-        return result;
-    }
-
-    static tensor_list backward(AutogradContext* ctx,
-                                 tensor_list grad_outputs)
-    {
-        Tensor input  = ctx->get_saved_variables()[0];
-        Tensor weight = ctx->get_saved_variables()[1];
-        bool has_bias = ctx->saved_data["has_bias"].toBool();
-        c10::Device dev = input.device();
-
-        Tensor dy    = grad_outputs[0].contiguous();
-        Tensor cpu_dy = to_cpu(dy);
-        Tensor cpu_x  = to_cpu(input);
-        Tensor cpu_w  = to_cpu(weight);
-
-        Tensor cpu_dx = at::mm(cpu_dy.view({-1, cpu_dy.size(-1)}), cpu_w);
-        cpu_dx = cpu_dx.view(cpu_x.sizes());
-
-        int64_t fi = cpu_w.size(1), fo = cpu_w.size(0);
-        int64_t batch = cpu_x.numel() / fi;
-        Tensor cpu_x2  = cpu_x.view({batch, fi});
-        Tensor cpu_dy2 = cpu_dy.view({batch, fo});
-        Tensor cpu_dw  = at::mm(cpu_dy2.t(), cpu_x2);
-
-        Tensor dx = to_device(cpu_dx.contiguous(), dev);
-        Tensor dw = to_device(cpu_dw.contiguous(), dev);
-        Tensor db;
-        if (has_bias) {
-            Tensor cpu_db = cpu_dy2.sum(0);
-            db = to_device(cpu_db.contiguous(), dev);
-        }
-        return {dx, dw, db};
-    }
-};
-
-Tensor linear(const Tensor& input, const Tensor& weight,
-              const c10::optional<Tensor>& bias)
-{
-    PTSYCL_TRACE_OP("linear");
-    return LinearFunction::apply(input, weight, bias);
-}
-
 class MaxPool2dFunction : public torch::autograd::Function<MaxPool2dFunction> {
 public:
     static Tensor forward(AutogradContext* ctx,
@@ -388,20 +345,64 @@ Tensor max_pool2d_autograd(
 Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("mm.out");
-    Tensor cpu_out = at::mm(to_cpu(self), to_cpu(mat2));
+    TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2,
+                "paras mm: expected 2-D tensors");
+    const int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
+    TORCH_CHECK(mat2.size(0) == K, "paras mm: shape mismatch");
+    if (out.numel() == 0) return out;
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+
+    const int64_t As0 = self.stride(0), As1 = self.stride(1);
+    const int64_t Bs0 = mat2.stride(0), Bs1 = mat2.stride(1);
+    const int64_t Cs0 = out.stride(0),  Cs1 = out.stride(1);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_mm", [&] {
+            const scalar_t* A = data_ptr<scalar_t>(self);
+            const scalar_t* B = data_ptr<scalar_t>(mat2);
+            scalar_t*       C = data_ptr<scalar_t>(out);
+            launch_gemm(q, 1, M, N, [=](int64_t /*b*/, int64_t i, int64_t j) {
+                double acc = 0.0;
+                for (int64_t k = 0; k < K; ++k)
+                    acc += static_cast<double>(A[i * As0 + k * As1]) *
+                           static_cast<double>(B[k * Bs0 + j * Bs1]);
+                C[i * Cs0 + j * Cs1] = static_cast<scalar_t>(acc);
+            });
+        });
     return out;
 }
 
 Tensor& bmm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("bmm.out");
-    Tensor cpu_out = at::bmm(to_cpu(self), to_cpu(mat2));
+    TORCH_CHECK(self.dim() == 3 && mat2.dim() == 3,
+                "paras bmm: expected 3-D tensors");
+    const int64_t Bn = self.size(0);
+    TORCH_CHECK(mat2.size(0) == Bn, "paras bmm: batch size mismatch");
+    const int64_t M = self.size(1), K = self.size(2), N = mat2.size(2);
+    TORCH_CHECK(mat2.size(1) == K, "paras bmm: shape mismatch");
+    if (out.numel() == 0) return out;
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+
+    const int64_t Ab0 = self.stride(0), As0 = self.stride(1), As1 = self.stride(2);
+    const int64_t Bb0 = mat2.stride(0), Bs0 = mat2.stride(1), Bs1 = mat2.stride(2);
+    const int64_t Cb0 = out.stride(0),  Cs0 = out.stride(1),  Cs1 = out.stride(2);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_bmm", [&] {
+            const scalar_t* A = data_ptr<scalar_t>(self);
+            const scalar_t* B = data_ptr<scalar_t>(mat2);
+            scalar_t*       C = data_ptr<scalar_t>(out);
+            launch_gemm(q, Bn, M, N, [=](int64_t b, int64_t i, int64_t j) {
+                const scalar_t* Ab = A + b * Ab0;
+                const scalar_t* Bb = B + b * Bb0;
+                double acc = 0.0;
+                for (int64_t k = 0; k < K; ++k)
+                    acc += static_cast<double>(Ab[i * As0 + k * As1]) *
+                           static_cast<double>(Bb[k * Bs0 + j * Bs1]);
+                C[b * Cb0 + i * Cs0 + j * Cs1] = static_cast<scalar_t>(acc);
+            });
+        });
     return out;
 }
 
@@ -414,11 +415,39 @@ Tensor& addmm_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("addmm.out");
-    Tensor cpu_out = at::addmm(to_cpu(self), to_cpu(mat1), to_cpu(mat2),
-                                beta, alpha);
+    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2,
+                "paras addmm: expected 2-D tensors");
+    const int64_t M = mat1.size(0), K = mat1.size(1), N = mat2.size(1);
+    TORCH_CHECK(mat2.size(0) == K, "paras addmm: shape mismatch");
+    if (out.numel() == 0) return out;
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+
+    Tensor self_c = self.scalar_type() == out.scalar_type()
+                       ? self : self.to(out.scalar_type());
+    Tensor bias = self_c.expand({M, N});
+    const double a  = alpha.toDouble();
+    const double bt = beta.toDouble();
+
+    const int64_t As0 = mat1.stride(0), As1 = mat1.stride(1);
+    const int64_t Bs0 = mat2.stride(0), Bs1 = mat2.stride(1);
+    const int64_t Cs0 = out.stride(0),  Cs1 = out.stride(1);
+    const int64_t Ds0 = bias.stride(0), Ds1 = bias.stride(1);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_addmm", [&] {
+            const scalar_t* A = data_ptr<scalar_t>(mat1);
+            const scalar_t* B = data_ptr<scalar_t>(mat2);
+            const scalar_t* D = data_ptr<scalar_t>(bias);
+            scalar_t*       C = data_ptr<scalar_t>(out);
+            launch_gemm(q, 1, M, N, [=](int64_t /*b*/, int64_t i, int64_t j) {
+                double acc = 0.0;
+                for (int64_t k = 0; k < K; ++k)
+                    acc += static_cast<double>(A[i * As0 + k * As1]) *
+                           static_cast<double>(B[k * Bs0 + j * Bs1]);
+                acc = a * acc + bt * static_cast<double>(D[i * Ds0 + j * Ds1]);
+                C[i * Cs0 + j * Cs1] = static_cast<scalar_t>(acc);
+            });
+        });
     return out;
 }
 
@@ -691,6 +720,5 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 }
 
 TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
-    m.impl("aten::linear",     &ptsycl::linear);
     m.impl("aten::max_pool2d", &ptsycl::max_pool2d_autograd);
 }
