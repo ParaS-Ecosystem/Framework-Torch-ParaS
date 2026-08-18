@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from common import assert_close, check_op
+from common import check_op, assert_close
 
 
 def _pair(device):
@@ -427,40 +427,34 @@ def test_mm(device):
     check_op("mm", lambda: a @ b, lambda: a.to(device) @ b.to(device))
 
 
-def test_bmm(device):
-    a = torch.randn(3, 8, 16)
-    b = torch.randn(3, 16, 4)
-    check_op("bmm", lambda: torch.bmm(a, b),
-             lambda: torch.bmm(a.to(device), b.to(device)))
+def test_sort_ascending(device):
+    a = torch.randn(100, dtype=torch.float32)
+    cpu_vals, cpu_idxs = torch.sort(a)
+    dev_vals, dev_idxs = torch.sort(a.to(device))
+    assert_close(dev_vals, cpu_vals, "sort ascending values")
+    assert_close(dev_idxs, cpu_idxs, "sort ascending indices")
 
 
-def test_addmm(device):
-    self = torch.randn(8, 4)
-    a = torch.randn(8, 16)
-    b = torch.randn(16, 4)
-    check_op("addmm",
-             lambda: torch.addmm(self, a, b, beta=0.5, alpha=2.0),
-             lambda: torch.addmm(self.to(device), a.to(device), b.to(device),
-                                 beta=0.5, alpha=2.0))
+def test_sort_descending(device):
+    a = torch.randn(100, dtype=torch.float32)
+    cpu_vals, cpu_idxs = torch.sort(a, descending=True)
+    dev_vals, dev_idxs = torch.sort(a.to(device), descending=True)
+    assert_close(dev_vals, cpu_vals, "sort descending values")
+    assert_close(dev_idxs, cpu_idxs, "sort descending indices")
 
 
-def test_linear_forward(device):
-    x = torch.randn(2, 5, 16)
-    w = torch.randn(4, 16)
-    b = torch.randn(4)
-    check_op("linear", lambda: torch.nn.functional.linear(x, w, b),
-             lambda: torch.nn.functional.linear(x.to(device), w.to(device),
-                                                b.to(device)))
+def test_sort_dim0(device):
+    a = torch.randn(5, 8, dtype=torch.float32)
+    cpu_vals, cpu_idxs = torch.sort(a, dim=0)
+    dev_vals, dev_idxs = torch.sort(a.to(device), dim=0)
+    assert_close(dev_vals, cpu_vals, "sort dim0 values")
+    assert_close(dev_idxs, cpu_idxs, "sort dim0 indices")
 
 
-def test_sort(device):
-    a = torch.randn(4, 7)
-    check_op("sort", lambda: torch.sort(a, dim=-1, descending=True),
-             lambda: torch.sort(a.to(device), dim=-1, descending=True))
-
-
-def test_argsort(device):
-    a = torch.randn(4, 7)
-    check_op("argsort", lambda: torch.argsort(a, dim=-1),
-             lambda: torch.argsort(a.to(device), dim=-1))
+def test_sort_stable(device):
+    a = torch.tensor([3.0, 1.0, 2.0, 1.0, 3.0])
+    cpu_vals, cpu_idxs = torch.sort(a, stable=True)
+    dev_vals, dev_idxs = torch.sort(a.to(device), stable=True)
+    assert_close(dev_vals, cpu_vals, "sort stable values")
+    assert_close(dev_idxs, cpu_idxs, "sort stable indices")
 

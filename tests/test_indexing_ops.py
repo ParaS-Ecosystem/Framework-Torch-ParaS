@@ -34,7 +34,7 @@ def test_index_copy_(device):
 
 def test_index_put_(device):
     a, _, da, _ = _pair(device)
-    idx = torch.randint(0, 4, (3,))
+    idx = torch.randperm(4)[:3]
     values = torch.randn(3, 5)
     check_op("index_put_",
              lambda: a.clone().index_put_((idx,), values),

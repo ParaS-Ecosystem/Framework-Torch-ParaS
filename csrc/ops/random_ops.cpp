@@ -202,6 +202,113 @@ Tensor native_dropout_backward(const Tensor& grad_output, const Tensor& mask,
     return out;
 }
 
+Tensor& multinomial_out(
+    const Tensor& self, int64_t num_samples,
+    bool replacement, std::optional<at::Generator> /*generator*/,
+    Tensor& out) {
+    PTSYCL_TRACE_OP("multinomial.out");
+    TORCH_CHECK(self.dim() == 1 || self.dim() == 2,
+                "multinomial: input must be 1D or 2D");
+    TORCH_CHECK(num_samples > 0, "multinomial: num_samples must be > 0");
+
+    const bool batched = (self.dim() == 2);
+    const Tensor input = (batched ? self : self.unsqueeze(0)).contiguous();
+    const int64_t B = input.size(0);
+    const int64_t K = input.size(1);
+
+    if (!replacement) {
+        TORCH_CHECK(num_samples <= K,
+            "multinomial without replacement: num_samples > categories");
+    }
+
+    out.resize_(batched ? c10::IntArrayRef({B, num_samples})
+                        : c10::IntArrayRef({num_samples}));
+
+    if (replacement) {
+        Tensor cdf = input.cumsum(/*dim=*/-1);
+        auto& q = queue_for(self);
+        const auto [seed, seq] = draw_state(input, B * num_samples);
+
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            c10::kHalf, c10::kBFloat16, input.scalar_type(),
+            "ptsycl_multinomial_repl", [&] {
+                const scalar_t* pcdf = data_ptr<scalar_t>(cdf);
+                int64_t* pout = data_ptr<int64_t>(out);
+
+                launch_flat(q, B * num_samples, [=](std::size_t idx) {
+                    const int64_t b = static_cast<int64_t>(idx) / num_samples;
+                    const int64_t s = static_cast<int64_t>(idx) % num_samples;
+
+                    uint32_t r0, r1;
+                    Philox2x32::generate(seed, seq,
+                        static_cast<uint64_t>(idx), r0, r1);
+                    const float u = Philox2x32::to_float(r0);
+
+                    const scalar_t* row_cdf = pcdf + b * K;
+                    const double total = static_cast<double>(row_cdf[K - 1]);
+                    const double target = static_cast<double>(u) * total;
+
+                    int64_t lo = 0, hi = K;
+                    while (lo < hi) {
+                        const int64_t mid = (lo + hi) / 2;
+                        if (static_cast<double>(row_cdf[mid]) <= target)
+                            lo = mid + 1;
+                        else
+                            hi = mid;
+                    }
+                    if (lo >= K) lo = K - 1;
+
+                    pout[b * num_samples + s] = lo;
+                });
+            });
+    } else {
+        auto& q = queue_for(self);
+        Tensor keys = at::empty_like(input);
+        const auto [seed, seq] = draw_state(input, B * K);
+
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            c10::kHalf, c10::kBFloat16, input.scalar_type(),
+            "ptsycl_multinomial_norepl_keys", [&] {
+                const scalar_t* pw = data_ptr<scalar_t>(input);
+                scalar_t* pk = data_ptr<scalar_t>(keys);
+
+                launch_flat(q, B * K, [=](std::size_t idx) {
+                    const int64_t b = static_cast<int64_t>(idx) / K;
+                    const int64_t j = static_cast<int64_t>(idx) % K;
+
+                    uint32_t r0, r1;
+                    Philox2x32::generate(seed, seq,
+                        static_cast<uint64_t>(idx), r0, r1);
+                    float u = Philox2x32::to_float(r0);
+                    if (u < 1e-7f) u = 1e-7f;
+
+                    const double w = static_cast<double>(pw[b * K + j]);
+                    const double key = (w > 0.0)
+                        ? (-::log(static_cast<double>(u)) / w)
+                        : 1e38;
+                    pk[b * K + j] = static_cast<scalar_t>(key);
+                });
+            });
+
+        auto [topk_vals, topk_idxs] = keys.topk(
+            num_samples, /*dim=*/-1, /*largest=*/false, /*sorted=*/false);
+        Tensor out_view = out.view({B, num_samples});
+        out_view.copy_(topk_idxs);
+    }
+
+    if (!batched) out = out.squeeze(0);
+    return out;
+}
+
+Tensor multinomial(
+    const Tensor& self, int64_t num_samples,
+    bool replacement, std::optional<at::Generator> generator) {
+    PTSYCL_TRACE_OP("multinomial");
+    Tensor out = at::empty({0}, self.options().dtype(c10::kLong));
+    return ptsycl::multinomial_out(self, num_samples, replacement,
+                                   generator, out);
+}
+
 } // namespace
 } // namespace ptsycl
 
@@ -211,4 +318,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::bernoulli_.float", &ptsycl::bernoulli_);
     m.impl("aten::native_dropout", &ptsycl::native_dropout);
     m.impl("aten::native_dropout_backward", &ptsycl::native_dropout_backward);
+    m.impl("aten::multinomial", &ptsycl::multinomial);
+    m.impl("aten::multinomial.out", &ptsycl::multinomial_out);
 }

@@ -50,3 +50,35 @@ def test_rng_advances(device):
     a = torch.empty((10,), device=device).uniform_(0, 1)
     b = torch.empty((10,), device=device).uniform_(0, 1)
     assert not torch.equal(a.cpu(), b.cpu())
+
+
+def test_multinomial_with_replacement(device):
+    torch.manual_seed(42)
+    probs = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)
+    samples = torch.multinomial(probs.to(device), 10000, replacement=True)
+    samples_cpu = samples.cpu()
+    assert samples_cpu.min() >= 0 and samples_cpu.max() <= 3
+    counts = torch.bincount(samples_cpu, minlength=4).float() / 10000
+    for i, p in enumerate([0.1, 0.2, 0.3, 0.4]):
+        assert abs(counts[i].item() - p) < 0.05, \
+            f"multinomial replacement: bin {i} expected ~{p}, got {counts[i]:.3f}"
+
+
+def test_multinomial_without_replacement(device):
+    torch.manual_seed(42)
+    probs = torch.tensor([0.1, 0.2, 0.3, 0.2, 0.2], dtype=torch.float32)
+    samples = torch.multinomial(probs.to(device), 4, replacement=False)
+    samples_cpu = samples.cpu()
+    assert samples_cpu.unique().numel() == 4, \
+        "multinomial without replacement: indices not unique"
+    assert samples_cpu.min() >= 0 and samples_cpu.max() <= 4
+
+
+def test_multinomial_2d(device):
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(3, 8, dtype=torch.float32), dim=-1)
+    samples = torch.multinomial(probs.to(device), 5, replacement=True)
+    assert samples.shape == (3, 5)
+    samples_cpu = samples.cpu()
+    assert samples_cpu.min() >= 0 and samples_cpu.max() <= 7
+
