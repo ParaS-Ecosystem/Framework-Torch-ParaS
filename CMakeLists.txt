@@ -102,6 +102,12 @@ add_library(torch_paras_C SHARED
     csrc/ops/vision_ops.cpp
     csrc/ops/attention_ops.cpp
     csrc/ops/rms_swiglu_ops.cpp
+    csrc/ops/sort_ops.cpp
+    csrc/ops/creation_ops.cpp
+    # csrc/ops/matmul_ops.cpp # see the warning at the top of that file --
+    #                         # confirm tensor_ops.cpp/fused_ops.cpp don't
+    #                         # already register aten::mm/bmm/matmul before
+    #                         # enabling this (naive GEMM, not a real one).
     # csrc/ops/copy_ops.cpp   # see the warning at the top of that file --
     #                         # confirm tensor_ops.cpp doesn't already
     #                         # register aten::copy_ before enabling this.
