@@ -100,6 +100,11 @@ add_library(torch_paras_C SHARED
     csrc/ops/loss_ops.cpp
     csrc/ops/norm_ops.cpp
     csrc/ops/vision_ops.cpp
+    csrc/ops/attention_ops.cpp
+    csrc/ops/rms_swiglu_ops.cpp
+    # csrc/ops/copy_ops.cpp   # see the warning at the top of that file --
+    #                         # confirm tensor_ops.cpp doesn't already
+    #                         # register aten::copy_ before enabling this.
     csrc/python/module.cpp
 )
 

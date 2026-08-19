@@ -458,3 +458,45 @@ def test_sort_stable(device):
     assert_close(dev_vals, cpu_vals, "sort stable values")
     assert_close(dev_idxs, cpu_idxs, "sort stable indices")
 
+
+
+
+def test_bmm(device):
+    a = torch.randn(3, 8, 16)
+    b = torch.randn(3, 16, 4)
+    check_op("bmm", lambda: torch.bmm(a, b),
+             lambda: torch.bmm(a.to(device), b.to(device)))
+
+
+def test_addmm(device):
+    self = torch.randn(8, 4)
+    a = torch.randn(8, 16)
+    b = torch.randn(16, 4)
+    check_op("addmm",
+             lambda: torch.addmm(self, a, b, beta=0.5, alpha=2.0),
+             lambda: torch.addmm(self.to(device), a.to(device), b.to(device),
+                                 beta=0.5, alpha=2.0))
+
+
+def test_linear_forward(device):
+    x = torch.randn(2, 5, 16)
+    w = torch.randn(4, 16)
+    b = torch.randn(4)
+    check_op("linear", lambda: torch.nn.functional.linear(x, w, b),
+             lambda: torch.nn.functional.linear(x.to(device), w.to(device),
+                                                b.to(device)))
+
+
+def test_sort(device):
+    a = torch.randn(4, 7)
+    check_op("sort", lambda: torch.sort(a, dim=-1, descending=True),
+             lambda: torch.sort(a.to(device), dim=-1, descending=True))
+
+
+def test_argsort(device):
+    a = torch.randn(4, 7)
+    check_op("argsort", lambda: torch.argsort(a, dim=-1),
+             lambda: torch.argsort(a.to(device), dim=-1))
+
+
+

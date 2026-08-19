@@ -30,6 +30,7 @@ MODULES = [
     "test_fused_ops",
     "test_random_ops",
     "test_vision_ops",
+    "test_attention_norm_ops"
 ]
 
 
