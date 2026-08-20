@@ -206,101 +206,231 @@ Tensor index_copy(const Tensor& self, int64_t dim, const Tensor& index,
 }
 
 // -----------------------------------------------------------------------------
-// Advanced indexing (index.Tensor / index_put_) -- supports a run of
-// leading, non-null Long index tensors broadcast against each other, with
-// the remaining trailing dims taken in full.
+// Advanced indexing (index.Tensor / index_put_)
 // -----------------------------------------------------------------------------
-struct IndexPtrs {
-    const int64_t* p[kMaxDims]{};
+struct AdvancedIndexInfo {
+    int self_ndim = 0;
+    int64_t self_sizes[kMaxDims]{};
+    int64_t self_strides[kMaxDims]{};
+
+    int out_ndim = 0;
+    int64_t out_sizes[kMaxDims]{};
+
+    int b_ndim = 0;
+    int64_t b_sizes[kMaxDims]{};
+    int64_t b_strides[kMaxDims]{};
+
+    bool is_indexed[kMaxDims]{};
+    int idx_map[kMaxDims]{};
+    int unindexed_out_dim[kMaxDims]{};
+
+    bool is_bdim[kMaxDims]{};
+    int b_dim_idx[kMaxDims]{};
+
+    int num_indexed = 0;
+    const int64_t* pidx[kMaxDims]{};
+
+    PTSYCL_HOST_DEVICE inline int64_t compute_self_offset(int64_t flat) const {
+        int64_t rem = flat;
+        int64_t out_coord[kMaxDims];
+        for (int d = out_ndim - 1; d >= 0; --d) {
+            out_coord[d] = rem % out_sizes[d];
+            rem /= out_sizes[d];
+        }
+
+        int64_t b_offset = 0;
+        for (int o = 0; o < out_ndim; ++o) {
+            if (is_bdim[o]) {
+                int b_d = b_dim_idx[o];
+                b_offset += out_coord[o] * b_strides[b_d];
+            }
+        }
+
+        int64_t self_offset = 0;
+        for (int d = 0; d < self_ndim; ++d) {
+            int64_t coord_d;
+            if (is_indexed[d]) {
+                int idx_i = idx_map[d];
+                int64_t raw_val = pidx[idx_i][b_offset];
+                if (raw_val < 0) raw_val += self_sizes[d];
+                coord_d = raw_val;
+            } else {
+                int out_d = unindexed_out_dim[d];
+                coord_d = out_coord[out_d];
+            }
+            self_offset += coord_d * self_strides[d];
+        }
+        return self_offset;
+    }
 };
 
 std::vector<int64_t> broadcast_shape(const std::vector<Tensor>& ts) {
+    if (ts.empty()) return {};
     std::vector<int64_t> shape = ts[0].sizes().vec();
     for (std::size_t i = 1; i < ts.size(); ++i)
         shape = at::infer_size(shape, ts[i].sizes());
     return shape;
 }
 
-struct AdvancedIndex {
-    std::vector<Tensor> idx;
-    int64_t k = 0;
-    std::vector<int64_t> bshape;
-    int64_t bn = 1;
+struct PreparedIndex {
+    AdvancedIndexInfo info;
+    std::vector<Tensor> expanded_indices;
+    std::vector<int64_t> out_sizes;
+    bool no_op = false;
 };
 
-AdvancedIndex prepare_advanced_index(
-    const Tensor& self, const c10::List<c10::optional<Tensor>>& indices) {
+PreparedIndex prepare_advanced_indexing(
+    const Tensor& self, const c10::List<c10::optional<Tensor>>& orig_indices) {
+    TORCH_CHECK(spec_supported(self), "paras index: rank exceeds kernel limit");
+
+    std::vector<c10::optional<Tensor>> indices;
+    for (std::size_t i = 0; i < orig_indices.size(); ++i) {
+        c10::optional<Tensor> oi = orig_indices[i];
+        if (oi.has_value() && oi->defined() &&
+            (oi->scalar_type() == c10::kBool || oi->scalar_type() == c10::kByte)) {
+            auto nonzeros = oi->nonzero().unbind(1);
+            for (auto& nz : nonzeros) {
+                indices.push_back(nz);
+            }
+        } else {
+            indices.push_back(oi);
+        }
+    }
+
     TORCH_CHECK(static_cast<int64_t>(indices.size()) <= self.dim(),
                 "paras index: too many indices for tensor");
-    int64_t k = 0;
-    std::vector<Tensor> raw;
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        c10::optional<Tensor> oi = indices[i];
-        if (!oi.has_value() || !oi->defined()) break;
-        raw.push_back(to_long(*oi));
-        ++k;
-    }
-    for (int64_t i = k; i < static_cast<int64_t>(indices.size()); ++i) {
-        c10::optional<Tensor> oi = indices[i];
-        TORCH_CHECK(!oi.has_value() || !oi->defined(),
-                    "paras index: only leading contiguous advanced "
-                    "indices are supported");
-    }
-    TORCH_CHECK(k > 0, "paras index: at least one index tensor is required");
 
-    AdvancedIndex ai;
-    ai.k      = k;
-    ai.bshape = broadcast_shape(raw);
-    ai.bn     = 1;
-    for (int64_t s : ai.bshape) ai.bn *= s;
-    for (auto& t : raw) ai.idx.push_back(t.expand(ai.bshape).contiguous());
-    return ai;
+    const int self_dim = static_cast<int>(self.dim());
+    std::vector<int> indexed_dims;
+    std::vector<Tensor> raw_indices;
+
+    for (int d = 0; d < self_dim; ++d) {
+        if (d < static_cast<int>(indices.size())) {
+            c10::optional<Tensor> oi = indices[d];
+            if (oi.has_value() && oi->defined()) {
+                indexed_dims.push_back(d);
+                raw_indices.push_back(to_long(*oi));
+            }
+        }
+    }
+
+    PreparedIndex res;
+    if (indexed_dims.empty()) {
+        res.no_op = true;
+        res.out_sizes = self.sizes().vec();
+        return res;
+    }
+
+    const int num_indexed = static_cast<int>(indexed_dims.size());
+    std::vector<int64_t> bshape = broadcast_shape(raw_indices);
+    const int b_dim = static_cast<int>(bshape.size());
+
+    for (int i = 0; i < num_indexed; ++i) {
+        res.expanded_indices.push_back(raw_indices[i].expand(bshape).contiguous());
+    }
+
+    const int first_idx = indexed_dims.front();
+    const int last_idx = indexed_dims.back();
+    const bool is_contiguous = (last_idx - first_idx + 1 == num_indexed);
+
+    std::vector<int64_t> out_sizes;
+    AdvancedIndexInfo& info = res.info;
+    info.self_ndim = self_dim;
+    for (int d = 0; d < self_dim; ++d) {
+        info.self_sizes[d] = self.size(d);
+        info.self_strides[d] = self.stride(d);
+        info.is_indexed[d] = false;
+        info.idx_map[d] = -1;
+        info.unindexed_out_dim[d] = -1;
+    }
+
+    for (int i = 0; i < num_indexed; ++i) {
+        int d = indexed_dims[i];
+        info.is_indexed[d] = true;
+        info.idx_map[d] = i;
+    }
+
+    info.b_ndim = b_dim;
+    for (int d = 0; d < b_dim; ++d) {
+        info.b_sizes[d] = bshape[d];
+    }
+    if (b_dim > 0) {
+        info.b_strides[b_dim - 1] = 1;
+        for (int d = b_dim - 2; d >= 0; --d) {
+            info.b_strides[d] = info.b_strides[d + 1] * info.b_sizes[d + 1];
+        }
+    }
+
+    if (is_contiguous) {
+        for (int d = 0; d < first_idx; ++d) {
+            info.unindexed_out_dim[d] = static_cast<int>(out_sizes.size());
+            out_sizes.push_back(self.size(d));
+        }
+        int b_start_out_dim = static_cast<int>(out_sizes.size());
+        for (int d = 0; d < b_dim; ++d) {
+            out_sizes.push_back(bshape[d]);
+        }
+        for (int d = last_idx + 1; d < self_dim; ++d) {
+            info.unindexed_out_dim[d] = static_cast<int>(out_sizes.size());
+            out_sizes.push_back(self.size(d));
+        }
+        info.out_ndim = static_cast<int>(out_sizes.size());
+        for (int o = 0; o < info.out_ndim; ++o) {
+            info.out_sizes[o] = out_sizes[o];
+            info.is_bdim[o] = (o >= b_start_out_dim && o < b_start_out_dim + b_dim);
+            info.b_dim_idx[o] = info.is_bdim[o] ? (o - b_start_out_dim) : -1;
+        }
+    } else {
+        for (int d = 0; d < b_dim; ++d) {
+            out_sizes.push_back(bshape[d]);
+        }
+        for (int d = 0; d < self_dim; ++d) {
+            if (!info.is_indexed[d]) {
+                info.unindexed_out_dim[d] = static_cast<int>(out_sizes.size());
+                out_sizes.push_back(self.size(d));
+            }
+        }
+        info.out_ndim = static_cast<int>(out_sizes.size());
+        for (int o = 0; o < info.out_ndim; ++o) {
+            info.out_sizes[o] = out_sizes[o];
+            info.is_bdim[o] = (o < b_dim);
+            info.b_dim_idx[o] = (o < b_dim) ? o : -1;
+        }
+    }
+
+    TORCH_CHECK(info.out_ndim <= kMaxDims,
+                "paras index: result rank exceeds kernel limit");
+
+    info.num_indexed = num_indexed;
+    for (int i = 0; i < num_indexed; ++i) {
+        info.pidx[i] = data_ptr<int64_t>(res.expanded_indices[i]);
+    }
+    res.out_sizes = out_sizes;
+    return res;
 }
 
 Tensor index_tensor(const Tensor& self,
                     const c10::List<c10::optional<Tensor>>& indices) {
     PTSYCL_TRACE_OP("index.Tensor");
-    TORCH_CHECK(spec_supported(self), "paras index: rank exceeds kernel limit");
+    auto prep = prepare_advanced_indexing(self, indices);
+    if (prep.no_op) return self.clone();
 
-    auto ai = prepare_advanced_index(self, indices);
-    auto& q = queue_for(self);
-
-    std::vector<int64_t> out_sizes = ai.bshape;
-    for (int64_t d = ai.k; d < self.dim(); ++d)
-        out_sizes.push_back(self.size(d));
-    Tensor out = at::empty(out_sizes, self.options());
-
+    Tensor out = at::empty(prep.out_sizes, self.options());
     const int64_t n = out.numel();
     if (n == 0) return out;
-    const int64_t tail_n = n / (ai.bn > 0 ? ai.bn : 1);
 
-    const auto self_spec = make_spec(self);
-    IndexPtrs pidx;
-    for (int64_t i = 0; i < ai.k; ++i) pidx.p[i] = data_ptr<int64_t>(ai.idx[i]);
-    const int64_t k = ai.k;
+    auto& q = queue_for(self);
+    const auto info = prep.info;
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
         "ptsycl_index", [&] {
             const scalar_t* pself = data_ptr<scalar_t>(self);
             scalar_t*       pout  = data_ptr<scalar_t>(out);
-            const auto sspec = self_spec;
 
             launch_flat(q, n, [=](std::size_t flat_) {
                 const int64_t flat = static_cast<int64_t>(flat_);
-                const int64_t b    = flat / tail_n;
-                const int64_t t    = flat % tail_n;
-
-                int64_t self_off = 0;
-                for (int64_t i = 0; i < k; ++i)
-                    self_off += pidx.p[i][b] * sspec.strides[i];
-
-                int64_t rem = t;
-                for (int dd = sspec.ndim - 1; dd >= static_cast<int>(k); --dd) {
-                    const int64_t c = rem % sspec.sizes[dd];
-                    rem /= sspec.sizes[dd];
-                    self_off += c * sspec.strides[dd];
-                }
+                const int64_t self_off = info.compute_self_offset(flat);
                 pout[flat] = pself[self_off];
             });
         });
@@ -310,49 +440,37 @@ Tensor index_tensor(const Tensor& self,
 Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
                    const Tensor& values, bool accumulate) {
     PTSYCL_TRACE_OP("index_put_");
-    TORCH_CHECK(spec_supported(self),
-                "paras index_put_: rank exceeds kernel limit");
+    auto prep = prepare_advanced_indexing(self, indices);
+    if (prep.no_op) {
+        if (accumulate) {
+            self.add_(values);
+        } else {
+            self.copy_(values);
+        }
+        return self;
+    }
 
-    auto ai = prepare_advanced_index(self, indices);
-    auto& q = queue_for(self);
-
-    std::vector<int64_t> vshape = ai.bshape;
-    for (int64_t d = ai.k; d < self.dim(); ++d) vshape.push_back(self.size(d));
-    Tensor v = values.expand(vshape).contiguous();
-
+    Tensor v = values.expand(prep.out_sizes).contiguous();
     const int64_t n = v.numel();
     if (n == 0) return self;
-    const int64_t tail_n = n / (ai.bn > 0 ? ai.bn : 1);
 
-    const auto self_spec = make_spec(self);
-    IndexPtrs pidx;
-    for (int64_t i = 0; i < ai.k; ++i) pidx.p[i] = data_ptr<int64_t>(ai.idx[i]);
-    const int64_t k = ai.k;
+    auto& q = queue_for(self);
+    const auto info = prep.info;
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
         "ptsycl_index_put", [&] {
             scalar_t*       pself = data_ptr<scalar_t>(self);
             const scalar_t* pval  = data_ptr<scalar_t>(v);
-            const auto sspec = self_spec;
 
             launch_flat(q, n, [=](std::size_t flat_) {
                 const int64_t flat = static_cast<int64_t>(flat_);
-                const int64_t b    = flat / tail_n;
-                const int64_t t    = flat % tail_n;
-
-                int64_t self_off = 0;
-                for (int64_t i = 0; i < k; ++i)
-                    self_off += pidx.p[i][b] * sspec.strides[i];
-
-                int64_t rem = t;
-                for (int dd = sspec.ndim - 1; dd >= static_cast<int>(k); --dd) {
-                    const int64_t c = rem % sspec.sizes[dd];
-                    rem /= sspec.sizes[dd];
-                    self_off += c * sspec.strides[dd];
+                const int64_t self_off = info.compute_self_offset(flat);
+                if (accumulate) {
+                    atomic_add(&pself[self_off], pval[flat]);
+                } else {
+                    pself[self_off] = pval[flat];
                 }
-                if (accumulate) atomic_add(&pself[self_off], pval[flat]);
-                else pself[self_off] = pval[flat];
             });
         });
     return self;

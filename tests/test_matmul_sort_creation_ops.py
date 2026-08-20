@@ -1,7 +1,23 @@
-import pytest
 import torch
 
 from common import check_op
+
+
+def _expect_raises(fn, exc_type=RuntimeError):
+    """Local substitute for pytest.raises so this file has no pytest
+    dependency (tests/run_all.py is meant to run standalone)."""
+    try:
+        fn()
+    except exc_type:
+        return
+    except Exception as e:
+        raise AssertionError(
+            f"expected {exc_type.__name__}, got {type(e).__name__}: {e}"
+        ) from e
+    else:
+        raise AssertionError(
+            f"expected {exc_type.__name__} but no exception was raised"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -79,8 +95,7 @@ def test_matmul_batched_vec(device):
 def test_mm_shape_mismatch_raises(device):
     a = torch.randn(4, 6).to(device)
     b = torch.randn(5, 5).to(device)
-    with pytest.raises(RuntimeError):
-        torch.mm(a, b)
+    _expect_raises(lambda: torch.mm(a, b))
 
 
 # -----------------------------------------------------------------------------
