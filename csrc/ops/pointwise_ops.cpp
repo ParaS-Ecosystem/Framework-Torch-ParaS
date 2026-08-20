@@ -1530,7 +1530,7 @@ std::tuple<Tensor, Tensor> sort_stable(
     c10::optional<bool> stable,
     int64_t dim, bool descending) {
     PTSYCL_TRACE_OP("sort.stable");
-    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+  
     auto values  = at::empty_like(self);
     auto indices = at::empty(self.sizes(),
                              self.options().dtype(c10::kLong));
@@ -1585,6 +1585,22 @@ Tensor cat(const at::ITensorListRef& tensors, int64_t dim) {
     ptsycl::cat_out(tensors, dim, out);
     return out;
 }
+
+
+
+// --- sort / argsort -----------------------------------------------------------------
+// A full sort is topk with k == the dimension's size; topk_out's tie-break
+// (earlier index wins) already makes it a stable order, so sort's `stable`
+// flag doesn't change the kernel used.
+// std::tuple<Tensor&, Tensor&> sort_out(const Tensor& self, int64_t dim,
+//                                       bool descending, Tensor& values,
+//                                       Tensor& indices) {
+//     PTSYCL_TRACE_OP("sort.values");
+//     const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+//     const int64_t n = self.size(d);
+//     return ptsycl::topk_out(self, c10::SymInt(n), d, descending,
+//                             /*sorted=*/true, values, indices);
+// }
 
 } // namespace
 } // namespace ptsycl
@@ -1712,4 +1728,5 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::sort.stable", &ptsycl::sort_stable);
     m.impl("aten::sort.values", &ptsycl::sort_out_default);
     m.impl("aten::sort.values_stable", &ptsycl::sort_out);
+
 }

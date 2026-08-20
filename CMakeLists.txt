@@ -100,6 +100,10 @@ add_library(torch_paras_C SHARED
     csrc/ops/loss_ops.cpp
     csrc/ops/norm_ops.cpp
     csrc/ops/vision_ops.cpp
+    csrc/ops/attention_ops.cpp
+    csrc/ops/rms_swiglu_ops.cpp
+    csrc/ops/sort_ops.cpp
+    csrc/ops/creation_ops.cpp
     csrc/python/module.cpp
 )
 
