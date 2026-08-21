@@ -1,0 +1,7 @@
+# Datasets are downloaded, not vendored. Point --datasets-root wherever they
+# live, or drop them here; either way they must never enter the repository.
+datasets/
+# The download in README.md leaves the archives beside it.
+*.tar.gz
+__pycache__/
+*.pyc

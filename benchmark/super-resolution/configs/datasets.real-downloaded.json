@@ -1,0 +1,12 @@
+{
+  "Set5": {"hr_globs": ["Set5/GTmod12/**/*"]},
+  "Set14": {"hr_globs": ["Set14/GTmod12/**/*"]},
+  "BSD100": {"hr_globs": ["BSDS100/**/*"]},
+  "Urban100": {"hr_globs": ["urban100/**/*"]},
+  "Manga109": {"hr_globs": ["manga109/**/*"]},
+  "DIV2K": {"hr_globs": ["DIV2K_valid_HR/**/*"]},
+  "General100": {"hr_globs": ["General100/**/*"]},
+  "T91": {"hr_globs": ["T91/**/*"]},
+  "Flickr2K": {"hr_globs": ["Flickr2K/**/*"]},
+  "Historical": {"hr_globs": ["historical/LR/**/*"]}
+}

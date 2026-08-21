@@ -1,0 +1,7 @@
+{
+  "Set5": {"hr_globs": ["Set5_HR/**/*"]},
+  "Set14": {"hr_globs": ["Set14_HR/**/*"]},
+  "BSD100": {"hr_globs": ["BSD100_HR/**/*"]},
+  "Urban100": {"hr_globs": ["Urban100_HR/**/*"]},
+  "Manga109": {"hr_globs": ["Manga109_HR/**/*", "manga109/**/*"]}
+}
