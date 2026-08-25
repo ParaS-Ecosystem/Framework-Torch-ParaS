@@ -190,7 +190,7 @@ def test_masked_fill__tensor_value(device):
 
 def test_scatter_src(device):
     a = torch.randn(5, 6, dtype=torch.float32)
-    index = torch.randint(0, 5, (3, 6))
+    index = torch.stack([torch.randperm(5)[:3] for _ in range(6)], dim=1)
     src = torch.randn(3, 6, dtype=torch.float32)
     cpu_out = torch.scatter(a, 0, index, src)
     dev_out = torch.scatter(a.to(device), 0, index.to(device), src.to(device))
@@ -387,3 +387,38 @@ def test_concurrent_parallel_dispatch(device):
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(work, range(4)))
     assert results == [20.0, 21.0, 22.0, 23.0]
+
+
+def test_slice_basic(device):
+    a = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    cpu_out = a[1:3, 2:5]
+    dev_out = a.to(device)[1:3, 2:5]
+    assert_close(dev_out, cpu_out, "slice basic")
+
+
+def test_slice_step(device):
+    a = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    cpu_out = a[::2, 1::3]
+    dev_out = a.to(device)[::2, 1::3]
+    assert_close(dev_out, cpu_out, "slice step")
+
+
+def test_slice_negative(device):
+    a = torch.randn(5, 8, dtype=torch.float32)
+    cpu_out = a[-3:, :-2]
+    dev_out = a.to(device)[-3:, :-2]
+    assert_close(dev_out, cpu_out, "slice negative")
+
+
+def test_to_dtype(device):
+    a = torch.randn(4, 5, dtype=torch.float32).to(device)
+    b = a.to(dtype=torch.float64)
+    assert b.dtype == torch.float64 and b.device.type == 'paras'
+    assert_close(b, a.cpu().to(torch.float64), "to dtype")
+
+
+def test_to_device_roundtrip(device):
+    a = torch.randn(3, 4, dtype=torch.float32).to(device)
+    b = a.cpu()
+    c = b.to(device)
+    assert_close(c, a, "to device roundtrip")

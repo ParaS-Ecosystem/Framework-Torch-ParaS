@@ -4,3 +4,9 @@ __pycache__/
 *.so
 *.patch
 data/
+*.log
+*.pt
+gpucore*
+param2_*_results.json
+param2_comparison_report.json
+

@@ -55,6 +55,7 @@ __all__ = [
     "empty_cache",
     "device_name",
     "backend_name",
+    "get_amp_supported_dtype",
     "nn",
     "OptimizationSpec",
     "OptimizedModule",
@@ -113,12 +114,14 @@ def is_gpu_device(device: int) -> bool:
     return _C.is_gpu_device(device)
 
 
-def synchronize(device: int | None = None) -> None:
+def synchronize(device: int | torch.device | None = None) -> None:
     """Blocks until queued work on one device (or all devices) completes."""
     if device is None:
         _C.synchronize_all()
+    elif isinstance(device, torch.device):
+        _C.synchronize(device.index if device.index is not None else 0)
     else:
-        _C.synchronize(device)
+        _C.synchronize(int(device))
 
 
 def manual_seed(seed: int, device: int | None = None) -> None:
@@ -145,6 +148,10 @@ def memory_cached(device: int = 0) -> int:
     return _C.cached_bytes(device)
 
 
+def get_amp_supported_dtype() -> list[torch.dtype]:
+    return [torch.float16, torch.float32]
+
+
 def _register() -> None:
     torch.utils.rename_privateuse1_backend("paras")
 
@@ -158,6 +165,7 @@ def _register() -> None:
     mod.device_name = device_name
     mod.is_bad_fork = _C.is_bad_fork
     mod._is_in_bad_fork = _C.is_bad_fork
+    mod.get_amp_supported_dtype = get_amp_supported_dtype
     torch._register_device_module("paras", mod)
 
     # tensor.paras() / module.paras() / tensor.is_paras

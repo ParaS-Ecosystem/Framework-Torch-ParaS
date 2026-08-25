@@ -37,7 +37,7 @@ foreach(var PTSYCL_GCC_TOOLCHAIN PTSYCL_TORCH_DIR PARAS_HOME)
     endif()
 endforeach()
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
 execute_process(
     COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
@@ -100,6 +100,10 @@ add_library(torch_paras_C SHARED
     csrc/ops/loss_ops.cpp
     csrc/ops/norm_ops.cpp
     csrc/ops/vision_ops.cpp
+    csrc/ops/attention_ops.cpp
+    csrc/ops/rms_swiglu_ops.cpp
+    csrc/ops/sort_ops.cpp
+    csrc/ops/creation_ops.cpp
     csrc/python/module.cpp
 )
 
@@ -145,8 +149,9 @@ target_link_directories(torch_paras_C PRIVATE
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )
 
+file(GLOB _ptsycl_gcc_lib_dirs "${PTSYCL_GCC_TOOLCHAIN}/lib/gcc/*/*")
 find_library(PTSYCL_GOMP_LIBRARY NAMES gomp
-    HINTS "${PTSYCL_GCC_TOOLCHAIN}/lib64" "${PTSYCL_GCC_TOOLCHAIN}/lib")
+    HINTS "${PTSYCL_GCC_TOOLCHAIN}/lib64" "${PTSYCL_GCC_TOOLCHAIN}/lib" ${_ptsycl_gcc_lib_dirs})
 if(NOT PTSYCL_GOMP_LIBRARY)
     message(FATAL_ERROR "GNU OpenMP runtime (libgomp) not found under "
                         "PTSYCL_GCC_TOOLCHAIN=${PTSYCL_GCC_TOOLCHAIN}")
@@ -190,9 +195,12 @@ else()
                     "soft-float builtin symbols like __truncsfbf2 at link time)")
 endif()
 
+find_library(PTSYCL_PYTHON_LIBRARY NAMES python3.12 python3.12d python3
+    HINTS "${PTSYCL_GCC_TOOLCHAIN}/lib64" "${PTSYCL_GCC_TOOLCHAIN}/lib" /usr/lib64 /usr/lib)
+
 target_link_libraries(torch_paras_C PRIVATE
     torch torch_cpu torch_python c10
-    ${Python3_LIBRARIES}
+    ${PTSYCL_PYTHON_LIBRARY}
     pthread
     "${PTSYCL_GOMP_LIBRARY}"
 )
