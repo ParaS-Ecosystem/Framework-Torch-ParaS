@@ -17,9 +17,8 @@
 // -----------------------------------------------------------------------------
 
 
-#include <ATen/core/Reduction.h>
+#include "core/kernel_utils.h"
 
-#include "core/kernels.h"
 
 namespace ptsycl {
 namespace {

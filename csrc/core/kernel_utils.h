@@ -16,15 +16,21 @@
 // along with this library. If not, see <https://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
+// NOTE: filename assumed -- adjust the #include below and the path this is
+// copied to if your tree calls this something other than core/kernel_utils.h.
 
 #pragma once
 
-
 #include <cstdint>
+#include <type_traits>
 
 #include <c10/util/Exception.h>
 
 #include "core/common.h"
+
+#if defined(PTSYCL_BACKEND_SYCL)
+#include <sycl/sycl.hpp>
+#endif
 
 namespace ptsycl {
 
@@ -67,28 +73,53 @@ inline StridedSpec make_spec(const at::Tensor& t) {
 // Elementwise helpers
 // -----------------------------------------------------------------------------
 
+// atomic_ref is one of the constructs the compiler-team audit confirmed
+// working under parascc (unlike, e.g., sub_group::get_local_linear_id(),
+// which always returns 0). It replaces the old CUDA/HIP atomicAdd()
+// intrinsics entirely -- there is no more __CUDA_ARCH__/__HIP_DEVICE_COMPILE__
+// branch here.
+// template <typename T>
+// PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
+//     if constexpr (std::is_same_v<T, bool>) {
+//         if (val) *address = true;
+//     } else {
+// #if defined(PTSYCL_BACKEND_SYCL)
+//         sycl::atomic_ref<T, sycl::memory_order::relaxed,
+//                           sycl::memory_scope::device> ref(*address);
+//         ref.fetch_add(val);
+// #else
+//         *address += val;
+// #endif
+//     }
+// }
+
+// core/kernel_utils.h — atomic_add
 template <typename T>
 PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
-#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_HIP)) && (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__))
-    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
-                  std::is_same_v<T, int> || std::is_same_v<T, unsigned int>) {
-        atomicAdd(address, val);
-    } else if constexpr (sizeof(T) == 8 && std::is_integral_v<T>) {
-        atomicAdd(reinterpret_cast<unsigned long long*>(address), static_cast<unsigned long long>(val));
-    } else if constexpr (std::is_same_v<T, bool>) {
-        if (val) *address = true;
-    } else {
-        *address += val;
-    }
-#else
     if constexpr (std::is_same_v<T, bool>) {
         if (val) *address = true;
     } else {
+#if defined(PTSYCL_BACKEND_SYCL)
+        // fetch_add on this parascc install passes through directly to a
+        // native atomicAdd() overload with NO generic/CAS fallback beneath
+        // it -- confirmed by int64_t (64-bit, same width as double) still
+        // failing to compile. Only {int32_t, uint32_t, float, double} are
+        // safe here today. Everything else needs a hand-rolled CAS loop,
+        // which is unverified on this install -- see the open item with
+        // Laxmikant re: atomic_ref::compare_exchange_strong before adding
+        // support for int8/int16/int64/Half/BFloat16.
+        static_assert(std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t> ||
+                      std::is_same_v<T, float> || std::is_same_v<T, double>,
+                      "paras atomic_add: T not yet supported by this parascc "
+                      "install's atomic_ref::fetch_add -- see kernel_utils.h");
+        sycl::atomic_ref<T, sycl::memory_order::relaxed,
+                          sycl::memory_scope::device> ref(*address);
+        ref.fetch_add(val);
+#else
         *address += val;
-    }
 #endif
+    }
 }
-
 template <typename F>
 inline void launch_flat(compat::Queue& q, int64_t n, F fn) {
     if (n <= 0) return;
@@ -104,7 +135,6 @@ inline void launch_strided_store(compat::Queue& q, int64_t n, T* out,
         out[spec.index(static_cast<int64_t>(i))] = fn(static_cast<int64_t>(i));
     });
 }
-
 
 constexpr int64_t kReducePartials = 1024;
 
@@ -123,7 +153,8 @@ inline acc_t reduce_full(compat::Queue& q, int64_t n, acc_t init, Map map,
             acc = combine(acc, map(i));
         partials[s] = acc;
     });
-    q.synchronize(); // partials are read on the host below
+    q.synchronize(); // partials are read on the host below (they're USM
+                      // shared allocations, so this is a plain host read)
 
     acc_t result = init;
     for (int64_t s = 0; s < stripes; ++s) result = combine(result, partials[s]);

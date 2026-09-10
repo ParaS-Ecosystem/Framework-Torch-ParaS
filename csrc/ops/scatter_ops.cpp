@@ -17,7 +17,9 @@
 // -----------------------------------------------------------------------------
 
 
-#include "core/kernels.h"
+#include "core/kernel_utils.h"
+
+#include <ATen/MemoryOverlap.h>
 
 // NOTE: masked_fill.Scalar/.Tensor (out-of-place) and scatter.src/.value
 // (out-of-place, non-structured-delegate entry) are CompositeExplicitAutograd
@@ -46,6 +48,8 @@ Tensor& masked_fill__scalar(Tensor& self, const Tensor& mask,
     TORCH_CHECK(mask.scalar_type() == c10::kBool,
                 "paras masked_fill_: mask must be a bool tensor");
     TORCH_CHECK(spec_supported(self), "paras masked_fill_: rank exceeds kernel limit");
+
+    at::assert_no_internal_overlap(self);
 
     auto& q = queue_for(self);
     const int64_t n = self.numel();
@@ -86,6 +90,11 @@ Tensor& masked_fill__tensor(Tensor& self, const Tensor& mask,
 // picks out. Like upstream, results with duplicate indices along `dim` are
 // unspecified (racing writes, no atomics) -- this matches real CPU/CUDA
 // scatter semantics, which document the non-reduce form as such too.
+//
+// --- WRAPPING & SAFETY LOGIC ---
+// Negative indices wrap via idx + dim_size (matching PyTorch's documented
+// negative-indexing semantics); indices that remain out of range after
+// wrapping are skipped rather than dereferenced, to avoid a device segfault.
 Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
                         const Tensor& src, Tensor& out) {
     PTSYCL_TRACE_OP("scatter.src_out");
@@ -100,6 +109,7 @@ Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
     Tensor idx = to_long(index);
 
     if (out.data_ptr() != self.data_ptr()) out.copy_(self);
+    at::assert_no_internal_overlap(out);
 
     const auto idx_spec = make_spec(idx);
     const auto out_spec = make_spec(out);
@@ -107,6 +117,7 @@ Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
     const int     ndim = idx_spec.ndim;
     const int64_t n    = idx.numel();
     const int64_t out_dim_stride = out.stride(d);
+    const int64_t out_dim_size   = out.size(d);
     if (n == 0) return out;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -128,7 +139,14 @@ Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
                     rem /= idx_spec.sizes[dd];
                     if (dd != d) out_off += c * out_spec.strides[dd];
                 }
-                const int64_t sel = pidx[idx_off];
+
+                // --- WRAPPING & SAFETY LOGIC ---
+                int64_t sel = pidx[idx_off];
+                if (sel < 0) sel += out_dim_size;
+                if (sel < 0 || sel >= out_dim_size) {
+                    return; // safe skip to prevent segfault
+                }
+
                 out_off += sel * out_dim_stride;
                 pout[out_off] = psrc[src_off];
             });
@@ -150,12 +168,14 @@ Tensor& scatter_value_out(const Tensor& self, int64_t dim, const Tensor& index,
     Tensor idx = to_long(index);
 
     if (out.data_ptr() != self.data_ptr()) out.copy_(self);
+    at::assert_no_internal_overlap(out);
 
     const auto idx_spec = make_spec(idx);
     const auto out_spec = make_spec(out);
     const int     ndim = idx_spec.ndim;
     const int64_t n    = idx.numel();
     const int64_t out_dim_stride = out.stride(d);
+    const int64_t out_dim_size   = out.size(d);
     if (n == 0) return out;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -176,7 +196,14 @@ Tensor& scatter_value_out(const Tensor& self, int64_t dim, const Tensor& index,
                     rem /= idx_spec.sizes[dd];
                     if (dd != d) out_off += c * out_spec.strides[dd];
                 }
-                const int64_t sel = pidx[idx_off];
+
+                // --- WRAPPING & SAFETY LOGIC ---
+                int64_t sel = pidx[idx_off];
+                if (sel < 0) sel += out_dim_size;
+                if (sel < 0 || sel >= out_dim_size) {
+                    return; // safe skip to prevent segfault
+                }
+
                 out_off += sel * out_dim_stride;
                 pout[out_off] = v;
             });
@@ -210,6 +237,122 @@ Tensor& scatter_value_(Tensor& self, int64_t dim, const Tensor& index,
     return ptsycl::scatter_value_out(self, dim, index, value, self);
 }
 
+// -----------------------------------------------------------------------------
+// scatter_add
+// -----------------------------------------------------------------------------
+// Unlike scatter.src, duplicate indices along `dim` are well-defined here:
+// each contribution must be accumulated, not overwritten. We use atomic_add
+// per element so concurrent writers targeting the same output slot combine
+// correctly instead of racing (matching upstream's documented scatter_add_
+// semantics, where duplicate indices sum).
+//
+// --- WRAPPING & SAFETY LOGIC ---
+// Same negative-index wraparound and out-of-range skip as scatter.src/.value.
+//
+// --- DTYPE COVERAGE (deliberately narrower than scatter.src/.value) ---
+// atomic_add() -> sycl::atomic_ref<T>::fetch_add() on this parascc install
+// is a direct passthrough to a native CUDA atomicAdd() overload with NO
+// generic/CAS fallback beneath it -- confirmed by int64_t (64-bit, same
+// width as double) still failing to compile even though double works.
+// Only {int32_t, float, double} have a matching native atomicAdd()
+// overload; bool is safe too but never reaches hardware atomics (handled
+// separately as a plain store in atomic_add's `if constexpr` branch, same
+// as before this change). int8_t/int16_t/int64_t/Half/BFloat16 are NOT
+// dispatched here -- they need a hand-rolled compare-exchange loop that is
+// unverified on this install (open item with the compiler team re:
+// atomic_ref::compare_exchange_strong; the construct matrix does not list
+// it). Until that's confirmed, scatter_add on those dtypes raises a clear
+// error below instead of either failing to compile or silently corrupting
+// results.
+Tensor& scatter_add_out(const Tensor& self, int64_t dim, const Tensor& index,
+                        const Tensor& src, Tensor& out) {
+    PTSYCL_TRACE_OP("scatter_add.out");
+    TORCH_CHECK(index.dim() == self.dim(),
+                "paras scatter_add: index must have the same rank as self");
+    TORCH_CHECK(spec_supported(self) && spec_supported(index) &&
+                    spec_supported(src) && spec_supported(out),
+                "paras scatter_add: rank exceeds kernel limit");
+
+    auto& q = queue_for(self);
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    Tensor idx = to_long(index);
+
+    if (out.data_ptr() != self.data_ptr()) out.copy_(self);
+    at::assert_no_internal_overlap(out);
+
+    const auto idx_spec = make_spec(idx);
+    const auto out_spec = make_spec(out);
+    const auto src_spec = make_spec(src);
+    const int     ndim = idx_spec.ndim;
+    const int64_t n    = idx.numel();
+    const int64_t out_dim_stride = out.stride(d);
+    const int64_t out_dim_size   = out.size(d);
+    if (n == 0) return out;
+
+#define PTSYCL_SCATTER_ADD_ATOMIC_SAFE_TYPES(_)                              \
+    _(int32_t, c10::kInt)                                                    \
+    _(float,   c10::kFloat)                                                  \
+    _(double,  c10::kDouble)                                                 \
+    _(bool,    c10::kBool)
+
+    switch (self.scalar_type()) {
+#define CASE(T, ST)                                                          \
+    case ST: {                                                               \
+        T*       pout = data_ptr<T>(out);                                    \
+        const T* psrc = data_ptr<T>(src);                                    \
+        const int64_t* pidx = data_ptr<int64_t>(idx);                        \
+        launch_flat(q, n, [=](std::size_t flat_) {                           \
+            const int64_t flat    = static_cast<int64_t>(flat_);             \
+            const int64_t idx_off = idx_spec.index(flat);                    \
+            const int64_t src_off = src_spec.index(flat);                    \
+                                                                              \
+            int64_t rem = flat;                                              \
+            int64_t out_off = 0;                                             \
+            for (int dd = ndim - 1; dd >= 0; --dd) {                         \
+                const int64_t c = rem % idx_spec.sizes[dd];                  \
+                rem /= idx_spec.sizes[dd];                                   \
+                if (dd != d) out_off += c * out_spec.strides[dd];            \
+            }                                                                \
+                                                                              \
+            int64_t sel = pidx[idx_off];                                     \
+            if (sel < 0) sel += out_dim_size;                                \
+            if (sel < 0 || sel >= out_dim_size) {                            \
+                return; /* safe skip to prevent segfault */                  \
+            }                                                                \
+                                                                              \
+            out_off += sel * out_dim_stride;                                 \
+            atomic_add(&pout[out_off], psrc[src_off]); /* duplicate-index safe */ \
+        });                                                                  \
+        break;                                                               \
+    }
+        PTSYCL_SCATTER_ADD_ATOMIC_SAFE_TYPES(CASE)
+#undef CASE
+        default:
+            TORCH_CHECK(false, "paras scatter_add: dtype ", self.scalar_type(),
+                        " is not yet supported -- this parascc install's "
+                        "atomic_ref::fetch_add only has native hardware "
+                        "support for int32, float, double, and bool. "
+                        "int8/int16/int64/Half/BFloat16 scatter_add is "
+                        "pending a verified compare-exchange-based atomic "
+                        "implementation.");
+    }
+#undef PTSYCL_SCATTER_ADD_ATOMIC_SAFE_TYPES
+    return out;
+}
+
+Tensor scatter_add(const Tensor& self, int64_t dim, const Tensor& index,
+                   const Tensor& src) {
+    PTSYCL_TRACE_OP("scatter_add");
+    Tensor out = self.clone();
+    return ptsycl::scatter_add_out(self, dim, index, src, out);
+}
+
+Tensor& scatter_add_(Tensor& self, int64_t dim, const Tensor& index,
+                     const Tensor& src) {
+    PTSYCL_TRACE_OP("scatter_add_");
+    return ptsycl::scatter_add_out(self, dim, index, src, self);
+}
+
 } // namespace
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -222,6 +365,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::scatter.value", &ptsycl::scatter_value);
     m.impl("aten::scatter.value_out", &ptsycl::scatter_value_out);
     m.impl("aten::scatter_.value", &ptsycl::scatter_value_);
+
+    m.impl("aten::scatter_add", &ptsycl::scatter_add);
+    m.impl("aten::scatter_add.out", &ptsycl::scatter_add_out);
+    m.impl("aten::scatter_add_", &ptsycl::scatter_add_);
 }
 
 } // namespace ptsycl

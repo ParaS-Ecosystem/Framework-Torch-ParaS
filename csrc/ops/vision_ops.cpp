@@ -17,7 +17,7 @@
 // -----------------------------------------------------------------------------
 
 
-#include "core/kernels.h"
+#include "core/kernel_utils.h"
 #include <ATen/ATen.h>
 #include <torch/torch.h>
 #include <ATen/ops/_native_multi_head_attention_cpu_dispatch.h>

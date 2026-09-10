@@ -18,8 +18,9 @@
 
 
 #include <cmath>
+#include <ATen/MemoryOverlap.h>
 
-#include "core/kernels.h"
+#include "core/kernel_utils.h"
 
 namespace ptsycl {
 namespace {
@@ -32,6 +33,8 @@ using at::Tensor;
 
 template <typename Fn>
 void unary_kernel(const Tensor& a, Tensor& out, Fn fn) {
+    at::assert_no_internal_overlap(out);
+
     auto& q = queue_for(out);
     const int64_t n = out.numel();
     if (n == 0) return;
@@ -61,6 +64,8 @@ Tensor to_compute(const Tensor& t, c10::ScalarType dtype, c10::Device device) {
 
 template <typename Fn>
 void binary_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
+    at::assert_no_internal_overlap(out);
+
     auto& q = queue_for(out);
     const int64_t n = out.numel();
     if (n == 0) return;

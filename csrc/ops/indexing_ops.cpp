@@ -17,7 +17,8 @@
 // -----------------------------------------------------------------------------
 
 
-#include "core/kernels.h"
+#include "core/kernel_utils.h"
+#include <ATen/MemoryOverlap.h>
 
 namespace ptsycl {
 namespace {
@@ -57,6 +58,7 @@ Tensor& gather_out(const Tensor& self, int64_t dim, const Tensor& index,
     const int     ndim = idx_spec.ndim;
     const int64_t n    = idx.numel();
     const int64_t self_dim_stride = self.stride(d);
+    const int64_t self_dim_size   = self.size(d);
     if (n == 0) return out;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -71,12 +73,20 @@ Tensor& gather_out(const Tensor& self, int64_t dim, const Tensor& index,
                 const int64_t idx_off = idx_spec.index(flat);
                 const int64_t out_off = out_spec.index(flat);
 
+                // --- WRAPPING & SAFETY LOGIC ---
+                int64_t raw_idx = pidx[idx_off];
+                if (raw_idx < 0) raw_idx += self_dim_size;
+                if (raw_idx < 0 || raw_idx >= self_dim_size) {
+                    pout[out_off] = scalar_t(0); // safe fallback to prevent segfault
+                    return;
+                }
+
                 int64_t rem = flat;
                 int64_t self_off = 0;
                 for (int dd = ndim - 1; dd >= 0; --dd) {
                     const int64_t c = rem % idx_spec.sizes[dd];
                     rem /= idx_spec.sizes[dd];
-                    self_off += (dd == d) ? pidx[idx_off] * self_dim_stride
+                    self_off += (dd == d) ? raw_idx * self_dim_stride
                                           : c * self_spec.strides[dd];
                 }
                 pout[out_off] = pself[self_off];
@@ -113,6 +123,7 @@ Tensor& index_select_out(const Tensor& self, int64_t dim, const Tensor& index,
     const auto self_spec = make_spec(self);
     const auto out_spec  = make_spec(out);
     const int64_t self_dim_stride = self.stride(d);
+    const int64_t self_dim_size   = self.size(d);
     const int     ndim = out_spec.ndim;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -135,7 +146,16 @@ Tensor& index_select_out(const Tensor& self, int64_t dim, const Tensor& index,
                     if (dd == d) sel = c;
                     else self_off += c * self_spec.strides[dd];
                 }
-                self_off += pidx[sel] * self_dim_stride;
+
+                // --- WRAPPING & SAFETY LOGIC ---
+                int64_t raw_idx = pidx[sel];
+                if (raw_idx < 0) raw_idx += self_dim_size;
+                if (raw_idx < 0 || raw_idx >= self_dim_size) {
+                    pout[out_off] = scalar_t(0); // safe fallback to prevent segfault
+                    return;
+                }
+
+                self_off += raw_idx * self_dim_stride;
                 pout[out_off] = pself[self_off];
             });
         });
@@ -160,6 +180,8 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
     TORCH_CHECK(spec_supported(self) && spec_supported(source),
                 "paras index_copy_: rank exceeds kernel limit");
 
+    at::assert_no_internal_overlap(self);
+
     auto& q = queue_for(self);
     const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
     Tensor idx = to_long(index).contiguous();
@@ -169,6 +191,7 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
     const auto self_spec = make_spec(self);
     const auto src_spec  = make_spec(source);
     const int64_t self_dim_stride = self.stride(d);
+    const int64_t self_dim_size   = self.size(d);
     const int     ndim = src_spec.ndim;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -191,7 +214,15 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
                     if (dd == d) sel = c;
                     else self_off += c * self_spec.strides[dd];
                 }
-                self_off += pidx[sel] * self_dim_stride;
+
+                // --- WRAPPING & SAFETY LOGIC ---
+                int64_t raw_idx = pidx[sel];
+                if (raw_idx < 0) raw_idx += self_dim_size;
+                if (raw_idx < 0 || raw_idx >= self_dim_size) {
+                    return; // safe skip to prevent segfault
+                }
+
+                self_off += raw_idx * self_dim_stride;
                 pself[self_off] = psrc[src_off];
             });
         });
@@ -437,6 +468,22 @@ Tensor index_tensor(const Tensor& self,
     return out;
 }
 
+// -----------------------------------------------------------------------------
+// index_put_
+// -----------------------------------------------------------------------------
+// Split into two dispatches rather than one: the plain-store path
+// (accumulate=false) has no type restriction and keeps the full
+// AT_DISPATCH_ALL_TYPES_AND3 range, same as index.Tensor above. The
+// accumulate=true path goes through atomic_add(), and this parascc
+// install's atomic_ref::fetch_add is a direct passthrough to a native
+// CUDA atomicAdd() overload with NO generic/CAS fallback beneath it
+// (confirmed via scatter_add: int64_t, same width as double, still fails
+// to compile). Only {int32_t, float, double, bool} have a matching
+// native atomicAdd() overload (bool never reaches hardware atomics --
+// atomic_add's `if constexpr` branch handles it as a plain store).
+// int8_t/int16_t/int64_t/Half/BFloat16 accumulate is NOT dispatched here
+// -- same open item as scatter_ops.cpp re: a verified compare-exchange-
+// based atomic_add before those types can accumulate on-device.
 Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
                    const Tensor& values, bool accumulate) {
     PTSYCL_TRACE_OP("index_put_");
@@ -450,6 +497,8 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
         return self;
     }
 
+    at::assert_no_internal_overlap(self);
+
     Tensor v = values.expand(prep.out_sizes).contiguous();
     const int64_t n = v.numel();
     if (n == 0) return self;
@@ -457,22 +506,52 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
     auto& q = queue_for(self);
     const auto info = prep.info;
 
-    AT_DISPATCH_ALL_TYPES_AND3(
-        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
-        "ptsycl_index_put", [&] {
-            scalar_t*       pself = data_ptr<scalar_t>(self);
-            const scalar_t* pval  = data_ptr<scalar_t>(v);
+    if (!accumulate) {
+        AT_DISPATCH_ALL_TYPES_AND3(
+            c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
+            "ptsycl_index_put", [&] {
+                scalar_t*       pself = data_ptr<scalar_t>(self);
+                const scalar_t* pval  = data_ptr<scalar_t>(v);
 
-            launch_flat(q, n, [=](std::size_t flat_) {
-                const int64_t flat = static_cast<int64_t>(flat_);
-                const int64_t self_off = info.compute_self_offset(flat);
-                if (accumulate) {
-                    atomic_add(&pself[self_off], pval[flat]);
-                } else {
+                launch_flat(q, n, [=](std::size_t flat_) {
+                    const int64_t flat = static_cast<int64_t>(flat_);
+                    const int64_t self_off = info.compute_self_offset(flat);
                     pself[self_off] = pval[flat];
-                }
+                });
             });
-        });
+        return self;
+    }
+
+#define PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES(_)                                \
+    _(int32_t, c10::kInt)                                                    \
+    _(float,   c10::kFloat)                                                  \
+    _(double,  c10::kDouble)                                                 \
+    _(bool,    c10::kBool)
+
+    switch (self.scalar_type()) {
+#define CASE(T, ST)                                                          \
+    case ST: {                                                               \
+        T*       pself = data_ptr<T>(self);                                  \
+        const T* pval  = data_ptr<T>(v);                                     \
+        launch_flat(q, n, [=](std::size_t flat_) {                           \
+            const int64_t flat = static_cast<int64_t>(flat_);                \
+            const int64_t self_off = info.compute_self_offset(flat);         \
+            atomic_add(&pself[self_off], pval[flat]);                        \
+        });                                                                  \
+        break;                                                               \
+    }
+        PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES(CASE)
+#undef CASE
+        default:
+            TORCH_CHECK(false, "paras index_put_ (accumulate=True): dtype ",
+                        self.scalar_type(), " is not yet supported -- this "
+                        "parascc install's atomic_ref::fetch_add only has "
+                        "native hardware support for int32, float, double, "
+                        "and bool. int8/int16/int64/Half/BFloat16 "
+                        "accumulating index_put_ is pending a verified "
+                        "compare-exchange-based atomic implementation.");
+    }
+#undef PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES
     return self;
 }
 
@@ -537,6 +616,8 @@ Tensor& triu_tril_out(const Tensor& self, int64_t diagonal, Tensor& out,
                 "paras triu/tril: input must have at least 2 dimensions");
     TORCH_CHECK(spec_supported(self) && spec_supported(out),
                 "paras triu/tril: rank exceeds kernel limit");
+
+    at::assert_no_internal_overlap(out);
 
     auto& q = queue_for(self);
     const int64_t n    = out.numel();

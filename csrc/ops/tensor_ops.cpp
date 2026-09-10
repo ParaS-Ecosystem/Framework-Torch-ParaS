@@ -16,14 +16,15 @@
 // along with this library. If not, see <https://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
-
 #include <ATen/ExpandUtils.h>
 #include <ATen/InferSize.h>
 #include <ATen/native/CPUFallback.h>
 #include <c10/core/DeviceGuard.h>
 
 #include "core/allocator.h"
-#include "core/kernels.h"
+#include "core/common.h"       // kParasDevice, data_ptr<T>, queue_for, is_paras_tensor
+#include "core/kernel_utils.h" // StridedSpec, make_spec, launch_flat, atomic_add
+#include "core/log.h"          // PTSYCL_TRACE_OP, PTSYCL_INFO, log::level()
 
 namespace ptsycl {
 namespace {
@@ -1027,6 +1028,3 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
 TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
     m.fallback(torch::CppFunction::makeFallthrough());
 }
-
-
-

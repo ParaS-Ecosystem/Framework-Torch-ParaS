@@ -17,7 +17,7 @@
 // -----------------------------------------------------------------------------
 
 
-#include "core/kernels.h"
+#include "core/kernel_utils.h"
 #include <ATen/ATen.h>
 #include <torch/torch.h>
 

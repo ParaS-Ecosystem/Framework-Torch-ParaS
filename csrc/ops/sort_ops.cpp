@@ -49,8 +49,7 @@
 //     duplicating a sort implementation here.
 // -----------------------------------------------------------------------------
 
-#include "core/kernels.h"
-
+#include "core/kernel_utils.h"
 #include <algorithm>
 #include <numeric>
 #include <vector>

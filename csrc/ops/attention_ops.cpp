@@ -16,8 +16,8 @@
 // along with this library. If not, see <https://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
-#include "core/kernels.h"
 
+#include "core/kernel_utils.h"
 #include <cmath>
 #include <limits>
 

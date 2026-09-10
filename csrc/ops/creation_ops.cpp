@@ -27,8 +27,8 @@
 // fallback.
 // -----------------------------------------------------------------------------
 
-#include "core/kernels.h"
 
+#include "core/kernel_utils.h"
 namespace ptsycl {
 namespace {
 

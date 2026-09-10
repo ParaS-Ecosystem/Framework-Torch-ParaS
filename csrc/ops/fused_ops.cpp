@@ -19,7 +19,7 @@
 
 #include <cmath>
 
-#include "core/kernels.h"
+#include "core/kernel_utils.h"
 
 // NOTE: these are registered under a new "paras::" op namespace rather than
 // overriding aten::rms_norm. Upstream, aten::rms_norm has only a

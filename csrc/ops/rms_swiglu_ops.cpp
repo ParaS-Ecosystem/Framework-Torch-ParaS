@@ -16,30 +16,11 @@
 // along with this library. If not, see <https://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
-#include "core/kernels.h"
-
-// Both ops below are "wiring", not new low-level kernels: they compose
-// primitives this tree already registers for PrivateUse1 (pow, mean,
-// rsqrt, mul, silu -- all listed under the ~130 existing aten kernels in
-// the README). Each call below redispatches through the operator table,
-// so it lands on this backend's existing elementwise/reduction kernels
-// automatically. If profiling later shows either is a hot path, replace
-// the composition with a fused launch_flat kernel following the pattern
-// in indexing_ops.cpp (a single-pass parallel reduction).
-
+#include "core/kernel_utils.h"
 namespace ptsycl {
 namespace {
 
 using at::Tensor;
-
-// rms_norm(Tensor input, int[] normalized_shape, Tensor? weight=None,
-//          float? eps=None) -> Tensor
-// Reduces over the trailing `normalized_shape.size()` dims, same
-// convention as layer_norm. NOTE: real torch defaults `eps` per-dtype
-// (see torch.finfo(dtype).eps-derived default in native_layer_norm) --
-// 1e-6 below is a reasonable default for fp32/bf16 but check
-// `torch.ops.aten.rms_norm.default._schema` / your torch version's
-// actual default before relying on omitted eps for fp16.
 Tensor rms_norm(const Tensor& input, at::IntArrayRef normalized_shape,
                  const c10::optional<Tensor>& weight,
                  c10::optional<double> eps) {
@@ -73,13 +54,6 @@ Tensor rms_norm(const Tensor& input, at::IntArrayRef normalized_shape,
     }
     return out;
 }
-
-// torch_paras::swiglu(Tensor x, Tensor gate) -> Tensor
-// x * silu(gate)  (SiLU-gated linear unit, as in Llama/PaLM-style MLPs).
-// Not a standard aten op, so it's registered under a `torch_paras`
-// namespace rather than `aten::` -- call it as `torch.ops.torch_paras.swiglu`.
-// x and gate broadcast per normal elementwise rules (typically same shape:
-// both are the two halves of a chunked gate_up_proj output).
 Tensor swiglu(const Tensor& x, const Tensor& gate) {
     PTSYCL_TRACE_OP("swiglu");
     return x * at::silu(gate);
@@ -99,12 +73,6 @@ TORCH_LIBRARY_IMPL(torch_paras, PrivateUse1, m) {
     m.impl("swiglu", &ptsycl::swiglu);
 }
 
-// swiglu's body is pure composition (calls at::silu / operator* and lets
-// them redispatch on whatever device the tensors are already on), so the
-// same function is correct as a CPU kernel too -- register it there as
-// well rather than leaving CPU tensors with no kernel to fall back to.
-// Useful for writing device-vs-CPU parity tests that call
-// torch.ops.torch_paras.swiglu directly on both sides.
 TORCH_LIBRARY_IMPL(torch_paras, CPU, m) {
     m.impl("swiglu", &ptsycl::swiglu);
 }
