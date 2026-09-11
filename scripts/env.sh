@@ -12,7 +12,7 @@
 #
 #   source scripts/env.sh
 # ==========================================================
-export PARAS_HOME="/storage/Laxmikant/LFI_RELEASE_V2/ParaS-Compiler/build/install"
+export PARAS_HOME="${PARAS_HOME:-/storage/parikshit/torch_paras/ParaS-Compiler/build/install}"
 export PTSYCL_GCC_TOOLCHAIN="/storage/aniket/binaries/gcc-13.4.0"
 export PTSYCL_CUDA_HOME="/storage/Laxmikant/binaries/cuda-12.2"
 export PTSYCL_LLVM_DIR="/storage/Laxmikant/binaries/LLVM_v21.1_GCC_v12.2_inst_dir"

@@ -1,4 +1,7 @@
 
+#if defined(PTSYCL_BACKEND_SYCL)
+#include <sycl/sycl.hpp>
+#endif
 #include "compat/paras_compat.h"
 
 #include <ATen/Parallel.h>
@@ -10,6 +13,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+
+
 
 namespace ptsycl {
 namespace compat {
@@ -85,26 +90,18 @@ std::vector<DeviceInfo> enumerate_devices() {
 #if defined(PTSYCL_BACKEND_SYCL)
     auto& table = device_table();
     table.clear();
-    try {
-        sycl::device dev(sycl::gpu_selector_v);
+    auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
         DeviceInfo gpu;
-        gpu.name          = dev.get_info<sycl::info::device::name>();
+        gpu.name          = gpus[i].get_info<sycl::info::device::name>();
         gpu.is_gpu        = true;
-        gpu.native_id     = static_cast<int>(table.size()); // always 0 today
-        gpu.compute_units = static_cast<int>(
-            dev.get_info<sycl::info::device::max_compute_units>());
-        gpu.global_mem    = dev.get_info<sycl::info::device::global_mem_size>();
-        // aspect::fp64 is not in the supported construct matrix (Section 1's
-        // `aspect` row lists only cpu, queue_profiling) and doesn't compile
-        // on this parascc install. Hardcoded true -- these are V100s, which
-        // support fp64 in hardware. Revisit if this backend ever targets
-        // fp64-limited hardware; track alongside the enumeration gap above.
-      //  gpu.fp64          = true;
-      gpu.fp64 = dev.has(sycl::aspect::fp64);
-        table.push_back(dev);
+        gpu.native_id     = static_cast<int>(i);
+        gpu.compute_units = static_cast<int>(gpus[i].get_info<sycl::info::device::max_compute_units>());
+        gpu.global_mem    = gpus[i].get_info<sycl::info::device::global_mem_size>();
+        gpu.fp64          = true;
+
+        table.push_back(gpus[i]);
         out.push_back(std::move(gpu));
-    } catch (const sycl::exception&) {
-       
     }
 #endif
 
@@ -201,7 +198,7 @@ void Queue::init(const DeviceInfo& dev) {
 Queue::~Queue() {
 #if defined(PTSYCL_BACKEND_SYCL)
     if (queue_ != nullptr) {
-        delete static_cast<sycl::queue*>(queue_);
+        delete queue_;
         queue_ = nullptr;
     }
 #endif
@@ -212,7 +209,7 @@ void* Queue::alloc(std::size_t nbytes) {
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
         void* p = static_cast<void*>(
-            sycl::malloc_shared<std::byte>(nbytes, sycl_queue()));
+            sycl::malloc_shared<std::byte>(nbytes, *queue_));
         if (p == nullptr) {
             std::ostringstream os;
             os << "sycl::malloc_shared(" << nbytes << " bytes) on device "
@@ -235,7 +232,7 @@ void Queue::dealloc(void* ptr) {
     if (ptr == nullptr) return;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        sycl::free(ptr, sycl_queue());
+        sycl::free(ptr, *queue_);
         return;
     }
 #endif
@@ -246,7 +243,7 @@ void Queue::copy(void* dst, const void* src, std::size_t nbytes, bool blocking) 
     if (nbytes == 0) return;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        sycl_queue().memcpy(dst, src, nbytes);
+        queue_->memcpy(dst, src, nbytes);
         if (blocking) synchronize();
         return;
     }
@@ -259,7 +256,7 @@ void Queue::memset(void* ptr, int value, std::size_t nbytes) {
     if (nbytes == 0) return;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        sycl_queue().memset(ptr, value, nbytes);
+        queue_->memset(ptr, value, nbytes);
         return;
     }
 #endif
@@ -269,7 +266,7 @@ void Queue::memset(void* ptr, int value, std::size_t nbytes) {
 void Queue::synchronize() {
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        sycl_queue().wait_and_throw();
+        queue_->wait();
     }
 #endif
 }

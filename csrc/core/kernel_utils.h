@@ -99,7 +99,7 @@ PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
     if constexpr (std::is_same_v<T, bool>) {
         if (val) *address = true;
     } else {
-#if defined(PTSYCL_BACKEND_SYCL)
+#if defined(PTSYCL_BACKEND_SYCL) && (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__))
         // fetch_add on this parascc install passes through directly to a
         // native atomicAdd() overload with NO generic/CAS fallback beneath
         // it -- confirmed by int64_t (64-bit, same width as double) still

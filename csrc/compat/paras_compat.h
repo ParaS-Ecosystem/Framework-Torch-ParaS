@@ -20,7 +20,13 @@
 #include <sycl/sycl.hpp>
 #endif
 
+#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_SYCL)) && (defined(__CUDACC__) || defined(__CUDA__))
+#define PTSYCL_HOST_DEVICE __host__ __device__
+#elif defined(PTSYCL_BACKEND_HIP) && (defined(__HIPCC__) || defined(__HIP__))
+#define PTSYCL_HOST_DEVICE __host__ __device__
+#else
 #define PTSYCL_HOST_DEVICE
+#endif
 
 namespace ptsycl {
 namespace compat {
@@ -90,7 +96,7 @@ public:
     void synchronize();
 
 #if defined(PTSYCL_BACKEND_SYCL)
-    sycl::queue& sycl_queue() { return *static_cast<sycl::queue*>(queue_); }
+    sycl::queue& sycl_queue() { return *queue_; }
 #endif
 
     template <typename F>
@@ -98,11 +104,9 @@ public:
         if (n == 0) return;
 #if defined(PTSYCL_BACKEND_SYCL)
         if (is_gpu_) {
-          
-            sycl_queue().template parallel_for<ParasKernelKey<F>>(
+            queue_->template parallel_for<ParasKernelKey<F>>(
                 sycl::range<1>(n),
                 [f](sycl::id<1> i) { f(static_cast<std::size_t>(i[0])); });
-           
             return;
         }
 #endif
@@ -110,10 +114,14 @@ public:
     }
 
 private:
-    bool  initialized_ = false;
-    bool  is_gpu_      = false;
-    int   native_id_   = -1;
-    void* queue_       = nullptr; // sycl::queue*, PTSYCL_BACKEND_SYCL only
+    bool         initialized_ = false;
+    bool         is_gpu_      = false;
+    int          native_id_   = -1;
+#if defined(PTSYCL_BACKEND_SYCL)
+    sycl::queue* queue_       = nullptr;
+#else
+    void*        queue_       = nullptr;
+#endif
 };
 
 const char* backend_name();
