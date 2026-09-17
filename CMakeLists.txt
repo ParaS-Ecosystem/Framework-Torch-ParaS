@@ -1,11 +1,3 @@
-# PyTorch backend for the ParaS compiler.
-#
-# The C++ compiler must be parascc; scripts/build.sh sets it together with
-# the toolchain environment. Two build flavors exist:
-#
-#   -DPTSYCL_DEVICE=cpu          ParaS CPU engine (kem threadpool)
-#   -DPTSYCL_DEVICE=cuda:sm_70   CUDA kernels through -parasdevice
-#   -DPTSYCL_DEVICE=hip:gfx90a   HIP/ROCm kernels through -parasdevice
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -23,11 +15,9 @@ endif()
 # ------------------------------------------------------------------------------
 # Required configuration (normally provided by scripts/build.sh)
 # ------------------------------------------------------------------------------
-set(PTSYCL_DEVICE "cpu" CACHE STRING "Target: cpu or cuda:sm_XX")
+set(PTSYCL_DEVICE "cpu" CACHE STRING "Target: cpu, or sycl:cuda:sm_XX / sycl:hip:gfxXXX")
 set(PTSYCL_GCC_TOOLCHAIN "" CACHE PATH "GCC toolchain root for parascc")
 set(PTSYCL_TORCH_DIR "" CACHE PATH "PyTorch installation (site-packages/torch)")
-set(PTSYCL_CUDA_HOME "" CACHE PATH "CUDA toolkit root (cuda flavor only)")
-set(PTSYCL_ROCM_HOME "" CACHE PATH "ROCm installation root (hip flavor only)")
 set(PARAS_HOME "$ENV{PARAS_HOME}" CACHE PATH "ParaS compiler installation")
 set(PTSYCL_LLVM_DIR "$ENV{PTSYCL_LLVM_DIR}" CACHE PATH "LLVM/clang installation used by parascc")
 
@@ -54,35 +44,46 @@ message(STATUS "Torch C++11 ABI : ${PTSYCL_CXX11_ABI}")
 # ------------------------------------------------------------------------------
 # Flavor selection
 # ------------------------------------------------------------------------------
+# PTSYCL_DEVICE_FLAGS carries -parasdevice <target> so parascc's SYCL
+# codegen knows which underlying GPU to lower to.
 if(PTSYCL_DEVICE STREQUAL "cpu")
     set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_CPU)
     set(PTSYCL_DEVICE_FLAGS "")
-elseif(PTSYCL_DEVICE MATCHES "^cuda:sm_[0-9]+$")
-    set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_CUDA)
-    set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_DEVICE}")
-    if(NOT PTSYCL_CUDA_HOME)
-        message(FATAL_ERROR "PTSYCL_CUDA_HOME required for ${PTSYCL_DEVICE}")
-    endif()
-elseif(PTSYCL_DEVICE MATCHES "^hip:gfx[0-9a-zA-Z]+$")
-    set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_HIP)
-    set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_DEVICE}")
-    if(NOT PTSYCL_ROCM_HOME)
-        message(FATAL_ERROR "PTSYCL_ROCM_HOME required for ${PTSYCL_DEVICE}")
-    endif()
+elseif(PTSYCL_DEVICE MATCHES "^sycl:(cuda:sm_[0-9]+|hip:gfx[0-9a-zA-Z]+)$")
+    set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_SYCL)
+    set(PTSYCL_PARASDEVICE_TARGET "${CMAKE_MATCH_1}")
+    set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_PARASDEVICE_TARGET}")
 else()
-    message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu', 'cuda:sm_XX', or 'hip:gfxXXX', got '${PTSYCL_DEVICE}'")
+    message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu', 'sycl:cuda:sm_XX', or "
+                         "'sycl:hip:gfxXXX', got '${PTSYCL_DEVICE}'")
 endif()
 
 message(STATUS "ParaS home      : ${PARAS_HOME}")
 message(STATUS "Device flavor   : ${PTSYCL_DEVICE} (${PTSYCL_FLAVOR_DEFINE})")
 message(STATUS "Torch           : ${PTSYCL_TORCH_DIR}")
 message(STATUS "Python          : ${Python3_EXECUTABLE}")
-if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_CUDA")
-    message(STATUS "CUDA home       : ${PTSYCL_CUDA_HOME}")
-elseif(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")
-    message(STATUS "ROCm home       : ${PTSYCL_ROCM_HOME}")
-endif()
 
+# ------------------------------------------------------------------------------
+# CUDA runtime (required for PTSYCL_BACKEND_SYCL targeting cuda:sm_XX)
+# ------------------------------------------------------------------------------
+if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL" AND
+   PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+    set(PTSYCL_CUDA_HOME "$ENV{PTSYCL_CUDA_HOME}" CACHE PATH
+        "CUDA toolkit root (needed to locate libcudart for the cuda: SYCL flavor)")
+    if(NOT PTSYCL_CUDA_HOME)
+        message(FATAL_ERROR "PTSYCL_CUDA_HOME must be set when PTSYCL_DEVICE "
+                            "targets sycl:cuda:sm_XX -- parascc's SYCL layer "
+                            "for NVIDIA links against the real CUDA runtime "
+                            "underneath (see cuda_threadpool in "
+                            "kem_gpu/gpu_threadpool.hpp)")
+    endif()
+    find_library(PTSYCL_CUDART_LIBRARY NAMES cudart
+        HINTS "${PTSYCL_CUDA_HOME}/lib64" "${PTSYCL_CUDA_HOME}/lib")
+    if(NOT PTSYCL_CUDART_LIBRARY)
+        message(FATAL_ERROR "libcudart not found under PTSYCL_CUDA_HOME=${PTSYCL_CUDA_HOME}")
+    endif()
+    message(STATUS "CUDA runtime    : ${PTSYCL_CUDART_LIBRARY}")
+endif()
 # ------------------------------------------------------------------------------
 # Sources
 # ------------------------------------------------------------------------------
@@ -131,10 +132,6 @@ target_include_directories(torch_paras_C SYSTEM PRIVATE
     "${Python3_INCLUDE_DIRS}"
     "${PARAS_HOME}/include"
 )
-
-if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")
-    target_include_directories(torch_paras_C SYSTEM PRIVATE "${PTSYCL_ROCM_HOME}/include")
-endif()
 
 target_compile_options(torch_paras_C PRIVATE
     --gcc-toolchain=${PTSYCL_GCC_TOOLCHAIN}
@@ -209,23 +206,28 @@ if(PTSYCL_CLANG_RT_BUILTINS)
     target_link_libraries(torch_paras_C PRIVATE "${PTSYCL_CLANG_RT_BUILTINS}")
 endif()
 
+if(PTSYCL_CUDART_LIBRARY)
+    target_link_libraries(torch_paras_C PRIVATE "${PTSYCL_CUDART_LIBRARY}")
+endif()
+
+# Note: still no amdhip64 link line, and no PTSYCL_ROCM_HOME include/link
+# directories -- the hip: SYCL flavor's own runtime dependency (if it has
+# one analogous to cuda_threadpool's libcudart need) hasn't been verified
+# the way the cuda: flavor's has been here. Revisit if/when hip:gfxXXX is
+# actually exercised on hardware -- see the earlier compiler-support-
+# matrix finding that this parascc install's public backend list is only
+# {host, cuda}, with AMD/HIP-ROCm still in Laxmikant's internal fork.
 set(PTSYCL_RPATHS
     "${PTSYCL_TORCH_DIR}/lib"
     "${PARAS_HOME}/lib"
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )
-
-if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_CUDA")
-    target_link_directories(torch_paras_C PRIVATE "${PTSYCL_CUDA_HOME}/lib64")
-    target_link_libraries(torch_paras_C PRIVATE cudart)
-    list(APPEND PTSYCL_RPATHS "${PTSYCL_CUDA_HOME}/lib64")
-    target_link_options(torch_paras_C PRIVATE ${PTSYCL_DEVICE_FLAGS})
+if(PTSYCL_CUDART_LIBRARY)
+    get_filename_component(_ptsycl_cudart_dir "${PTSYCL_CUDART_LIBRARY}" DIRECTORY)
+    list(APPEND PTSYCL_RPATHS "${_ptsycl_cudart_dir}")
 endif()
 
-if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_HIP")
-    target_link_directories(torch_paras_C PRIVATE "${PTSYCL_ROCM_HOME}/lib")
-    target_link_libraries(torch_paras_C PRIVATE amdhip64)
-    list(APPEND PTSYCL_RPATHS "${PTSYCL_ROCM_HOME}/lib")
+if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
     target_link_options(torch_paras_C PRIVATE ${PTSYCL_DEVICE_FLAGS})
 endif()
 
@@ -237,5 +239,4 @@ set_target_properties(torch_paras_C PROPERTIES
 
 target_link_options(torch_paras_C PRIVATE
     --gcc-toolchain=${PTSYCL_GCC_TOOLCHAIN}
-    -Wl,--no-undefined
 )

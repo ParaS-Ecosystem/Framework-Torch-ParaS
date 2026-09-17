@@ -1,11 +1,3 @@
-#!/usr/bin/env bash
-# Builds the backend with the ParaS compiler.
-#
-#   scripts/build.sh [cpu|cuda|hip]
-#
-# Build trees: build/<flavor>. The produced extension is copied to
-# python/torch_paras/_C.so, so the most recently built flavor is the one
-# `import torch_paras` picks up.
 set -euo pipefail
 
 FLAVOR="${1:-cpu}"
@@ -16,10 +8,10 @@ source "${REPO_ROOT}/scripts/env.sh"
 
 case "${FLAVOR}" in
     cpu)  DEVICE="cpu" ;;
-    cuda) DEVICE="${PTSYCL_CUDA_ARCH:-cuda:sm_70}" ;;
+    cuda) DEVICE="sycl:${PTSYCL_CUDA_ARCH:-cuda:sm_70}" ;;
     hip)
         if [[ -n "${PTSYCL_HIP_ARCH:-}" ]]; then
-            DEVICE="${PTSYCL_HIP_ARCH}"
+            DEVICE="sycl:${PTSYCL_HIP_ARCH}"
         elif command -v rocm_agent_enumerator >/dev/null 2>&1; then
             # rocm_agent_enumerator lists one gfx target per visible agent,
             # including a "gfx000" line for the host CPU which we must skip.
@@ -34,7 +26,7 @@ case "${FLAVOR}" in
                 echo "       to pick which one, e.g. PTSYCL_HIP_ARCH=hip:${_ptsycl_gfx_agents[0]}" >&2
                 exit 1
             fi
-            DEVICE="hip:${_ptsycl_gfx_agents[0]}"
+            DEVICE="sycl:hip:${_ptsycl_gfx_agents[0]}"
             echo "[build.sh] auto-detected HIP arch: ${DEVICE}"
         else
             echo "error: rocm_agent_enumerator not found and PTSYCL_HIP_ARCH not set." >&2
@@ -57,14 +49,16 @@ if ! command -v "${CMAKE_BIN}" >/dev/null 2>&1; then
     exit 1
 fi
 
+# NOTE: PTSYCL_CUDA_HOME / PTSYCL_ROCM_HOME are intentionally NOT passed
+# to cmake anymore -- CMakeLists.txt no longer declares those cache vars
+# or links against the raw CUDA/HIP SDKs. Device access under
+# PTSYCL_BACKEND_SYCL goes exclusively through parascc/PARAS_HOME.
 "${CMAKE_BIN}" -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DCMAKE_CXX_COMPILER="${PARAS_HOME}/bin/parascc" \
     -DPTSYCL_DEVICE="${DEVICE}" \
     -DPTSYCL_GCC_TOOLCHAIN="${PTSYCL_GCC_TOOLCHAIN}" \
     -DPTSYCL_TORCH_DIR="${PTSYCL_TORCH_DIR}" \
-    -DPTSYCL_CUDA_HOME="${PTSYCL_CUDA_HOME}" \
-    -DPTSYCL_ROCM_HOME="${PTSYCL_ROCM_HOME}" \
     -DPARAS_HOME="${PARAS_HOME}" \
     -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
 

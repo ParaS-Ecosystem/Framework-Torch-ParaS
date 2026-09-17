@@ -1,22 +1,7 @@
-// -----------------------------------------------------------------------------
-// Copyright (c) 2026 Centre for Development of Advanced Computing (C-DAC)
-//
-// This file is part of Torch_ParaS, a component of the ParaS Ecosystem
-//
-// This library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License (LGPL)
-// version 3 as published by the Free Software Foundation.
-//
-// This library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-// See the GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with this library. If not, see <https://www.gnu.org/licenses/>.
-// -----------------------------------------------------------------------------
 
-
+#if defined(PTSYCL_BACKEND_SYCL)
+#include <sycl/sycl.hpp>
+#endif
 #include "compat/paras_compat.h"
 
 #include <ATen/Parallel.h>
@@ -29,16 +14,14 @@
 #include <stdexcept>
 #include <thread>
 
+
+
 namespace ptsycl {
 namespace compat {
 
 void fail(const std::string& what) {
     throw std::runtime_error("ptsycl: " + what);
 }
-
-// -----------------------------------------------------------------------------
-// Host CPU description
-// -----------------------------------------------------------------------------
 static std::string host_cpu_name() {
     std::ifstream f("/proc/cpuinfo");
     std::string line;
@@ -80,12 +63,47 @@ unsigned host_thread_count() {
     }();
     return n;
 }
+#if defined(PTSYCL_BACKEND_SYCL)
+namespace {
 
-// -----------------------------------------------------------------------------
-// Device enumeration
-// -----------------------------------------------------------------------------
+std::vector<sycl::device>& device_table() {
+    static std::vector<sycl::device> table;
+    return table;
+}
+} // namespace
+
+sycl::device& device_by_native_id(int native_id) {
+    auto& table = device_table();
+    if (native_id < 0 || static_cast<std::size_t>(native_id) >= table.size()) {
+        std::ostringstream os;
+        os << "device_by_native_id: invalid ordinal " << native_id;
+        fail(os.str());
+    }
+    return table[static_cast<std::size_t>(native_id)];
+}
+#endif
+
 std::vector<DeviceInfo> enumerate_devices() {
+
     std::vector<DeviceInfo> out;
+
+#if defined(PTSYCL_BACKEND_SYCL)
+    auto& table = device_table();
+    table.clear();
+    auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        DeviceInfo gpu;
+        gpu.name          = gpus[i].get_info<sycl::info::device::name>();
+        gpu.is_gpu        = true;
+        gpu.native_id     = static_cast<int>(i);
+        gpu.compute_units = static_cast<int>(gpus[i].get_info<sycl::info::device::max_compute_units>());
+        gpu.global_mem    = gpus[i].get_info<sycl::info::device::global_mem_size>();
+        gpu.fp64          = true;
+
+        table.push_back(gpus[i]);
+        out.push_back(std::move(gpu));
+    }
+#endif
 
     DeviceInfo cpu;
     cpu.name          = host_cpu_name();
@@ -96,47 +114,9 @@ std::vector<DeviceInfo> enumerate_devices() {
     cpu.fp64          = true;
     out.push_back(std::move(cpu));
 
-#if defined(PTSYCL_BACKEND_CUDA)
-    int count = 0;
-    cudaError_t err = cudaGetDeviceCount(&count);
-    if (err != cudaSuccess) count = 0; // no GPUs visible: CPU-only table
-    for (int i = 0; i < count; ++i) {
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, i) != cudaSuccess) continue;
-        DeviceInfo gpu;
-        gpu.name          = prop.name;
-        gpu.is_gpu        = true;
-        gpu.native_id     = i;
-        gpu.compute_units = prop.multiProcessorCount;
-        gpu.global_mem    = prop.totalGlobalMem;
-        gpu.fp64          = true;
-        out.push_back(std::move(gpu));
-    }
-#endif
-
-#if defined(PTSYCL_BACKEND_HIP)
-    int hip_count = 0;
-    hipError_t herr = hipGetDeviceCount(&hip_count);
-    if (herr != hipSuccess) hip_count = 0; // no GPUs visible: CPU-only table
-    for (int i = 0; i < hip_count; ++i) {
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, i) != hipSuccess) continue;
-        DeviceInfo gpu;
-        gpu.name          = prop.name;
-        gpu.is_gpu        = true;
-        gpu.native_id     = i;
-        gpu.compute_units = prop.multiProcessorCount;
-        gpu.global_mem    = prop.totalGlobalMem;
-        gpu.fp64          = true;
-        out.push_back(std::move(gpu));
-    }
-#endif
     return out;
 }
 
-// -----------------------------------------------------------------------------
-// Host execution engine
-// -----------------------------------------------------------------------------
 namespace {
 
 extern "C" void GOMP_parallel(void (*fn)(void*), void* data,
@@ -193,59 +173,21 @@ void host_parallel_chunks(std::size_t n, host_chunk_fn body, void* ctx) {
     GOMP_parallel(run_host_parallel_job, &job,
                   static_cast<unsigned>(chunks), 0);
 }
-
-// -----------------------------------------------------------------------------
-// CUDA helpers
-// -----------------------------------------------------------------------------
-#if defined(PTSYCL_BACKEND_CUDA)
-namespace detail {
-void throw_on_cuda_error(int err, const char* what) {
-    if (err != cudaSuccess) {
-        std::ostringstream os;
-        os << what << ": " << cudaGetErrorString(static_cast<cudaError_t>(err));
-        fail(os.str());
-    }
-}
-} // namespace detail
-#endif
-
-// -----------------------------------------------------------------------------
-// HIP/ROCm helpers
-// -----------------------------------------------------------------------------
-#if defined(PTSYCL_BACKEND_HIP)
-namespace detail {
-void throw_on_hip_error(int err, const char* what) {
-    if (err != hipSuccess) {
-        std::ostringstream os;
-        os << what << ": " << hipGetErrorString(static_cast<hipError_t>(err));
-        fail(os.str());
-    }
-}
-} // namespace detail
-#endif
-
-// -----------------------------------------------------------------------------
-// Queue
-// -----------------------------------------------------------------------------
 void Queue::init(const DeviceInfo& dev) {
     if (initialized_) fail("Queue::init called twice");
     is_gpu_    = dev.is_gpu;
     native_id_ = dev.native_id;
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        detail::throw_on_cuda_error(cudaSetDevice(native_id_), "cudaSetDevice(init)");
-        cudaStream_t s = nullptr;
-        detail::throw_on_cuda_error(
-            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "cudaStreamCreate");
-        stream_ = s;
-    }
-#elif defined(PTSYCL_BACKEND_HIP)
-    if (is_gpu_) {
-        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(init)");
-        hipStream_t s = nullptr;
-        detail::throw_on_hip_error(
-            hipStreamCreateWithFlags(&s, hipStreamNonBlocking), "hipStreamCreate");
-        stream_ = s;
+        sycl::device& d = device_by_native_id(native_id_);
+        try {
+            queue_ = new sycl::queue(d, sycl::property::queue::in_order{});
+        } catch (const sycl::exception& e) {
+            std::ostringstream os;
+            os << "sycl::queue construction failed on device " << native_id_
+               << ": " << e.what();
+            fail(os.str());
+        }
     }
 #else
     if (is_gpu_) fail("GPU device requested in a CPU-only build");
@@ -254,44 +196,24 @@ void Queue::init(const DeviceInfo& dev) {
 }
 
 Queue::~Queue() {
-#if defined(PTSYCL_BACKEND_CUDA)
-    if (stream_ != nullptr) {
-        cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
-        stream_ = nullptr;
-    }
-#elif defined(PTSYCL_BACKEND_HIP)
-    if (stream_ != nullptr) {
-        hipStreamDestroy(static_cast<hipStream_t>(stream_));
-        stream_ = nullptr;
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (queue_ != nullptr) {
+        delete queue_;
+        queue_ = nullptr;
     }
 #endif
 }
 
 void* Queue::alloc(std::size_t nbytes) {
     if (nbytes == 0) nbytes = 1;
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        detail::throw_on_cuda_error(cudaSetDevice(native_id_), "cudaSetDevice(alloc)");
-        void* p = nullptr;
-        cudaError_t err = cudaMallocManaged(&p, nbytes);
-        if (err != cudaSuccess) {
+        void* p = static_cast<void*>(
+            sycl::malloc_shared<std::byte>(nbytes, *queue_));
+        if (p == nullptr) {
             std::ostringstream os;
-            os << "cudaMallocManaged(" << nbytes << " bytes) on cuda:" << native_id_
-               << ": " << cudaGetErrorString(err);
-            fail(os.str());
-        }
-        return p;
-    }
-#endif
-#if defined(PTSYCL_BACKEND_HIP)
-    if (is_gpu_) {
-        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(alloc)");
-        void* p = nullptr;
-        hipError_t err = hipMallocManaged(&p, nbytes);
-        if (err != hipSuccess) {
-            std::ostringstream os;
-            os << "hipMallocManaged(" << nbytes << " bytes) on hip:" << native_id_
-               << ": " << hipGetErrorString(err);
+            os << "sycl::malloc_shared(" << nbytes << " bytes) on device "
+               << native_id_ << " failed";
             fail(os.str());
         }
         return p;
@@ -308,15 +230,9 @@ void* Queue::alloc(std::size_t nbytes) {
 
 void Queue::dealloc(void* ptr) {
     if (ptr == nullptr) return;
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        cudaFree(ptr); 
-        return;
-    }
-#endif
-#if defined(PTSYCL_BACKEND_HIP)
-    if (is_gpu_) {
-        hipFree(ptr);
+        sycl::free(ptr, *queue_);
         return;
     }
 #endif
@@ -325,47 +241,22 @@ void Queue::dealloc(void* ptr) {
 
 void Queue::copy(void* dst, const void* src, std::size_t nbytes, bool blocking) {
     if (nbytes == 0) return;
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        detail::throw_on_cuda_error(cudaSetDevice(native_id_), "cudaSetDevice(copy)");
-        // cudaMemcpyDefault resolves host/managed/device pointers via UVA.
-        detail::throw_on_cuda_error(
-            cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDefault, stream()),
-            "cudaMemcpyAsync");
-        if (blocking) synchronize();
-        return;
-    }
-#endif
-#if defined(PTSYCL_BACKEND_HIP)
-    if (is_gpu_) {
-        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(copy)");
-        // hipMemcpyDefault resolves host/managed/device pointers via unified addressing.
-        detail::throw_on_hip_error(
-            hipMemcpyAsync(dst, src, nbytes, hipMemcpyDefault, stream()),
-            "hipMemcpyAsync");
+        queue_->memcpy(dst, src, nbytes);
         if (blocking) synchronize();
         return;
     }
 #endif
     std::memcpy(dst, src, nbytes);
-    (void)blocking; 
+    (void)blocking;
 }
 
 void Queue::memset(void* ptr, int value, std::size_t nbytes) {
     if (nbytes == 0) return;
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        detail::throw_on_cuda_error(cudaSetDevice(native_id_), "cudaSetDevice(memset)");
-        detail::throw_on_cuda_error(
-            cudaMemsetAsync(ptr, value, nbytes, stream()), "cudaMemsetAsync");
-        return;
-    }
-#endif
-#if defined(PTSYCL_BACKEND_HIP)
-    if (is_gpu_) {
-        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(memset)");
-        detail::throw_on_hip_error(
-            hipMemsetAsync(ptr, value, nbytes, stream()), "hipMemsetAsync");
+        queue_->memset(ptr, value, nbytes);
         return;
     }
 #endif
@@ -373,28 +264,16 @@ void Queue::memset(void* ptr, int value, std::size_t nbytes) {
 }
 
 void Queue::synchronize() {
-#if defined(PTSYCL_BACKEND_CUDA)
+#if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        detail::throw_on_cuda_error(cudaSetDevice(native_id_), "cudaSetDevice(sync)");
-        detail::throw_on_cuda_error(
-            cudaStreamSynchronize(stream()), "cudaStreamSynchronize");
+        queue_->wait();
     }
 #endif
-#if defined(PTSYCL_BACKEND_HIP)
-    if (is_gpu_) {
-        detail::throw_on_hip_error(hipSetDevice(native_id_), "hipSetDevice(sync)");
-        detail::throw_on_hip_error(
-            hipStreamSynchronize(stream()), "hipStreamSynchronize");
-    }
-#endif
-    
 }
 
 const char* backend_name() {
-#if defined(PTSYCL_BACKEND_CUDA)
-    return "paras-cuda";
-#elif defined(PTSYCL_BACKEND_HIP)
-    return "paras-hip";
+#if defined(PTSYCL_BACKEND_SYCL)
+    return "paras-sycl";
 #else
     return "paras-cpu";
 #endif
@@ -402,3 +281,4 @@ const char* backend_name() {
 
 } // namespace compat
 } // namespace ptsycl
+
