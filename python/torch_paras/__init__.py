@@ -26,14 +26,13 @@ Importing this package registers the ``paras`` device with PyTorch:
     import torch
     import torch_paras
 
-    x = torch.randn(64, 64, device="paras")        # device 0 = host CPU engine
-    y = torch.randn(64, 64, device="paras:1")      # device 1.. = CUDA/HIP GPUs
+    x = torch.randn(64, 64, device="paras")        # default paras device (paras:0, primary GPU or CPU)
+    y = torch.randn(64, 64, device="paras:0")      # device 0..N-1 = GPUs (in GPU builds)
     z = (x @ x).relu().cpu()
 
-Device 0 always exists and executes on the host through the ParaS CPU
-engine. In CUDA- or HIP-enabled builds, devices 1..N map to the visible
-NVIDIA or AMD GPUs, respectively (a single build is one flavor or the
-other, never both).
+In GPU-enabled builds (CUDA or HIP), devices 0..N-1 map to visible GPUs,
+and device N maps to the host CPU engine. In CPU-only builds, device 0 maps
+to the host CPU.
 """
 
 import types

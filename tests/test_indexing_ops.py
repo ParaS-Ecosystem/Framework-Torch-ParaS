@@ -51,6 +51,17 @@ def test_index_put_accumulate(device):
                                            accumulate=True))
 
 
+def test_index_put_accumulate_dtypes(device):
+    for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
+        base = torch.zeros(10, dtype=dtype)
+        idx = torch.tensor([1, 2, 1, 3, 1, 2, 1, 3, 1], dtype=torch.long)
+        vals = torch.ones(len(idx), dtype=dtype)
+        check_op(f"index_put_accumulate_{dtype}",
+                 lambda: base.clone().index_put_((idx,), vals, accumulate=True),
+                 lambda: base.clone().to(device).index_put_((idx.to(device),), vals.to(device),
+                                                               accumulate=True))
+
+
 def test_index_tensor(device):
     a, _, da, _ = _pair(device)
     idx = torch.randint(0, 4, (6,))

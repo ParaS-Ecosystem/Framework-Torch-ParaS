@@ -8,15 +8,14 @@ without code changes:
 import torch
 import torch_paras
 
-x = torch.randn(64, 64, device="paras")     # device 0 = host CPU engine
-y = torch.randn(64, 64, device="paras:1")   # devices 1.. = NVIDIA or AMD GPUs
+x = torch.randn(64, 64, device="paras")     # default paras device (paras:0)
+y = torch.randn(64, 64, device="paras:0")   # devices 0..N-1 = NVIDIA or AMD GPUs
 z = (x @ x).relu().cpu()
 ```
 
-Device 0 always exists and runs on the host CPU through the ParaS
-threadpool engine. In CUDA builds, devices 1..N map to the visible NVIDIA
-GPUs; in HIP builds, to the visible AMD GPUs (each build targets one
-vendor). Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
+In GPU-enabled builds (CUDA or HIP), devices 0..N-1 map to visible GPUs,
+and device N maps to the host CPU engine. In CPU-only builds, device 0 maps
+to the host CPU. Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
 
 ## What is implemented
 

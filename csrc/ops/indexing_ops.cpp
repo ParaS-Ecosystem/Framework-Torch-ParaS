@@ -490,6 +490,7 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
 
 #define PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES(_)                                \
     _(int32_t, c10::kInt)                                                    \
+    _(int64_t, c10::kLong)                                                   \
     _(float,   c10::kFloat)                                                  \
     _(double,  c10::kDouble)                                                 \
     _(bool,    c10::kBool)

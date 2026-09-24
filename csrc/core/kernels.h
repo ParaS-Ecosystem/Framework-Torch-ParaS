@@ -69,7 +69,7 @@ inline StridedSpec make_spec(const at::Tensor& t) {
 
 template <typename T>
 PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
-#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_HIP)) && (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__))
+#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_HIP) || defined(PTSYCL_BACKEND_SYCL)) && (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__))
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> ||
                   std::is_same_v<T, int> || std::is_same_v<T, unsigned int>) {
         atomicAdd(address, val);
@@ -83,6 +83,12 @@ PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
 #else
     if constexpr (std::is_same_v<T, bool>) {
         if (val) *address = true;
+    } else if constexpr (std::is_integral_v<T>) {
+        __atomic_fetch_add(address, val, __ATOMIC_RELAXED);
+    } else if constexpr (std::is_floating_point_v<T>) {
+        T old_val = __atomic_load_n(address, __ATOMIC_RELAXED);
+        while (!__atomic_compare_exchange_n(address, &old_val, old_val + val,
+                                             true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
     } else {
         *address += val;
     }
