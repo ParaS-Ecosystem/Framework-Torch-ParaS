@@ -78,19 +78,22 @@ PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
     } else if constexpr (std::is_same_v<T, bool>) {
         if (val) *address = true;
     } else {
-        *address += val;
+        static_assert(!sizeof(T*), "atomic_add: unsupported dtype on device");
     }
 #else
     if constexpr (std::is_same_v<T, bool>) {
-        if (val) *address = true;
+        if (val) __atomic_store_n(address, true, __ATOMIC_RELAXED);
     } else if constexpr (std::is_integral_v<T>) {
         __atomic_fetch_add(address, val, __ATOMIC_RELAXED);
     } else if constexpr (std::is_floating_point_v<T>) {
-        T old_val = __atomic_load_n(address, __ATOMIC_RELAXED);
-        while (!__atomic_compare_exchange_n(address, &old_val, old_val + val,
-                                             true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        T expected;
+        __atomic_load(address, &expected, __ATOMIC_RELAXED);
+        T desired = expected + val;
+        while (!__atomic_compare_exchange(address, &expected, &desired, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            desired = expected + val;
     } else {
-        *address += val;
+        static_assert(!sizeof(T*), "atomic_add: unsupported dtype on host");
     }
 #endif
 }
