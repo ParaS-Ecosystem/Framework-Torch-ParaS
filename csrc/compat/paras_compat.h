@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -91,13 +92,40 @@ class ParasKernelKey;
 class Queue {
 public:
     Queue() = default;
-    ~Queue();
+    ~Queue() {
+#if defined(PTSYCL_BACKEND_SYCL)
+        if (queue_ != nullptr) {
+            delete queue_;
+            queue_ = nullptr;
+        }
+#endif
+    }
 
     Queue(const Queue&)            = delete;
     Queue& operator=(const Queue&) = delete;
 
     // Binds this queue to a device from enumerate_devices().
-    void init(const DeviceInfo& dev);
+    void init(const DeviceInfo& dev) {
+        if (initialized_) fail("Queue::init called twice");
+        is_gpu_    = dev.is_gpu;
+        native_id_ = dev.native_id;
+#if defined(PTSYCL_BACKEND_SYCL)
+        if (is_gpu_) {
+            sycl::device& d = device_by_native_id(native_id_);
+            try {
+                queue_ = new sycl::queue(d, sycl::property::queue::in_order{});
+            } catch (const sycl::exception& e) {
+                std::ostringstream os;
+                os << "sycl::queue construction failed on device " << native_id_
+                   << ": " << e.what();
+                fail(os.str());
+            }
+        }
+#else
+        if (is_gpu_) fail("GPU device requested in a CPU-only build");
+#endif
+        initialized_ = true;
+    }
 
     bool initialized() const { return initialized_; }
     bool is_gpu()      const { return is_gpu_; }

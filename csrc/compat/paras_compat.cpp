@@ -190,37 +190,6 @@ void host_parallel_chunks(std::size_t n, host_chunk_fn body, void* ctx) {
     GOMP_parallel(run_host_parallel_job, &job,
                   static_cast<unsigned>(chunks), 0);
 }
-void Queue::init(const DeviceInfo& dev) {
-    if (initialized_) fail("Queue::init called twice");
-    is_gpu_    = dev.is_gpu;
-    native_id_ = dev.native_id;
-#if defined(PTSYCL_BACKEND_SYCL)
-    if (is_gpu_) {
-        sycl::device& d = device_by_native_id(native_id_);
-        try {
-            queue_ = new sycl::queue(d, sycl::property::queue::in_order{});
-        } catch (const sycl::exception& e) {
-            std::ostringstream os;
-            os << "sycl::queue construction failed on device " << native_id_
-               << ": " << e.what();
-            fail(os.str());
-        }
-    }
-#else
-    if (is_gpu_) fail("GPU device requested in a CPU-only build");
-#endif
-    initialized_ = true;
-}
-
-Queue::~Queue() {
-#if defined(PTSYCL_BACKEND_SYCL)
-    if (queue_ != nullptr) {
-        delete queue_;
-        queue_ = nullptr;
-    }
-#endif
-}
-
 void* Queue::alloc(std::size_t nbytes) {
     if (nbytes == 0) nbytes = 1;
 #if defined(PTSYCL_BACKEND_SYCL)
