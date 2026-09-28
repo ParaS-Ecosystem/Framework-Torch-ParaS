@@ -103,10 +103,10 @@ or check `build/cpu` vs `build/cuda` to see which was built most recently.
 
 ### Wrong number of GPU devices enumerated, or wrong device mapping
 
-- Devices `paras:1..N` map to whatever NVIDIA GPUs are visible in the
-  process's environment, the same way CUDA enumerates them — check
-  `CUDA_VISIBLE_DEVICES` if the mapping looks different from what you
-  expect.
+- With `N` visible GPUs, `paras:0..N-1` map to GPUs in the order returned
+  by the ParaS/SYCL runtime, and `paras:N` is the host CPU. Check
+  `CUDA_VISIBLE_DEVICES` if the GPU ordering or count differs from what
+  you expect. If no GPU is visible, the CPU is `paras:0`.
 
 ## Still Stuck?
 

@@ -8,10 +8,14 @@ The suite lives in `tests/` and needs nothing beyond the built package
 ```bash
 source scripts/env.sh
 
-python tests/run_all.py                    # paras:0, the host CPU engine
-python tests/run_all.py --device paras:1   # first GPU (cuda or hip builds)
+python tests/run_all.py                    # paras:0 (first GPU if visible, otherwise CPU)
+python tests/run_all.py --device paras:0   # first visible GPU in a GPU build
 python tests/run_all.py --all-devices      # every enumerated device
 ```
+
+In a GPU-enabled build with `N` visible GPUs, `paras:0` through
+`paras:N-1` select GPUs and `paras:N` selects the host CPU. If no GPU is
+visible (including a CPU-only build), the host CPU is `paras:0`.
 
 The exit code is the number of failed tests, so it slots into CI as is.
 `TORCH_PARAS_DEVICE` selects the device when you run a module directly.
@@ -34,4 +38,3 @@ Each test function takes the device string as its one argument, so adding
 a test means adding a `test_*` function to the right module. The harness
 in `common.py` seeds torch before each test and prints a per-test
 PASS/FAIL line with a short traceback on failure.
-
