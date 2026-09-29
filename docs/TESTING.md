@@ -29,6 +29,20 @@ The exit code is the number of failed tests, so it slots into CI as is.
   statistical properties, not exact values.
 - `test_vision_ops.py` — adaptive pooling, linear, and nearest-neighbor
   upsampling, ensuring the large vision translation unit is linked.
+- `test_indexing_ops.py` — gather, index_select, index_copy_, index_put_
+  (with and without accumulate), advanced indexing, where, triu/tril.
+- `test_fused_ops.py` — `torch.ops.paras` rms_norm, swiglu and
+  rotate_half, forward and backward.
+- `test_attention_norm_ops.py` — scaled dot-product attention (scale,
+  causal, bool/additive masks, GQA), `aten::rms_norm`,
+  `torch_paras::swiglu`, and copy edge cases.
+- `test_matmul_sort_creation_ops.py` — mm/bmm/matmul shape variants,
+  argsort, and creation ops (zeros/ones/full, `*_like`, arange).
+- `test_param2_17b.py` — model-level check for the Param2 profiling
+  workload.
+
+See `docs/OPERATOR_COVERAGE.md` for which native kernels still lack a
+parity test.
 
 Each test function takes the device string as its one argument, so adding
 a test means adding a `test_*` function to the right module. The harness

@@ -22,10 +22,20 @@ vendor). Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
 
 - Tensor lifecycle: allocation, strided layouts, views, copies in every
   direction (host/device, cross-device, dtype conversion), resize.
-- Around 130 aten kernels: elementwise math, activations, comparisons,
-  reductions, matrix multiply (mm/bmm/addmm), convolution, pooling,
-  upsampling, batch/layer norm, losses, RNG (Philox counter-based),
-  dropout, multi-head attention.
+- 215 native aten kernel registrations covering 170 distinct aten
+  operators: tensor lifecycle and views, creation ops, elementwise math,
+  activations (forward and backward), comparisons, bitwise ops,
+  reductions, softmax/log-softmax, cumsum, sort/topk/argsort, indexing
+  (gather, index_select/put/copy, where, triu/tril), scatter and
+  masked_fill, embedding, matrix multiply (mm/bmm/addmm/linear),
+  convolution, pooling, upsampling, batch/layer/RMS norm, losses, RNG
+  (Philox counter-based), dropout, multinomial, scaled dot-product
+  attention and multi-head attention.
+- 7 custom fused ops outside aten: `torch.ops.paras.{rms_norm,
+  swiglu, rotate_half}` with their backward kernels, and
+  `torch.ops.torch_paras.swiglu`.
+- See docs/OPERATOR_COVERAGE.md for the per-category breakdown and test
+  status.
 - Anything not implemented natively falls back to CPU through the boxed
   fallback, so models keep working while coverage grows.
 - A binned memory pool per device on top of CUDA or HIP unified memory
