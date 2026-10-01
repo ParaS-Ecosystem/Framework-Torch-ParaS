@@ -103,9 +103,13 @@ Notes:
 ## 6. Check it works
 
 ```bash
-python tests/run_all.py                 # device paras:0 (CPU engine)
+python tests/run_all.py                 # paras:0 (first GPU if visible; otherwise CPU)
 python tests/run_all.py --all-devices   # every device, GPUs included
 ```
+
+In a GPU-enabled build with `N` visible GPUs, `paras:0` through
+`paras:N-1` are GPUs and `paras:N` is the host CPU. With no visible GPUs,
+the host CPU is `paras:0`.
 
 You should see `RESULTS: N passed, 0 failed`. If `import torch_paras`
 fails with a GLIBCXX error, your LD_LIBRARY_PATH is missing the GCC 13.4

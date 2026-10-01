@@ -16,7 +16,6 @@
 // along with this library. If not, see <https://www.gnu.org/licenses/>.
 // -----------------------------------------------------------------------------
 
-
 #include "core/kernels.h"
 
 namespace ptsycl {
@@ -437,6 +436,20 @@ Tensor index_tensor(const Tensor& self,
     return out;
 }
 
+// -----------------------------------------------------------------------------
+// index_put_
+// -----------------------------------------------------------------------------
+// Split into two dispatches rather than one: the plain-store path
+// (accumulate=false) never touches atomic_add and keeps the full
+// AT_DISPATCH_ALL_TYPES_AND3 range. The accumulate=true path goes
+// through atomic_add(), and this parascc install's atomic_ref::fetch_add
+// is a direct passthrough to a native CUDA atomicAdd() overload with NO
+// generic/CAS fallback beneath it (kernels.h's atomic_add<T> static_asserts
+// on this). Only {int32_t, float, double, bool} are safe -- bool never
+// reaches a hardware atomic, it's a plain store via atomic_add's
+// if-constexpr branch. int8_t/int16_t/int64_t/Half/BFloat16 accumulate is
+// NOT dispatched here; see the open item re: atomic_ref::compare_exchange
+// before adding those.
 Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
                    const Tensor& values, bool accumulate) {
     PTSYCL_TRACE_OP("index_put_");
@@ -450,6 +463,8 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
         return self;
     }
 
+    at::assert_no_internal_overlap(self);
+
     Tensor v = values.expand(prep.out_sizes).contiguous();
     const int64_t n = v.numel();
     if (n == 0) return self;
@@ -457,22 +472,53 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
     auto& q = queue_for(self);
     const auto info = prep.info;
 
-    AT_DISPATCH_ALL_TYPES_AND3(
-        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
-        "ptsycl_index_put", [&] {
-            scalar_t*       pself = data_ptr<scalar_t>(self);
-            const scalar_t* pval  = data_ptr<scalar_t>(v);
+    if (!accumulate) {
+        AT_DISPATCH_ALL_TYPES_AND3(
+            c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
+            "ptsycl_index_put", [&] {
+                scalar_t*       pself = data_ptr<scalar_t>(self);
+                const scalar_t* pval  = data_ptr<scalar_t>(v);
 
-            launch_flat(q, n, [=](std::size_t flat_) {
-                const int64_t flat = static_cast<int64_t>(flat_);
-                const int64_t self_off = info.compute_self_offset(flat);
-                if (accumulate) {
-                    atomic_add(&pself[self_off], pval[flat]);
-                } else {
+                launch_flat(q, n, [=](std::size_t flat_) {
+                    const int64_t flat = static_cast<int64_t>(flat_);
+                    const int64_t self_off = info.compute_self_offset(flat);
                     pself[self_off] = pval[flat];
-                }
+                });
             });
-        });
+        return self;
+    }
+
+#define PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES(_)                                \
+    _(int32_t, c10::kInt)                                                    \
+    _(int64_t, c10::kLong)                                                   \
+    _(float,   c10::kFloat)                                                  \
+    _(double,  c10::kDouble)                                                 \
+    _(bool,    c10::kBool)
+
+    switch (self.scalar_type()) {
+#define CASE(T, ST)                                                          \
+    case ST: {                                                              \
+        T*       pself = data_ptr<T>(self);                                 \
+        const T* pval  = data_ptr<T>(v);                                    \
+        launch_flat(q, n, [=](std::size_t flat_) {                          \
+            const int64_t flat = static_cast<int64_t>(flat_);               \
+            const int64_t self_off = info.compute_self_offset(flat);        \
+            atomic_add(&pself[self_off], pval[flat]);                       \
+        });                                                                 \
+        break;                                                              \
+    }
+        PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES(CASE)
+#undef CASE
+        default:
+            TORCH_CHECK(false, "paras index_put_ (accumulate=True): dtype ",
+                        self.scalar_type(), " is not yet supported -- this "
+                        "parascc install's atomic_ref::fetch_add only has "
+                        "native hardware support for int32, float, double, "
+                        "and bool. int8/int16/int64/Half/BFloat16 "
+                        "accumulating index_put_ is pending a verified "
+                        "compare-exchange-based atomic implementation.");
+    }
+#undef PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES
     return self;
 }
 
