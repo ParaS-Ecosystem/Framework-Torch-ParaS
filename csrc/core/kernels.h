@@ -24,9 +24,32 @@
 
 #include <c10/util/Exception.h>
 
+#if defined(PTSYCL_BACKEND_SYCL)
+#include <sycl/sycl.hpp>
+#endif
+
 #include "core/common.h"
 
 namespace ptsycl {
+
+namespace compat {
+template <typename F>
+class ParasKernelKey;
+
+template <typename F>
+inline void parallel_for(Queue& queue, std::size_t n, F f) {
+    if (n == 0) return;
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (queue.is_gpu()) {
+        queue.sycl_queue().template parallel_for<ParasKernelKey<F>>(
+            sycl::range<1>(n),
+            [f](sycl::id<1> i) { f(static_cast<std::size_t>(i[0])); });
+        return;
+    }
+#endif
+    host_parallel_for(n, f);
+}
+} // namespace compat
 
 constexpr int kMaxDims = 8;
 
@@ -101,7 +124,7 @@ PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
 template <typename F>
 inline void launch_flat(compat::Queue& q, int64_t n, F fn) {
     if (n <= 0) return;
-    q.parallel_for(static_cast<std::size_t>(n), fn);
+    compat::parallel_for(q, static_cast<std::size_t>(n), fn);
 }
 
 // Strided store: out[spec(i)] = fn(i).
@@ -109,7 +132,7 @@ template <typename T, typename F>
 inline void launch_strided_store(compat::Queue& q, int64_t n, T* out,
                                  StridedSpec spec, F fn) {
     if (n <= 0) return;
-    q.parallel_for(static_cast<std::size_t>(n), [=](std::size_t i) {
+    compat::parallel_for(q, static_cast<std::size_t>(n), [=](std::size_t i) {
         out[spec.index(static_cast<int64_t>(i))] = fn(static_cast<int64_t>(i));
     });
 }
@@ -126,7 +149,7 @@ inline acc_t reduce_full(compat::Queue& q, int64_t n, acc_t init, Map map,
     acc_t* partials = static_cast<acc_t*>(
         q.alloc(static_cast<std::size_t>(stripes) * sizeof(acc_t)));
 
-    q.parallel_for(static_cast<std::size_t>(stripes), [=](std::size_t s) {
+    compat::parallel_for(q, static_cast<std::size_t>(stripes), [=](std::size_t s) {
         acc_t acc = init;
         for (int64_t i = static_cast<int64_t>(s); i < n; i += stripes)
             acc = combine(acc, map(i));
@@ -144,7 +167,7 @@ template <typename acc_t, typename Map, typename Combine, typename Store>
 inline void reduce_outer(compat::Queue& q, int64_t out_n, int64_t red_n,
                          acc_t init, Map map, Combine combine, Store store) {
     if (out_n <= 0) return;
-    q.parallel_for(static_cast<std::size_t>(out_n), [=](std::size_t o) {
+    compat::parallel_for(q, static_cast<std::size_t>(out_n), [=](std::size_t o) {
         acc_t acc = init;
         for (int64_t j = 0; j < red_n; ++j)
             acc = combine(acc, map(static_cast<int64_t>(o), j));

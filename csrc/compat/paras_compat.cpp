@@ -36,6 +36,16 @@
 namespace ptsycl {
 namespace compat {
 
+struct Queue::Impl {
+#if defined(PTSYCL_BACKEND_SYCL)
+    ~Impl() { delete queue; }
+    sycl::queue* queue = nullptr;
+#endif
+};
+
+Queue::Queue() = default;
+Queue::~Queue() = default;
+
 void fail(const std::string& what) {
     throw std::runtime_error("ptsycl: " + what);
 }
@@ -97,6 +107,38 @@ sycl::device& device_by_native_id(int native_id) {
         fail(os.str());
     }
     return table[static_cast<std::size_t>(native_id)];
+}
+#endif
+
+void Queue::init(const DeviceInfo& dev) {
+    if (initialized_) fail("Queue::init called twice");
+    is_gpu_ = dev.is_gpu;
+    native_id_ = dev.native_id;
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (is_gpu_) {
+        sycl::device& device = device_by_native_id(native_id_);
+        try {
+            auto impl = std::make_unique<Impl>();
+            impl->queue = new sycl::queue(
+                device, sycl::property::queue::in_order{});
+            impl_ = std::move(impl);
+        } catch (const sycl::exception& e) {
+            std::ostringstream os;
+            os << "sycl::queue construction failed on device " << native_id_
+               << ": " << e.what();
+            fail(os.str());
+        }
+    }
+#else
+    if (is_gpu_) fail("GPU device requested in a CPU-only build");
+#endif
+    initialized_ = true;
+}
+
+#if defined(PTSYCL_BACKEND_SYCL)
+sycl::queue& Queue::sycl_queue() const {
+    if (!impl_ || !impl_->queue) fail("SYCL queue is not initialized");
+    return *impl_->queue;
 }
 #endif
 
@@ -195,7 +237,7 @@ void* Queue::alloc(std::size_t nbytes) {
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
         void* p = static_cast<void*>(
-            sycl::malloc_shared<std::byte>(nbytes, *queue_));
+            sycl::malloc_shared<std::byte>(nbytes, sycl_queue()));
         if (p == nullptr) {
             std::ostringstream os;
             os << "sycl::malloc_shared(" << nbytes << " bytes) on device "
@@ -218,7 +260,7 @@ void Queue::dealloc(void* ptr) {
     if (ptr == nullptr) return;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        sycl::free(ptr, *queue_);
+        sycl::free(ptr, sycl_queue());
         return;
     }
 #endif
@@ -229,7 +271,7 @@ void Queue::copy(void* dst, const void* src, std::size_t nbytes, bool blocking) 
     if (nbytes == 0) return;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        queue_->memcpy(dst, src, nbytes);
+        sycl_queue().memcpy(dst, src, nbytes);
         if (blocking) synchronize();
         return;
     }
@@ -242,7 +284,7 @@ void Queue::memset(void* ptr, int value, std::size_t nbytes) {
     if (nbytes == 0) return;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        queue_->memset(ptr, value, nbytes);
+        sycl_queue().memset(ptr, value, nbytes);
         return;
     }
 #endif
@@ -252,7 +294,7 @@ void Queue::memset(void* ptr, int value, std::size_t nbytes) {
 void Queue::synchronize() {
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
-        queue_->wait();
+        sycl_queue().wait();
     }
 #endif
 }
@@ -267,4 +309,3 @@ const char* backend_name() {
 
 } // namespace compat
 } // namespace ptsycl
-

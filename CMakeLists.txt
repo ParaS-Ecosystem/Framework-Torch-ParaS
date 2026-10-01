@@ -87,12 +87,18 @@ endif()
 # ------------------------------------------------------------------------------
 # Sources
 # ------------------------------------------------------------------------------
-add_library(torch_paras_C SHARED
+option(PTSYCL_FAST_BUILD "Build only tensor operators for queue diagnostics" OFF)
+option(PTSYCL_FLATTEN_HEADERS "Expose framework headers to ParaS source rewriting" ON)
+set(PTSYCL_SOURCES
     csrc/compat/paras_compat.cpp
     csrc/core/context.cpp
     csrc/core/allocator.cpp
     csrc/core/registration.cpp
     csrc/ops/tensor_ops.cpp
+    csrc/python/module.cpp
+)
+if(NOT PTSYCL_FAST_BUILD)
+    list(APPEND PTSYCL_SOURCES
     csrc/ops/pointwise_ops.cpp
     csrc/ops/scatter_ops.cpp
     csrc/ops/indexing_ops.cpp
@@ -105,8 +111,29 @@ add_library(torch_paras_C SHARED
     csrc/ops/rms_swiglu_ops.cpp
     csrc/ops/sort_ops.cpp
     csrc/ops/creation_ops.cpp
-    csrc/python/module.cpp
-)
+    )
+else()
+    message(STATUS "Fast build: only tensor_ops.cpp; other operator registrations are omitted")
+endif()
+
+if(PTSYCL_FLATTEN_HEADERS AND PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
+    file(GLOB_RECURSE PTSYCL_FRAMEWORK_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.h")
+    set(PTSYCL_GENERATED_SOURCES "")
+    foreach(source IN LISTS PTSYCL_SOURCES)
+        set(generated "${CMAKE_BINARY_DIR}/paras_sources/${source}")
+        add_custom_command(OUTPUT "${generated}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/flatten_framework_headers.py"
+                --root "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
+                --source "${CMAKE_CURRENT_SOURCE_DIR}/${source}" --output "${generated}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" ${PTSYCL_FRAMEWORK_HEADERS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/flatten_framework_headers.py"
+            VERBATIM)
+        list(APPEND PTSYCL_GENERATED_SOURCES "${generated}")
+    endforeach()
+    set(PTSYCL_SOURCES ${PTSYCL_GENERATED_SOURCES})
+endif()
+
+add_library(torch_paras_C SHARED ${PTSYCL_SOURCES})
 
 set_target_properties(torch_paras_C PROPERTIES
     PREFIX ""

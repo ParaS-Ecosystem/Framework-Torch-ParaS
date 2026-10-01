@@ -60,6 +60,7 @@ fi
     -DPTSYCL_GCC_TOOLCHAIN="${PTSYCL_GCC_TOOLCHAIN}" \
     -DPTSYCL_TORCH_DIR="${PTSYCL_TORCH_DIR}" \
     -DPARAS_HOME="${PARAS_HOME}" \
+    -DPTSYCL_FAST_BUILD="${PTSYCL_FAST_BUILD:-OFF}" \
     -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
 
 # parascc names its /tmp intermediates with second resolution; parallel

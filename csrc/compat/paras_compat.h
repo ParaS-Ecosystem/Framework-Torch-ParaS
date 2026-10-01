@@ -21,9 +21,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #if !defined(PTSYCL_BACKEND_SYCL) && !defined(PTSYCL_BACKEND_CPU)
@@ -38,7 +38,8 @@
 #include <sycl/sycl.hpp>
 #endif
 
-#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_SYCL)) && (defined(__CUDACC__) || defined(__CUDA__))
+#if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_SYCL)) && \
+    (defined(__CUDACC__) || defined(__CUDA__))
 #define PTSYCL_HOST_DEVICE __host__ __device__
 #elif defined(PTSYCL_BACKEND_HIP) && (defined(__HIPCC__) || defined(__HIP__))
 #define PTSYCL_HOST_DEVICE __host__ __device__
@@ -54,7 +55,6 @@ namespace compat {
 struct DeviceInfo {
     std::string name;
     bool        is_gpu        = false;
-
     int         native_id     = -1;
     int         compute_units = 0;
     std::size_t global_mem    = 0;
@@ -80,52 +80,15 @@ inline void host_parallel_for(std::size_t n, F&& f) {
         &ctx);
 }
 
-#if defined(PTSYCL_BACKEND_SYCL)
-// Returns the sycl::device captured for DeviceInfo::native_id at
-// enumerate_devices() time. Defined only under PTSYCL_BACKEND_SYCL.
-sycl::device& device_by_native_id(int native_id);
-#endif
-
-template <typename F>
-class ParasKernelKey;
-
 class Queue {
 public:
-    Queue() = default;
-    ~Queue() {
-#if defined(PTSYCL_BACKEND_SYCL)
-        if (queue_ != nullptr) {
-            delete queue_;
-            queue_ = nullptr;
-        }
-#endif
-    }
+    Queue();
+    ~Queue();
 
     Queue(const Queue&)            = delete;
     Queue& operator=(const Queue&) = delete;
 
-    // Binds this queue to a device from enumerate_devices().
-    void init(const DeviceInfo& dev) {
-        if (initialized_) fail("Queue::init called twice");
-        is_gpu_    = dev.is_gpu;
-        native_id_ = dev.native_id;
-#if defined(PTSYCL_BACKEND_SYCL)
-        if (is_gpu_) {
-            sycl::device& d = device_by_native_id(native_id_);
-            try {
-                queue_ = new sycl::queue(d, sycl::property::queue::in_order{});
-            } catch (const sycl::exception& e) {
-                std::ostringstream os;
-                os << "sycl::queue construction failed on device " << native_id_
-                   << ": " << e.what();
-                fail(os.str());
-            }
-        }
-#else
-        if (is_gpu_) fail("GPU device requested in a CPU-only build");
-#endif
-        initialized_ = true;
-    }
+    void init(const DeviceInfo& dev);
 
     bool initialized() const { return initialized_; }
     bool is_gpu()      const { return is_gpu_; }
@@ -133,44 +96,24 @@ public:
 
     void* alloc(std::size_t nbytes);
     void  dealloc(void* ptr);
-
     void copy(void* dst, const void* src, std::size_t nbytes, bool blocking);
-
     void memset(void* ptr, int value, std::size_t nbytes);
-
     void synchronize();
 
 #if defined(PTSYCL_BACKEND_SYCL)
-    sycl::queue& sycl_queue() { return *queue_; }
+    // Queue ownership and construction remain in paras_compat.cpp.
+    sycl::queue& sycl_queue() const;
 #endif
-
-    template <typename F>
-    void parallel_for(std::size_t n, F f) {
-        if (n == 0) return;
-#if defined(PTSYCL_BACKEND_SYCL)
-        if (is_gpu_) {
-            queue_->template parallel_for<ParasKernelKey<F>>(
-                sycl::range<1>(n),
-                [f](sycl::id<1> i) { f(static_cast<std::size_t>(i[0])); });
-            return;
-        }
-#endif
-        host_parallel_for(n, f);
-    }
 
 private:
-    bool         initialized_ = false;
-    bool         is_gpu_      = false;
-    int          native_id_   = -1;
-#if defined(PTSYCL_BACKEND_SYCL)
-    sycl::queue* queue_       = nullptr;
-#else
-    void*        queue_       = nullptr;
-#endif
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    bool initialized_ = false;
+    bool is_gpu_      = false;
+    int  native_id_   = -1;
 };
 
 const char* backend_name();
 
 } // namespace compat
 } // namespace ptsycl
-
