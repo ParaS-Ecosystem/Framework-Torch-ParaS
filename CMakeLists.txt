@@ -100,6 +100,7 @@ set(PTSYCL_SOURCES
 if(NOT PTSYCL_FAST_BUILD)
     list(APPEND PTSYCL_SOURCES
     csrc/ops/pointwise_ops.cpp
+    csrc/ops/clap_dnn_adapter.cpp
     csrc/ops/scatter_ops.cpp
     csrc/ops/indexing_ops.cpp
     csrc/ops/fused_ops.cpp
@@ -244,11 +245,81 @@ endif()
 # actually exercised on hardware -- see the earlier compiler-support-
 # matrix finding that this parascc install's public backend list is only
 # {host, cuda}, with AMD/HIP-ROCm still in Laxmikant's internal fork.
+
+# ------------------------------------------------------------------------------
+# Optional CLAP integration
+# ------------------------------------------------------------------------------
+option(PTSYCL_ENABLE_CLAP "Enable CLAP integration" OFF)
+
+set(PTSYCL_CLAP_ROOT "$ENV{CLAP_HOME}" CACHE PATH
+    "CLAP installation prefix")
+
+if(PTSYCL_ENABLE_CLAP)
+    set(_ptsycl_clap_include_hints)
+    set(_ptsycl_clap_library_hints)
+
+    if(PTSYCL_CLAP_ROOT)
+        list(APPEND _ptsycl_clap_include_hints
+            "${PTSYCL_CLAP_ROOT}/include")
+        list(APPEND _ptsycl_clap_library_hints
+            "${PTSYCL_CLAP_ROOT}/lib64"
+            "${PTSYCL_CLAP_ROOT}/lib")
+    endif()
+
+    find_path(PTSYCL_CLAP_INCLUDE_DIR
+        NAMES clap/dnn_factory.hpp
+        HINTS ${_ptsycl_clap_include_hints})
+
+    find_library(PTSYCL_CLAP_LIBRARY
+        NAMES clap
+        HINTS ${_ptsycl_clap_library_hints})
+
+    if(NOT PTSYCL_CLAP_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "CLAP headers not found. Set PTSYCL_CLAP_ROOT or CLAP_HOME.")
+    endif()
+
+    if(NOT PTSYCL_CLAP_LIBRARY)
+        message(FATAL_ERROR
+            "libclap not found. Set PTSYCL_CLAP_ROOT or CLAP_HOME.")
+    endif()
+
+    target_compile_definitions(torch_paras_C PRIVATE USE_CLAP_BACKEND)
+
+    if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
+        if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+            target_compile_definitions(
+                torch_paras_C PRIVATE PTSYCL_CLAP_DNN_CUDA)
+        elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+            target_compile_definitions(
+                torch_paras_C PRIVATE PTSYCL_CLAP_DNN_ROCM)
+        endif()
+    endif()
+
+    target_include_directories(torch_paras_C SYSTEM PRIVATE
+        "${PTSYCL_CLAP_INCLUDE_DIR}")
+
+    target_link_libraries(torch_paras_C PRIVATE
+        "${PTSYCL_CLAP_LIBRARY}")
+
+    get_filename_component(
+        PTSYCL_CLAP_LIBRARY_DIR
+        "${PTSYCL_CLAP_LIBRARY}"
+        DIRECTORY)
+
+    message(STATUS "CLAP include     : ${PTSYCL_CLAP_INCLUDE_DIR}")
+    message(STATUS "CLAP library     : ${PTSYCL_CLAP_LIBRARY}")
+endif()
+
 set(PTSYCL_RPATHS
     "${PTSYCL_TORCH_DIR}/lib"
     "${PARAS_HOME}/lib"
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )
+
+if(PTSYCL_ENABLE_CLAP)
+    list(APPEND PTSYCL_RPATHS "${PTSYCL_CLAP_LIBRARY_DIR}")
+endif()
 if(PTSYCL_CUDART_LIBRARY)
     get_filename_component(_ptsycl_cudart_dir "${PTSYCL_CUDART_LIBRARY}" DIRECTORY)
     list(APPEND PTSYCL_RPATHS "${_ptsycl_cudart_dir}")
