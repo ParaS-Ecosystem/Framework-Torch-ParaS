@@ -124,60 +124,6 @@ inline bool gemm_cpu(
 #endif
 }
 
-inline bool dot_cpu(
-    const at::Tensor& a_in,
-    const at::Tensor& b_in,
-    at::Tensor& out)
-{
-#ifdef PTSYCL_USE_CLAP_BLAS
-    if (!supported_dtype(a_in) ||
-        a_in.scalar_type() != b_in.scalar_type() ||
-        a_in.scalar_type() != out.scalar_type() ||
-        a_in.dim() != 1 ||
-        b_in.dim() != 1 ||
-        a_in.numel() != b_in.numel()) {
-        return false;
-    }
-
-    at::Tensor a = a_in.contiguous();
-    at::Tensor b = b_in.contiguous();
-
-    const int64_t n = a.numel();
-
-    if (n > std::numeric_limits<int>::max())
-        return false;
-
-    if (n == 0) {
-        out.zero_();
-        return true;
-    }
-
-    auto backend = clap::BlasFactory::create();
-    if (backend == nullptr)
-        return false;
-
-    if (a.scalar_type() == at::kFloat) {
-        *out.data_ptr<float>() =
-            backend->dot(
-                static_cast<int>(n),
-                a.data_ptr<float>(), 1,
-                b.data_ptr<float>(), 1);
-    } else {
-        *out.data_ptr<double>() =
-            backend->dot(
-                static_cast<int>(n),
-                a.data_ptr<double>(), 1,
-                b.data_ptr<double>(), 1);
-    }
-
-    return true;
-#else
-    (void)a_in;
-    (void)b_in;
-    (void)out;
-    return false;
-#endif
-}
 
 } // namespace clap_blas
 } // namespace ptsycl

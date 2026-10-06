@@ -268,6 +268,7 @@ public:
 
         if (cpu_x.dim() >= 1 &&
             cpu_w.dim() == 2 &&
+            cpu_w.size(1) > 0 &&
             cpu_x.size(-1) == cpu_w.size(1) &&
             cpu_x.scalar_type() == cpu_w.scalar_type() &&
             clap_blas::supported_dtype(cpu_x)) {
@@ -490,10 +491,32 @@ Tensor& addmm_out(
     Tensor cpu_a = to_cpu(mat1).contiguous();
     Tensor cpu_b = to_cpu(mat2).contiguous();
 
+    const int64_t out_rows =
+        cpu_a.dim() == 2 ? cpu_a.size(0) : 0;
+    const int64_t out_cols =
+        cpu_b.dim() == 2 ? cpu_b.size(1) : 0;
+
+    const bool self_broadcastable =
+        cpu_self.dim() == 0 ||
+        (cpu_self.dim() == 1 &&
+         (cpu_self.size(0) == 1 ||
+          cpu_self.size(0) == out_cols)) ||
+        (cpu_self.dim() == 2 &&
+         (cpu_self.size(0) == 1 ||
+          cpu_self.size(0) == out_rows) &&
+         (cpu_self.size(1) == 1 ||
+          cpu_self.size(1) == out_cols));
+
     if (cpu_a.dim() == 2 &&
         cpu_b.dim() == 2 &&
         cpu_a.size(1) == cpu_b.size(0) &&
         cpu_a.scalar_type() == cpu_b.scalar_type() &&
+        cpu_self.scalar_type() == cpu_a.scalar_type() &&
+        out.scalar_type() == cpu_a.scalar_type() &&
+        out.dim() == 2 &&
+        out.size(0) == cpu_a.size(0) &&
+        out.size(1) == cpu_b.size(1) &&
+        self_broadcastable &&
         clap_blas::supported_dtype(cpu_a)) {
 
         Tensor cpu_out = at::zeros(
@@ -509,7 +532,7 @@ Tensor& addmm_out(
                 alpha.toDouble())) {
 
             if (beta.toDouble() != 0.0)
-                cpu_out = at::add(cpu_out, cpu_self, beta);
+                cpu_out.add_(cpu_self, beta);
 
             auto& q = queue_for(out);
             q.copy(
