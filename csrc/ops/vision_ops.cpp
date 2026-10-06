@@ -23,6 +23,10 @@
 #include <ATen/ops/_native_multi_head_attention_cpu_dispatch.h>
 #include <cmath>
 
+
+
+#include "clap_blas_utils.h"
+
 namespace ptsycl {
 namespace {
 
@@ -255,16 +259,56 @@ public:
         at::AutoDispatchBelowADInplaceOrView g;
         c10::Device dev = input.device();
 
-        Tensor cpu_x = to_cpu(input);
-        Tensor cpu_w = to_cpu(weight);
-        auto   cpu_b = opt_to_cpu(bias);
+        Tensor cpu_x = to_cpu(input).contiguous();
+        Tensor cpu_w = to_cpu(weight).contiguous();
+        auto cpu_b = opt_to_cpu(bias);
 
-        Tensor cpu_out = at::linear(cpu_x, cpu_w,
-                                     cpu_b.has_value() ? *cpu_b : Tensor{});
-        Tensor result = to_device(cpu_out, dev);
+        Tensor cpu_out;
+        bool used_clap = false;
+
+        if (cpu_x.dim() >= 1 &&
+            cpu_w.dim() == 2 &&
+            cpu_x.size(-1) == cpu_w.size(1) &&
+            cpu_x.scalar_type() == cpu_w.scalar_type() &&
+            clap_blas::supported_dtype(cpu_x)) {
+
+            const int64_t fi = cpu_w.size(1);
+            const int64_t fo = cpu_w.size(0);
+            const int64_t batch = cpu_x.numel() / fi;
+
+            Tensor cpu_x2 = cpu_x.view({batch, fi});
+            Tensor cpu_wt = cpu_w.t().contiguous();
+
+            Tensor cpu_out2 = at::zeros(
+                {batch, fo},
+                at::TensorOptions()
+                    .dtype(cpu_x.scalar_type())
+                    .device(c10::kCPU));
+
+            if (clap_blas::gemm_cpu(cpu_x2, cpu_wt, cpu_out2)) {
+                if (cpu_b.has_value() && cpu_b->defined() && cpu_b->numel() > 0)
+                    cpu_out2.add_(*cpu_b);
+
+                auto out_sizes = cpu_x.sizes().vec();
+                out_sizes.back() = fo;
+                cpu_out = cpu_out2.view(out_sizes);
+                used_clap = true;
+            }
+        }
+
+        if (!used_clap) {
+            cpu_out = at::linear(
+                cpu_x,
+                cpu_w,
+                cpu_b.has_value() ? *cpu_b : Tensor{});
+        }
+
+        Tensor result = to_device(cpu_out.contiguous(), dev);
 
         ctx->save_for_backward({input.contiguous(), weight});
-        ctx->saved_data["has_bias"] = bias.has_value() && bias->numel() > 0;
+        ctx->saved_data["has_bias"] =
+            bias.has_value() && bias->numel() > 0;
+
         return result;
     }
 
@@ -388,10 +432,37 @@ Tensor max_pool2d_autograd(
 Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("mm.out");
-    Tensor cpu_out = at::mm(to_cpu(self), to_cpu(mat2));
+
+    Tensor cpu_a = to_cpu(self).contiguous();
+    Tensor cpu_b = to_cpu(mat2).contiguous();
+
+    if (cpu_a.dim() == 2 && cpu_b.dim() == 2 &&
+        cpu_a.size(1) == cpu_b.size(0)) {
+
+        Tensor cpu_out = at::zeros(
+            {cpu_a.size(0), cpu_b.size(1)},
+            at::TensorOptions()
+                .dtype(cpu_a.scalar_type())
+                .device(c10::kCPU));
+
+        if (clap_blas::gemm_cpu(cpu_a, cpu_b, cpu_out)) {
+            auto& q = queue_for(out);
+            q.copy(
+                out.data_ptr(),
+                cpu_out.data_ptr(),
+                static_cast<std::size_t>(cpu_out.nbytes()),
+                true);
+            return out;
+        }
+    }
+
+    Tensor cpu_out = at::mm(cpu_a, cpu_b);
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(
+        out.data_ptr(),
+        cpu_out.contiguous().data_ptr(),
+        static_cast<std::size_t>(cpu_out.nbytes()),
+        true);
     return out;
 }
 
@@ -414,11 +485,51 @@ Tensor& addmm_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("addmm.out");
-    Tensor cpu_out = at::addmm(to_cpu(self), to_cpu(mat1), to_cpu(mat2),
-                                beta, alpha);
+
+    Tensor cpu_self = to_cpu(self).contiguous();
+    Tensor cpu_a = to_cpu(mat1).contiguous();
+    Tensor cpu_b = to_cpu(mat2).contiguous();
+
+    if (cpu_a.dim() == 2 &&
+        cpu_b.dim() == 2 &&
+        cpu_a.size(1) == cpu_b.size(0) &&
+        cpu_a.scalar_type() == cpu_b.scalar_type() &&
+        clap_blas::supported_dtype(cpu_a)) {
+
+        Tensor cpu_out = at::zeros(
+            {cpu_a.size(0), cpu_b.size(1)},
+            at::TensorOptions()
+                .dtype(cpu_a.scalar_type())
+                .device(c10::kCPU));
+
+        if (clap_blas::gemm_cpu(
+                cpu_a,
+                cpu_b,
+                cpu_out,
+                alpha.toDouble())) {
+
+            if (beta.toDouble() != 0.0)
+                cpu_out = at::add(cpu_out, cpu_self, beta);
+
+            auto& q = queue_for(out);
+            q.copy(
+                out.data_ptr(),
+                cpu_out.contiguous().data_ptr(),
+                static_cast<std::size_t>(cpu_out.nbytes()),
+                true);
+            return out;
+        }
+    }
+
+    Tensor cpu_out =
+        at::addmm(cpu_self, cpu_a, cpu_b, beta, alpha);
+
     auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    q.copy(
+        out.data_ptr(),
+        cpu_out.contiguous().data_ptr(),
+        static_cast<std::size_t>(cpu_out.nbytes()),
+        true);
     return out;
 }
 

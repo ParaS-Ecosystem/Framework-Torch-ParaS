@@ -21,6 +21,8 @@
 
 #include "core/kernels.h"
 
+#include "clap_blas_utils.h"
+
 namespace ptsycl {
 namespace {
 
@@ -851,27 +853,72 @@ Tensor max(const Tensor& self) { return reduce_all_to_scalar(self, ReduceKind::M
 
 Tensor dot(const Tensor& self, const Tensor& other) {
     PTSYCL_TRACE_OP("dot");
-    TORCH_CHECK(self.dim() == 1 && other.dim() == 1 &&
-                    self.numel() == other.numel(),
-                "dot: expected 1-D tensors of equal length");
+
+    TORCH_CHECK(
+        self.dim() == 1 &&
+        other.dim() == 1 &&
+        self.numel() == other.numel(),
+        "dot: expected 1-D tensors of equal length");
+
+#ifdef PTSYCL_USE_CLAP_BLAS
+    if (clap_blas::supported_dtype(self) &&
+        self.scalar_type() == other.scalar_type()) {
+
+        Tensor cpu_a = self.cpu().contiguous();
+        Tensor cpu_b = other.cpu().contiguous();
+
+        Tensor cpu_out = at::empty(
+            {},
+            at::TensorOptions()
+                .dtype(self.scalar_type())
+                .device(c10::kCPU));
+
+        if (clap_blas::dot_cpu(cpu_a, cpu_b, cpu_out)) {
+            Tensor out = at::empty({}, self.options());
+            auto& q = queue_for(out);
+
+            q.copy(
+                out.data_ptr(),
+                cpu_out.data_ptr(),
+                static_cast<std::size_t>(cpu_out.nbytes()),
+                true);
+
+            return out;
+        }
+    }
+#endif
+
     auto& q = queue_for(self);
-    Tensor a = self.contiguous(), b = other.contiguous();
+    Tensor a = self.contiguous();
+    Tensor b = other.contiguous();
     Tensor out = at::empty({}, self.options());
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_dot", [&] {
+        c10::kHalf,
+        c10::kBFloat16,
+        self.scalar_type(),
+        "ptsycl_dot",
+        [&] {
             const scalar_t* pa = data_ptr<scalar_t>(a);
             const scalar_t* pb = data_ptr<scalar_t>(b);
+
             const double r = reduce_full<double>(
-                q, a.numel(), 0.0,
+                q,
+                a.numel(),
+                0.0,
                 [=](int64_t i) {
                     return static_cast<double>(pa[i]) *
                            static_cast<double>(pb[i]);
                 },
-                [](double x, double y) { return x + y; });
+                [](double x, double y) {
+                    return x + y;
+                });
+
             q.synchronize();
-            *data_ptr<scalar_t>(out) = static_cast<scalar_t>(r);
+            *data_ptr<scalar_t>(out) =
+                static_cast<scalar_t>(r);
         });
+
     return out;
 }
 
