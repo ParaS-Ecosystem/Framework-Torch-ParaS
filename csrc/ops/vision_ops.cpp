@@ -278,15 +278,20 @@ public:
             const int64_t batch = cpu_x.numel() / fi;
 
             Tensor cpu_x2 = cpu_x.view({batch, fi});
-            Tensor cpu_wt = cpu_w.t().contiguous();
 
-            Tensor cpu_out2 = at::zeros(
+            Tensor cpu_out2 = at::empty(
                 {batch, fo},
                 at::TensorOptions()
                     .dtype(cpu_x.scalar_type())
                     .device(c10::kCPU));
 
-            if (clap_blas::gemm_cpu(cpu_x2, cpu_wt, cpu_out2)) {
+            if (clap_blas::gemm_cpu(
+                    cpu_x2,
+                    cpu_w,
+                    cpu_out2,
+                    1.0,
+                    true)) {
+                PTSYCL_TRACE_OP("linear.clap_blas");
                 if (cpu_b.has_value() && cpu_b->defined() && cpu_b->numel() > 0)
                     cpu_out2.add_(*cpu_b);
 
@@ -298,6 +303,7 @@ public:
         }
 
         if (!used_clap) {
+            PTSYCL_TRACE_OP("linear.fallback");
             cpu_out = at::linear(
                 cpu_x,
                 cpu_w,
@@ -437,16 +443,37 @@ Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
     Tensor cpu_a = to_cpu(self).contiguous();
     Tensor cpu_b = to_cpu(mat2).contiguous();
 
+    // Validate the destination before any raw device copy.
+    if (cpu_a.dim() == 2 &&
+        cpu_b.dim() == 2 &&
+        cpu_a.size(1) == cpu_b.size(0)) {
+
+        TORCH_CHECK(
+            out.dim() == 2 &&
+            out.size(0) == cpu_a.size(0) &&
+            out.size(1) == cpu_b.size(1),
+            "mm.out: output shape mismatch");
+
+        TORCH_CHECK(
+            out.scalar_type() == cpu_a.scalar_type(),
+            "mm.out: output dtype mismatch");
+
+        TORCH_CHECK(
+            out.is_contiguous(),
+            "mm.out: output must be contiguous");
+    }
+
     if (cpu_a.dim() == 2 && cpu_b.dim() == 2 &&
         cpu_a.size(1) == cpu_b.size(0)) {
 
-        Tensor cpu_out = at::zeros(
+        Tensor cpu_out = at::empty(
             {cpu_a.size(0), cpu_b.size(1)},
             at::TensorOptions()
                 .dtype(cpu_a.scalar_type())
                 .device(c10::kCPU));
 
         if (clap_blas::gemm_cpu(cpu_a, cpu_b, cpu_out)) {
+            PTSYCL_TRACE_OP("mm.out.clap_blas");
             auto& q = queue_for(out);
             q.copy(
                 out.data_ptr(),
@@ -457,6 +484,7 @@ Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
         }
     }
 
+    PTSYCL_TRACE_OP("mm.out.fallback");
     Tensor cpu_out = at::mm(cpu_a, cpu_b);
     auto& q = queue_for(out);
     q.copy(
@@ -491,6 +519,26 @@ Tensor& addmm_out(
     Tensor cpu_a = to_cpu(mat1).contiguous();
     Tensor cpu_b = to_cpu(mat2).contiguous();
 
+    // Validate the destination before any raw device copy.
+    if (cpu_a.dim() == 2 &&
+        cpu_b.dim() == 2 &&
+        cpu_a.size(1) == cpu_b.size(0)) {
+
+        TORCH_CHECK(
+            out.dim() == 2 &&
+            out.size(0) == cpu_a.size(0) &&
+            out.size(1) == cpu_b.size(1),
+            "addmm.out: output shape mismatch");
+
+        TORCH_CHECK(
+            out.scalar_type() == cpu_a.scalar_type(),
+            "addmm.out: output dtype mismatch");
+
+        TORCH_CHECK(
+            out.is_contiguous(),
+            "addmm.out: output must be contiguous");
+    }
+
     const int64_t out_rows =
         cpu_a.dim() == 2 ? cpu_a.size(0) : 0;
     const int64_t out_cols =
@@ -519,7 +567,7 @@ Tensor& addmm_out(
         self_broadcastable &&
         clap_blas::supported_dtype(cpu_a)) {
 
-        Tensor cpu_out = at::zeros(
+        Tensor cpu_out = at::empty(
             {cpu_a.size(0), cpu_b.size(1)},
             at::TensorOptions()
                 .dtype(cpu_a.scalar_type())
@@ -530,6 +578,8 @@ Tensor& addmm_out(
                 cpu_b,
                 cpu_out,
                 alpha.toDouble())) {
+
+            PTSYCL_TRACE_OP("addmm.out.clap_blas");
 
             if (beta.toDouble() != 0.0)
                 cpu_out.add_(cpu_self, beta);
@@ -544,6 +594,7 @@ Tensor& addmm_out(
         }
     }
 
+    PTSYCL_TRACE_OP("addmm.out.fallback");
     Tensor cpu_out =
         at::addmm(cpu_self, cpu_a, cpu_b, beta, alpha);
 

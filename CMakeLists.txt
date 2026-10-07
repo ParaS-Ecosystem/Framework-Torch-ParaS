@@ -283,6 +283,46 @@ if(PTSYCL_ENABLE_CLAP_BLAS)
             "libclap not found. Set PTSYCL_CLAP_ROOT or CLAP_HOME.")
     endif()
 
+    set(PTSYCL_CLAP_WRAPPER_OBJ
+        "${CMAKE_CURRENT_BINARY_DIR}/clap_blas_wrapper.o")
+
+    set(PTSYCL_CLAP_HOST_CXX
+        "${PTSYCL_GCC_TOOLCHAIN}/bin/g++")
+
+    if(NOT EXISTS "${PTSYCL_CLAP_HOST_CXX}")
+        message(FATAL_ERROR
+            "Host C++ compiler not found: ${PTSYCL_CLAP_HOST_CXX}")
+    endif()
+
+    add_custom_command(
+        OUTPUT "${PTSYCL_CLAP_WRAPPER_OBJ}"
+        COMMAND "${PTSYCL_CLAP_HOST_CXX}"
+            -std=c++17
+            -fPIC
+            -O3
+            "-I${PTSYCL_CLAP_INCLUDE_DIR}"
+            -c
+            "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.cpp"
+            -o
+            "${PTSYCL_CLAP_WRAPPER_OBJ}"
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.h"
+        VERBATIM
+    )
+
+    set_source_files_properties(
+        "${PTSYCL_CLAP_WRAPPER_OBJ}"
+        PROPERTIES
+            GENERATED TRUE
+            EXTERNAL_OBJECT TRUE
+    )
+
+    target_sources(
+        torch_paras_C PRIVATE
+        "${PTSYCL_CLAP_WRAPPER_OBJ}"
+    )
+
     target_compile_definitions(torch_paras_C PRIVATE PTSYCL_USE_CLAP_BLAS)
 
     target_include_directories(torch_paras_C SYSTEM PRIVATE
