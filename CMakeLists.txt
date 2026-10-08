@@ -311,8 +311,18 @@ if(PTSYCL_ENABLE_CLAP)
     message(STATUS "CLAP library     : ${PTSYCL_CLAP_LIBRARY}")
 endif()
 
+set(PTSYCL_PARAS_RUNTIME_DIR "" CACHE PATH
+    "Optional ParaS runtime library override")
+
 set(PTSYCL_RPATHS
     "${PTSYCL_TORCH_DIR}/lib"
+)
+
+if(PTSYCL_PARAS_RUNTIME_DIR)
+    list(APPEND PTSYCL_RPATHS "${PTSYCL_PARAS_RUNTIME_DIR}")
+endif()
+
+list(APPEND PTSYCL_RPATHS
     "${PARAS_HOME}/lib"
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )

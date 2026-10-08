@@ -463,6 +463,9 @@ Tensor& tanh_backward_out(const Tensor& grad_output, const Tensor& output,
 }
 
 Tensor& silu_out(const Tensor& self, Tensor& out) {
+    if (clap_dnn::try_silu_forward(self, out)) {
+        return out;
+    }
     unary_kernel(self, out,
                  [](double v) { return v / (1.0 + ::exp(-v)); });
     return out;
