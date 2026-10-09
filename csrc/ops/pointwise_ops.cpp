@@ -20,6 +20,7 @@
 #include <cmath>
 
 #include "core/kernels.h"
+#include "ops/clap_dnn_adapter.h"
 
 namespace ptsycl {
 namespace {
@@ -426,6 +427,10 @@ Tensor& relu_(Tensor& self) {
 }
 
 Tensor& sigmoid_out(const Tensor& self, Tensor& out) {
+    if (clap_dnn::try_sigmoid_forward(self, out)) {
+        return out;
+    }
+
     unary_kernel(self, out, [](double v) { return 1.0 / (1.0 + ::exp(-v)); });
     return out;
 }
@@ -458,6 +463,9 @@ Tensor& tanh_backward_out(const Tensor& grad_output, const Tensor& output,
 }
 
 Tensor& silu_out(const Tensor& self, Tensor& out) {
+    if (clap_dnn::try_silu_forward(self, out)) {
+        return out;
+    }
     unary_kernel(self, out,
                  [](double v) { return v / (1.0 + ::exp(-v)); });
     return out;
