@@ -249,12 +249,13 @@ endif()
 # ------------------------------------------------------------------------------
 # Optional CLAP integration
 # ------------------------------------------------------------------------------
-option(PTSYCL_ENABLE_CLAP "Enable CLAP integration" OFF)
+option(PTSYCL_ENABLE_CLAP "Enable CLAP-DNN integration" OFF)
+option(PTSYCL_ENABLE_CLAP_BLAS "Enable CLAP-BLAS integration" OFF)
 
 set(PTSYCL_CLAP_ROOT "$ENV{CLAP_HOME}" CACHE PATH
     "CLAP installation prefix")
 
-if(PTSYCL_ENABLE_CLAP)
+if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
     set(_ptsycl_clap_include_hints)
     set(_ptsycl_clap_library_hints)
 
@@ -266,8 +267,9 @@ if(PTSYCL_ENABLE_CLAP)
             "${PTSYCL_CLAP_ROOT}/lib")
     endif()
 
+    # Both DNN and BLAS live under the same CLAP installation.
     find_path(PTSYCL_CLAP_INCLUDE_DIR
-        NAMES clap/dnn_factory.hpp
+        NAMES clap/dnn_factory.hpp clap/blas_factory.hpp
         HINTS ${_ptsycl_clap_include_hints})
 
     find_library(PTSYCL_CLAP_LIBRARY
@@ -284,18 +286,73 @@ if(PTSYCL_ENABLE_CLAP)
             "libclap not found. Set PTSYCL_CLAP_ROOT or CLAP_HOME.")
     endif()
 
-    target_compile_definitions(torch_paras_C PRIVATE USE_CLAP_BACKEND)
+    # --------------------------------------------------------------------------
+    # CLAP-DNN
+    # --------------------------------------------------------------------------
+    if(PTSYCL_ENABLE_CLAP)
+        target_compile_definitions(
+            torch_paras_C PRIVATE USE_CLAP_BACKEND)
 
-    if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
-        if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
-            target_compile_definitions(
-                torch_paras_C PRIVATE PTSYCL_CLAP_DNN_CUDA)
-        elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
-            target_compile_definitions(
-                torch_paras_C PRIVATE PTSYCL_CLAP_DNN_ROCM)
+        if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
+            if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+                target_compile_definitions(
+                    torch_paras_C PRIVATE PTSYCL_CLAP_DNN_CUDA)
+            elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+                target_compile_definitions(
+                    torch_paras_C PRIVATE PTSYCL_CLAP_DNN_ROCM)
+            endif()
         endif()
     endif()
 
+    # --------------------------------------------------------------------------
+    # CLAP-BLAS
+    # --------------------------------------------------------------------------
+    if(PTSYCL_ENABLE_CLAP_BLAS)
+        set(PTSYCL_CLAP_WRAPPER_OBJ
+            "${CMAKE_CURRENT_BINARY_DIR}/clap_blas_wrapper.o")
+
+        set(PTSYCL_CLAP_HOST_CXX
+            "${PTSYCL_GCC_TOOLCHAIN}/bin/g++")
+
+        if(NOT EXISTS "${PTSYCL_CLAP_HOST_CXX}")
+            message(FATAL_ERROR
+                "Host C++ compiler not found: ${PTSYCL_CLAP_HOST_CXX}")
+        endif()
+
+        add_custom_command(
+            OUTPUT "${PTSYCL_CLAP_WRAPPER_OBJ}"
+            COMMAND "${PTSYCL_CLAP_HOST_CXX}"
+                -std=c++17
+                -fPIC
+                -O3
+                "-I${PTSYCL_CLAP_INCLUDE_DIR}"
+                -c
+                "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.cpp"
+                -o
+                "${PTSYCL_CLAP_WRAPPER_OBJ}"
+            DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.h"
+            VERBATIM
+        )
+
+        set_source_files_properties(
+            "${PTSYCL_CLAP_WRAPPER_OBJ}"
+            PROPERTIES
+                GENERATED TRUE
+                EXTERNAL_OBJECT TRUE
+        )
+
+        target_sources(
+            torch_paras_C PRIVATE
+            "${PTSYCL_CLAP_WRAPPER_OBJ}"
+        )
+
+        target_compile_definitions(
+            torch_paras_C PRIVATE PTSYCL_USE_CLAP_BLAS)
+    endif()
+
+    # Shared CLAP include/link setup for DNN and/or BLAS.
     target_include_directories(torch_paras_C SYSTEM PRIVATE
         "${PTSYCL_CLAP_INCLUDE_DIR}")
 
@@ -311,6 +368,7 @@ if(PTSYCL_ENABLE_CLAP)
     message(STATUS "CLAP library     : ${PTSYCL_CLAP_LIBRARY}")
 endif()
 
+# Optional runtime override used when ParaS runtime ABI must match PyTorch.
 set(PTSYCL_PARAS_RUNTIME_DIR "" CACHE PATH
     "Optional ParaS runtime library override")
 
@@ -327,7 +385,7 @@ list(APPEND PTSYCL_RPATHS
     "${PTSYCL_GCC_TOOLCHAIN}/lib64"
 )
 
-if(PTSYCL_ENABLE_CLAP)
+if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
     list(APPEND PTSYCL_RPATHS "${PTSYCL_CLAP_LIBRARY_DIR}")
 endif()
 if(PTSYCL_CUDART_LIBRARY)
