@@ -297,6 +297,10 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
             if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
                 target_compile_definitions(
                     torch_paras_C PRIVATE PTSYCL_CLAP_DNN_CUDA)
+
+                target_include_directories(
+                    torch_paras_C SYSTEM PRIVATE
+                    "${PTSYCL_CUDA_HOME}/include")
             elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
                 target_compile_definitions(
                     torch_paras_C PRIVATE PTSYCL_CLAP_DNN_ROCM)

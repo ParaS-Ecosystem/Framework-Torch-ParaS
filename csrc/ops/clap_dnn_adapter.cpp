@@ -18,6 +18,10 @@
 #include <clap/dnn_types.hpp>
 #include <clap/idnn_backend.hpp>
 
+#if defined(PTSYCL_CLAP_DNN_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -31,6 +35,85 @@ namespace ptsycl::clap_dnn {
 #ifdef USE_CLAP_BACKEND
 
 namespace {
+
+
+#if defined(PTSYCL_CLAP_DNN_CUDA)
+
+class CudaDeviceGuard {
+public:
+    explicit CudaDeviceGuard(int target_device)
+        : previous_device_(-1),
+          restore_(false)
+    {
+        const auto get_status =
+            cudaGetDevice(&previous_device_);
+
+        TORCH_CHECK(
+            get_status == cudaSuccess,
+            "Torch-ParaS CLAP-DNN cudaGetDevice failed: ",
+            cudaGetErrorString(get_status));
+
+        if (previous_device_ == target_device)
+            return;
+
+        const auto set_status =
+            cudaSetDevice(target_device);
+
+        TORCH_CHECK(
+            set_status == cudaSuccess,
+            "Torch-ParaS CLAP-DNN cudaSetDevice(",
+            target_device,
+            ") failed: ",
+            cudaGetErrorString(set_status));
+
+        restore_ = true;
+    }
+
+    ~CudaDeviceGuard() noexcept
+    {
+        if (restore_) {
+            // Restore the calling thread's CUDA device on both
+            // normal completion and exception unwinding.
+            (void)cudaSetDevice(previous_device_);
+        }
+    }
+
+    CudaDeviceGuard(const CudaDeviceGuard&) = delete;
+    CudaDeviceGuard& operator=(const CudaDeviceGuard&) = delete;
+
+private:
+    int previous_device_;
+    bool restore_;
+};
+
+
+int cuda_device_for_pointer(const void* ptr)
+{
+    cudaPointerAttributes attributes{};
+
+    const auto status =
+        cudaPointerGetAttributes(
+            &attributes,
+            ptr);
+
+    TORCH_CHECK(
+        status == cudaSuccess,
+        "Torch-ParaS CLAP-DNN cudaPointerGetAttributes failed: ",
+        cudaGetErrorString(status));
+
+    TORCH_CHECK(
+        attributes.type == cudaMemoryTypeDevice ||
+        attributes.type == cudaMemoryTypeManaged,
+        "Torch-ParaS CLAP-DNN expected CUDA device memory");
+
+    TORCH_CHECK(
+        attributes.device >= 0,
+        "Torch-ParaS CLAP-DNN received an invalid CUDA device ordinal");
+
+    return attributes.device;
+}
+
+#endif
 
 
 bool select_backend(
@@ -262,6 +345,21 @@ bool try_activation_forward(
                 TORCH_CHECK(
                     native_stream != nullptr,
                     "Torch-ParaS CLAP-DNN received a null CUDA stream");
+
+                const int input_device =
+                    cuda_device_for_pointer(input_ptr);
+
+                const int output_device =
+                    cuda_device_for_pointer(output_ptr);
+
+                TORCH_CHECK(
+                    input_device == output_device,
+                    "Torch-ParaS CLAP-DNN input/output CUDA device mismatch: input=",
+                    input_device,
+                    ", output=",
+                    output_device);
+
+                CudaDeviceGuard device_guard(input_device);
 
                 auto ctx =
                     clap::ExecutionContext::cuda(
