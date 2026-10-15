@@ -102,10 +102,26 @@ Notes:
 
 ## 6. Check it works
 
+From the repository root, install the test dependencies with the same
+Python environment used for PyTorch and the build (`PTSYCL_PYTHON`):
+
 ```bash
-python tests/run_all.py                 # paras:0 (first GPU if visible; otherwise CPU)
-python tests/run_all.py --all-devices   # every device, GPUs included
+"$PTSYCL_PYTHON" -m pip install -r requirements-test.txt
+"$PTSYCL_PYTHON" tests/run_all.py                 # paras:0 (first GPU if visible; otherwise CPU)
+"$PTSYCL_PYTHON" tests/run_all.py --all-devices   # every device, GPUs included
 ```
+
+CLAP tests require a build with `PTSYCL_ENABLE_CLAP=ON` and a CLAP
+installation, for example:
+
+```bash
+export CLAP_HOME=/opt/clap/install
+PTSYCL_ENABLE_CLAP=ON scripts/build.sh cuda
+```
+
+Make the vendor libraries (oneDNN for CPU, cuDNN for NVIDIA) available on
+`LD_LIBRARY_PATH`. See [Testing](TESTING.md) for focused CLAP and fast-build
+checks and the current activation limits.
 
 In a GPU-enabled build with `N` visible GPUs, `paras:0` through
 `paras:N-1` are GPUs and `paras:N` is the host CPU. With no visible GPUs,

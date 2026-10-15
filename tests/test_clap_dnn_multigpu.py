@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 import torch_paras
 
+from clap_result import RESULT_MARKER, assert_clap_result
+
 
 def gpu_devices() -> list[str]:
     return [
@@ -307,11 +309,13 @@ def test_clap_dnn_backend_override_validation(
     matching_cli = "-cuda" if is_gpu else "-cpu"
 
     code = (
-        "import torch, torch_paras; "
+        "import json, torch, torch_paras; "
         f"x = torch.ones((2, 4), dtype=torch.float32, device={device!r}); "
         "torch_paras._C.clap_dnn_reset_stats(); "
         "y = torch.sigmoid(x).cpu(); "
-        "print(f'{torch_paras._C.clap_dnn_call_count()},{torch_paras._C.clap_dnn_fallback_count()}')"
+        f"print({RESULT_MARKER!r} + json.dumps({{"
+        "'calls': torch_paras._C.clap_dnn_call_count(), "
+        "'fallbacks': torch_paras._C.clap_dnn_fallback_count()}), flush=True)"
     )
 
     env = dict(os.environ)
@@ -322,15 +326,15 @@ def test_clap_dnn_backend_override_validation(
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
-    assert res_mismatch.stdout.strip().endswith("0,1")
+    assert_clap_result(res_mismatch, 0, 1)
 
     res_match = subprocess.run(
         [sys.executable, "-c", code, matching_cli],
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
-    assert res_match.stdout.strip().endswith("1,0")
+    assert_clap_result(res_match, 1, 0)

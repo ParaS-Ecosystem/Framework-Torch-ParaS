@@ -95,12 +95,13 @@ set(PTSYCL_SOURCES
     csrc/core/allocator.cpp
     csrc/core/registration.cpp
     csrc/ops/tensor_ops.cpp
+    # Python exposes CLAP status/stats even in fast builds and with CLAP disabled.
+    csrc/ops/clap_dnn_adapter.cpp
     csrc/python/module.cpp
 )
 if(NOT PTSYCL_FAST_BUILD)
     list(APPEND PTSYCL_SOURCES
     csrc/ops/pointwise_ops.cpp
-    csrc/ops/clap_dnn_adapter.cpp
     csrc/ops/scatter_ops.cpp
     csrc/ops/indexing_ops.cpp
     csrc/ops/fused_ops.cpp

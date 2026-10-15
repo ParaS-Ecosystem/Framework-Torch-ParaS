@@ -1,16 +1,19 @@
 # Testing torch-paras
 
-The suite lives in `tests/` and needs nothing beyond the built package
-(no pytest). Every test compares the backend against native CPU PyTorch.
+The suite lives in `tests/` and requires the built package and the dependencies
+in `requirements-test.txt`, including pytest. Operator tests compare the
+backend against native CPU PyTorch.
 
 ## Running
 
 ```bash
 source scripts/env.sh
 
-python tests/run_all.py                    # paras:0 (first GPU if visible, otherwise CPU)
-python tests/run_all.py --device paras:0   # first visible GPU in a GPU build
-python tests/run_all.py --all-devices      # every enumerated device
+# Use the same Python environment as PyTorch and the extension build.
+"$PTSYCL_PYTHON" -m pip install -r requirements-test.txt
+"$PTSYCL_PYTHON" tests/run_all.py                    # paras:0 (first GPU if visible, otherwise CPU)
+"$PTSYCL_PYTHON" tests/run_all.py --device paras:0   # first visible GPU in a GPU build
+"$PTSYCL_PYTHON" tests/run_all.py --all-devices      # every enumerated device
 ```
 
 In a GPU-enabled build with `N` visible GPUs, `paras:0` through
@@ -19,6 +22,60 @@ visible (including a CPU-only build), the host CPU is `paras:0`.
 
 The exit code is the number of failed tests, so it slots into CI as is.
 `TORCH_PARAS_DEVICE` selects the device when you run a module directly.
+
+## CLAP activation checks
+
+Build with `PTSYCL_ENABLE_CLAP=ON` (default: OFF), set `CLAP_HOME` to your
+CLAP installation, and make the vendor libraries available on
+`LD_LIBRARY_PATH`:
+
+```bash
+PTSYCL_ENABLE_CLAP=ON scripts/build.sh cuda
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+CLAP_DNN_VERBOSE=1 "$PTSYCL_PYTHON" -m pytest -q tests/test_clap_dnn_multigpu.py
+env -u CLAP_DNN_VERBOSE "$PTSYCL_PYTHON" -m pytest -q tests/test_clap_dnn_multigpu.py
+"$PTSYCL_PYTHON" -m pytest -q tests/test_clap_result.py
+```
+
+The result-parser checks need only pytest. They cover vendor logs before
+and after the marked JSON result, missing/malformed/repeated results,
+incorrect counts, and subprocess failures. Setting `CLAP_DNN_VERBOSE=0`
+still enables logging in runtimes that check for the variable's presence;
+unset it for the quiet check.
+
+Current limits remain:
+
+- CPU Float32 and BFloat16 activations use oneDNN. CPU Float16 Sigmoid and
+  SiLU (functional, out, and inplace) raise the expected unsupported
+  datatype/layout error on the tested Xeon/oneDNN setup. Passing that
+  error check does not mean CPU Float16 is supported.
+- Scalar, empty, Float64, and strided inputs use the ParaS fallback.
+  Contiguous CUDA tensors with rank above eight raise a cuDNN error.
+- Backend overrides must match the tensor device. Conflicting
+  `CLAP_BACKEND` and command-line flags can select the fallback even when
+  the environment setting matches; option precedence is unchanged.
+
+## Build smoke check
+
+`tests/smoke_build.py` checks package import, the CLAP enable status and
+all stats bindings, and a CPU → ParaS → CPU tensor copy. It works with
+`PTSYCL_FAST_BUILD=ON`, which omits activation operator registrations.
+Run it in fresh processes for both CLAP ON and OFF builds:
+
+```bash
+"$PTSYCL_PYTHON" tests/smoke_build.py --package-root build/fast-on-package --expect-clap on
+"$PTSYCL_PYTHON" tests/smoke_build.py --package-root build/fast-off-package --expect-clap off
+```
+
+Each command must point to the corresponding build's package. For separate
+CMake build trees (`cmake -S . -B <build-dir>`), copy `python/torch_paras`
+into separate package directories (such as `build/fast-on-package` and
+`build/fast-off-package`) and replace each `_C.so` with its build tree's
+`lib/_C.so`. Pass `--package-root <package-dir>` to check that exact package
+without overwriting another build. Configure each tree with the toolchain
+arguments used by `scripts/build.sh`, `-DPTSYCL_FAST_BUILD=ON`, and the
+appropriate `-DPTSYCL_ENABLE_CLAP=ON` or `OFF`. Build serially (`-j1`),
+waiting for each build to finish before starting another.
 
 ## What is covered
 
@@ -44,6 +101,8 @@ The exit code is the number of failed tests, so it slots into CI as is.
   argsort, and creation ops (zeros/ones/full, `*_like`, arange).
 - `test_param2_17b.py` — model-level check for the Param2 profiling
   workload.
+- `test_clap_dnn_multigpu.py` — vendor call counts, interleaved GPU calls,
+  CPU dtype limits, input fallbacks, and backend overrides.
 
 See `docs/OPERATOR_COVERAGE.md` for which native kernels still lack a
 parity test.
