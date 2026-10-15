@@ -12,6 +12,9 @@
 
 #include "core/kernels.h"
 
+#include <atomic>
+#include <mutex>
+
 #ifdef USE_CLAP_BACKEND
 
 #include <clap/dnn_factory.hpp>
@@ -23,6 +26,7 @@
 #endif
 
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +35,52 @@
 
 
 namespace ptsycl::clap_dnn {
+
+namespace {
+
+std::atomic<std::int64_t> g_total_calls{0};
+std::atomic<std::int64_t> g_cpu_calls{0};
+std::atomic<std::int64_t> g_cuda_calls{0};
+std::atomic<std::int64_t> g_rocm_calls{0};
+std::atomic<std::int64_t> g_fallback_calls{0};
+
+std::mutex g_last_backend_mutex;
+std::string g_last_backend;
+
+void record_clap_execution(
+    const char* backend_name,
+    int backend_kind) noexcept
+{
+    g_total_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (backend_kind == 0) {
+        g_cpu_calls.fetch_add(1, std::memory_order_relaxed);
+    } else if (backend_kind == 1) {
+        g_cuda_calls.fetch_add(1, std::memory_order_relaxed);
+    } else if (backend_kind == 2) {
+        g_rocm_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (backend_name != nullptr) {
+        std::lock_guard<std::mutex> lock(g_last_backend_mutex);
+        g_last_backend = backend_name;
+    }
+}
+
+void record_fallback() noexcept
+{
+    g_fallback_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void sync_all_devices_noexcept() noexcept
+{
+    try {
+        ptsycl::Context::instance().synchronize_all();
+    } catch (...) {
+    }
+}
+
+} // namespace
 
 #ifdef USE_CLAP_BACKEND
 
@@ -72,8 +122,6 @@ public:
     ~CudaDeviceGuard() noexcept
     {
         if (restore_) {
-            // Restore the calling thread's CUDA device on both
-            // normal completion and exception unwinding.
             (void)cudaSetDevice(previous_device_);
         }
     }
@@ -145,33 +193,124 @@ bool select_backend(
 }
 
 
+bool override_matches_requested(
+    clap::DnnBackendType override_backend,
+    clap::DnnBackendType requested) noexcept
+{
+    switch (override_backend) {
+
+        case clap::DnnBackendType::CPU:
+            return requested == clap::DnnBackendType::CPU;
+
+        case clap::DnnBackendType::CUDA:
+            return requested == clap::DnnBackendType::CUDA;
+
+        case clap::DnnBackendType::ROCM:
+            return requested == clap::DnnBackendType::ROCM;
+
+        case clap::DnnBackendType::GPU:
+            return requested == clap::DnnBackendType::CUDA ||
+                   requested == clap::DnnBackendType::ROCM;
+    }
+
+    return false;
+}
+
+
+bool parse_env_backend(
+    const std::string& backend,
+    clap::DnnBackendType& parsed) noexcept
+{
+    if (backend == "CPU") {
+        parsed = clap::DnnBackendType::CPU;
+        return true;
+    }
+
+    if (backend == "CUDA") {
+        parsed = clap::DnnBackendType::CUDA;
+        return true;
+    }
+
+    if (backend == "ROCM" || backend == "AMD") {
+        parsed = clap::DnnBackendType::ROCM;
+        return true;
+    }
+
+    if (backend == "GPU") {
+        parsed = clap::DnnBackendType::GPU;
+        return true;
+    }
+
+    return false;
+}
+
+
+bool parse_cmdline_backend_arg(
+    const std::string& arg,
+    clap::DnnBackendType& parsed) noexcept
+{
+    if (arg == "-cuda" || arg == "--cuda") {
+        parsed = clap::DnnBackendType::CUDA;
+        return true;
+    }
+
+    if (arg == "-rocm" || arg == "--rocm" ||
+        arg == "-amd" || arg == "--amd") {
+        parsed = clap::DnnBackendType::ROCM;
+        return true;
+    }
+
+    if (arg == "-cpu" || arg == "--cpu") {
+        parsed = clap::DnnBackendType::CPU;
+        return true;
+    }
+
+    if (arg == "-gpu" || arg == "--gpu") {
+        parsed = clap::DnnBackendType::GPU;
+        return true;
+    }
+
+    return false;
+}
+
+
+bool cmdline_override_matches(
+    clap::DnnBackendType requested)
+{
+    std::ifstream cmdline("/proc/self/cmdline", std::ios::in | std::ios::binary);
+
+    if (!cmdline.is_open())
+        return true;
+
+    std::string arg;
+
+    while (std::getline(cmdline, arg, '\0')) {
+        clap::DnnBackendType cli_backend{};
+        if (parse_cmdline_backend_arg(arg, cli_backend)) {
+            return override_matches_requested(cli_backend, requested);
+        }
+    }
+
+    return true;
+}
+
+
 bool backend_override_matches(
     clap::DnnBackendType requested)
 {
     const char* value = std::getenv("CLAP_BACKEND");
 
-    if (value == nullptr || *value == '\0')
-        return true;
+    if (value != nullptr && *value != '\0') {
+        clap::DnnBackendType env_backend{};
 
-    const std::string backend(value);
+        if (!parse_env_backend(std::string(value), env_backend))
+            return false;
 
-    switch (requested) {
-
-        case clap::DnnBackendType::CPU:
-            return backend == "CPU";
-
-        case clap::DnnBackendType::CUDA:
-            return backend == "CUDA";
-
-        case clap::DnnBackendType::ROCM:
-            return backend == "ROCM" ||
-                   backend == "AMD";
-
-        case clap::DnnBackendType::GPU:
-            return backend == "GPU";
+        if (!override_matches_requested(env_backend, requested))
+            return false;
     }
 
-    return false;
+    return cmdline_override_matches(requested);
 }
 
 
@@ -187,19 +326,23 @@ clap::IDnnBackend& backend_for(
     thread_local Cache cache;
 
     std::unique_ptr<clap::IDnnBackend>* slot = nullptr;
+    clap::ExecutionBackend expected_exec = clap::ExecutionBackend::CPU;
 
     switch (requested) {
 
         case clap::DnnBackendType::CPU:
             slot = &cache.cpu;
+            expected_exec = clap::ExecutionBackend::CPU;
             break;
 
         case clap::DnnBackendType::CUDA:
             slot = &cache.cuda;
+            expected_exec = clap::ExecutionBackend::CUDA;
             break;
 
         case clap::DnnBackendType::ROCM:
             slot = &cache.rocm;
+            expected_exec = clap::ExecutionBackend::ROCM;
             break;
 
         case clap::DnnBackendType::GPU:
@@ -214,6 +357,14 @@ clap::IDnnBackend& backend_for(
     TORCH_CHECK(
         *slot,
         "CLAP-DNN backend creation failed");
+
+    if ((*slot)->executionBackend() != expected_exec) {
+        slot->reset();
+        TORCH_CHECK(
+            false,
+            "Torch-ParaS CLAP-DNN backend mismatch for tensor device: expected ",
+            clap::executionBackendName(expected_exec));
+    }
 
     return **slot;
 }
@@ -248,18 +399,6 @@ bool try_activation_forward(
     at::Tensor& out,
     clap::ActivationMode mode)
 {
-    /*
-     * CLAP receives the actual Torch-ParaS device pointers.
-     *
-     * No:
-     *   GPU -> CPU copy
-     *   CPU temporary
-     *   CPU -> GPU copy
-     *
-     * The vendor operation is submitted onto the same native stream
-     * backing the ParaS SYCL queue.
-     */
-
     if (self.numel() == 0 ||
         self.numel() != out.numel() ||
         self.sizes() != out.sizes() ||
@@ -269,19 +408,23 @@ bool try_activation_forward(
         !out.is_contiguous() ||
         self.dim() == 0) {
 
+        record_fallback();
         return false;
     }
 
     clap::DataType dtype;
 
-    if (!map_dtype(self.scalar_type(), dtype))
+    if (!map_dtype(self.scalar_type(), dtype)) {
+        record_fallback();
         return false;
+    }
 
     clap::DnnBackendType requested;
 
     if (!select_backend(out, requested) ||
         !backend_override_matches(requested)) {
 
+        record_fallback();
         return false;
     }
 
@@ -304,9 +447,6 @@ bool try_activation_forward(
     const void* input_ptr = self.data_ptr();
     void* output_ptr = out.data_ptr();
 
-    /*
-     * CPU ParaS path.
-     */
     if (requested == clap::DnnBackendType::CPU) {
 
         const auto ctx =
@@ -320,6 +460,7 @@ bool try_activation_forward(
             output_ptr,
             ctx);
 
+        record_clap_execution(backend.name(), 0);
         return true;
     }
 
@@ -373,6 +514,8 @@ bool try_activation_forward(
                     tensor_desc,
                     output_ptr,
                     ctx);
+
+                record_clap_execution(backend_ptr->name(), 1);
             });
 
         return true;
@@ -414,6 +557,8 @@ bool try_activation_forward(
                     tensor_desc,
                     output_ptr,
                     ctx);
+
+                record_clap_execution(backend_ptr->name(), 2);
             });
 
         return true;
@@ -421,6 +566,7 @@ bool try_activation_forward(
 
 #endif
 
+    record_fallback();
     return false;
 }
 
@@ -446,6 +592,7 @@ bool try_sigmoid_forward(
     (void)self;
     (void)out;
 
+    record_fallback();
     return false;
 
 #endif
@@ -468,9 +615,71 @@ bool try_silu_forward(
     (void)self;
     (void)out;
 
+    record_fallback();
     return false;
 
 #endif
+}
+
+
+bool is_enabled() noexcept
+{
+#ifdef USE_CLAP_BACKEND
+    return true;
+#else
+    return false;
+#endif
+}
+
+
+void reset_stats() noexcept
+{
+    sync_all_devices_noexcept();
+    g_total_calls.store(0, std::memory_order_relaxed);
+    g_cpu_calls.store(0, std::memory_order_relaxed);
+    g_cuda_calls.store(0, std::memory_order_relaxed);
+    g_rocm_calls.store(0, std::memory_order_relaxed);
+    g_fallback_calls.store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_last_backend_mutex);
+    g_last_backend.clear();
+}
+
+
+std::int64_t call_count() noexcept
+{
+    sync_all_devices_noexcept();
+    return g_total_calls.load(std::memory_order_relaxed);
+}
+
+
+std::int64_t backend_call_count(const std::string& backend) noexcept
+{
+    sync_all_devices_noexcept();
+    if (backend == "CPU" || backend == "oneDNN") {
+        return g_cpu_calls.load(std::memory_order_relaxed);
+    }
+    if (backend == "CUDA" || backend == "cuDNN") {
+        return g_cuda_calls.load(std::memory_order_relaxed);
+    }
+    if (backend == "ROCM" || backend == "AMD" || backend == "MIOpen") {
+        return g_rocm_calls.load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+
+std::int64_t fallback_count() noexcept
+{
+    sync_all_devices_noexcept();
+    return g_fallback_calls.load(std::memory_order_relaxed);
+}
+
+
+std::string last_backend_name()
+{
+    sync_all_devices_noexcept();
+    std::lock_guard<std::mutex> lock(g_last_backend_mutex);
+    return g_last_backend;
 }
 
 

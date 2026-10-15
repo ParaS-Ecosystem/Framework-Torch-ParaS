@@ -1,6 +1,7 @@
 import os
 import sys
 import traceback
+import unittest
 
 import torch
 
@@ -42,19 +43,25 @@ def check_op(name: str, ref_fn, dev_fn):
         assert_close(out, ref, name)
 
 
-def run_module(module, device: str) -> tuple[int, int]:
-    """Runs every test_* function in ``module``; returns (passed, failed)."""
+def run_module(module, device: str) -> tuple[int, int, int]:
+    """Runs every test_* function; returns (passed, failed, skipped)."""
     tests = [(n, f) for n, f in vars(module).items()
              if n.startswith("test_") and callable(f)]
-    passed = failed = 0
+
+    passed = failed = skipped = 0
+
     for name, fn in tests:
         try:
             torch.manual_seed(0)
             fn(device)
             passed += 1
             print(f"  PASS  {name}")
+        except unittest.SkipTest as exc:
+            skipped += 1
+            print(f"  SKIP  {name}: {exc}")
         except Exception:
             failed += 1
             print(f"  FAIL  {name}")
             traceback.print_exc(limit=4, file=sys.stdout)
-    return passed, failed
+
+    return passed, failed, skipped
