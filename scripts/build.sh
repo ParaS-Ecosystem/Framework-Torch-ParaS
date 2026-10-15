@@ -6,6 +6,11 @@ BUILD_TYPE="${2:-Release}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/env.sh"
 
+PTSYCL_ENABLE_CLAP="${PTSYCL_ENABLE_CLAP:-OFF}"
+PTSYCL_ENABLE_CLAP_BLAS="${PTSYCL_ENABLE_CLAP_BLAS:-OFF}"
+PTSYCL_CLAP_ROOT="${PTSYCL_CLAP_ROOT:-${CLAP_HOME:-}}"
+PTSYCL_PARAS_RUNTIME_DIR="${PTSYCL_PARAS_RUNTIME_DIR:-}"
+
 case "${FLAVOR}" in
     cpu)  DEVICE="cpu" ;;
     cuda) DEVICE="sycl:${PTSYCL_CUDA_ARCH:-cuda:sm_70}" ;;
@@ -49,10 +54,8 @@ if ! command -v "${CMAKE_BIN}" >/dev/null 2>&1; then
     exit 1
 fi
 
-# NOTE: PTSYCL_CUDA_HOME / PTSYCL_ROCM_HOME are intentionally NOT passed
-# to cmake anymore -- CMakeLists.txt no longer declares those cache vars
-# or links against the raw CUDA/HIP SDKs. Device access under
-# PTSYCL_BACKEND_SYCL goes exclusively through parascc/PARAS_HOME.
+# Forward optional backend/integration settings explicitly so environment
+# configuration is reflected in the CMake cache.
 "${CMAKE_BIN}" -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DCMAKE_CXX_COMPILER="${PARAS_HOME}/bin/parascc" \
@@ -61,6 +64,11 @@ fi
     -DPTSYCL_TORCH_DIR="${PTSYCL_TORCH_DIR}" \
     -DPARAS_HOME="${PARAS_HOME}" \
     -DPTSYCL_FAST_BUILD="${PTSYCL_FAST_BUILD:-OFF}" \
+    -DPTSYCL_ENABLE_CLAP="${PTSYCL_ENABLE_CLAP}" \
+    -DPTSYCL_ENABLE_CLAP_BLAS="${PTSYCL_ENABLE_CLAP_BLAS}" \
+    -DPTSYCL_CLAP_ROOT="${PTSYCL_CLAP_ROOT}" \
+    -DPTSYCL_PARAS_RUNTIME_DIR="${PTSYCL_PARAS_RUNTIME_DIR}" \
+    -DPTSYCL_CUDA_HOME="${PTSYCL_CUDA_HOME:-}" \
     -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
 
 # parascc names its /tmp intermediates with second resolution; parallel

@@ -24,6 +24,7 @@
 
 #include "core/common.h"
 #include "core/allocator.h"
+#include "ops/clap_dnn_adapter.h"
 
 namespace py = pybind11;
 
@@ -75,4 +76,33 @@ PYBIND11_MODULE(_C, m) {
     });
 
     m.def("is_bad_fork", [] { return ptsycl::Context::bad_fork(); });
+
+    m.def("clap_dnn_enabled", [] {
+        return ptsycl::clap_dnn::is_enabled();
+    });
+
+    m.def("clap_dnn_reset_stats", [] {
+        py::gil_scoped_release no_gil;
+        ptsycl::clap_dnn::reset_stats();
+    });
+
+    m.def("clap_dnn_call_count", [] {
+        py::gil_scoped_release no_gil;
+        return ptsycl::clap_dnn::call_count();
+    });
+
+    m.def("clap_dnn_backend_call_count", [](const std::string& backend) {
+        py::gil_scoped_release no_gil;
+        return ptsycl::clap_dnn::backend_call_count(backend);
+    });
+
+    m.def("clap_dnn_fallback_count", [] {
+        py::gil_scoped_release no_gil;
+        return ptsycl::clap_dnn::fallback_count();
+    });
+
+    m.def("clap_dnn_last_backend", [] {
+        py::gil_scoped_release no_gil;
+        return ptsycl::clap_dnn::last_backend_name();
+    });
 }

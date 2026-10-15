@@ -31,23 +31,25 @@ MODULES = [
     "test_random_ops",
     "test_vision_ops",
     "test_attention_norm_ops",
-    "test_matmul_sort_creation_ops"
+    "test_matmul_sort_creation_ops",
+    "test_clap_dnn_multigpu",
 ]
 
 
-def run_device(device: str) -> tuple[int, int]:
+def run_device(device: str) -> tuple[int, int, int]:
     print(f"\n{'=' * 60}")
     print(f"Device {device}: {torch_paras.device_name(int(device.split(':')[1]))}")
     print(f"Backend flavor: {torch_paras.backend_name()}")
     print("=" * 60)
-    total_pass = total_fail = 0
+    total_pass = total_fail = total_skip = 0
     for name in MODULES:
         print(f"\n[{name}]")
         mod = importlib.import_module(name)
-        p, f = run_module(mod, device)
+        p, f, sk = run_module(mod, device)
         total_pass += p
         total_fail += f
-    return total_pass, total_fail
+        total_skip += sk
+    return total_pass, total_fail, total_skip
 
 
 def main() -> int:
@@ -62,14 +64,16 @@ def main() -> int:
         devices = [args.device or target_device()]
 
     start = time.time()
-    total_pass = total_fail = 0
+    total_pass = total_fail = total_skip = 0
     for dev in devices:
-        p, f = run_device(dev)
+        p, f, sk = run_device(dev)
         total_pass += p
         total_fail += f
+        total_skip += sk
 
     print(f"\n{'=' * 60}")
-    print(f"RESULTS: {total_pass} passed, {total_fail} failed "
+    print(f"RESULTS: {total_pass} passed, {total_fail} failed, "
+          f"{total_skip} skipped "
           f"({time.time() - start:.1f}s, devices: {', '.join(devices)})")
     print("=" * 60)
     return total_fail
