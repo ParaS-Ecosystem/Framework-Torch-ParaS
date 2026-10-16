@@ -86,20 +86,20 @@ Tensor full_like(const Tensor& self, const at::Scalar& fill_value,
 }
 
 // arange.start_step(Scalar start, Scalar end, Scalar step=1, ...) -> Tensor
-// Built on host (the range is a tiny CPU-side computation regardless of
-// output device) then a single copy_ moves it to the target device --
-// reuses whatever copy_ this backend already has rather than writing a
-// third arithmetic-progression kernel.
 Tensor arange(const at::Scalar& start, const at::Scalar& end, const at::Scalar& step,
               c10::optional<c10::ScalarType> dtype, c10::optional<c10::Layout> layout,
-              c10::optional<c10::Device> device, c10::optional<bool> pin_memory) {
+              c10::optional<c10::Device> device, c10::optional<bool> ) {
     PTSYCL_TRACE_OP("arange.start_step");
-    Tensor host = at::arange(start, end, step,
-                              dtype.has_value() ? dtype : c10::optional<c10::ScalarType>(),
-                              layout, c10::Device(c10::kCPU), pin_memory);
-    Tensor out = at::empty(host.sizes(), host.options().device(
-        device.has_value() ? *device : c10::Device(c10::DeviceType::PrivateUse1)));
-    out.copy_(host);
+    const bool floating = start.isFloatingPoint() || end.isFloatingPoint() ||
+                          step.isFloatingPoint();
+    const c10::ScalarType st = dtype.has_value()
+        ? *dtype
+        : (floating ? c10::typeMetaToScalarType(c10::get_default_dtype()) : c10::kLong);
+    Tensor out = at::empty({0}, at::TensorOptions()
+        .dtype(st)
+        .layout(layout.value_or(c10::kStrided))
+        .device(device.has_value() ? *device : c10::Device(c10::DeviceType::PrivateUse1)));
+    at::arange_out(out, start, end, step);
     return out;
 }
 

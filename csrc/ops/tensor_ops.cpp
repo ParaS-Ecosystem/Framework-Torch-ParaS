@@ -24,6 +24,7 @@
 
 #include "core/allocator.h"
 #include "core/kernels.h"
+#include "core/telemetry.h"
 
 namespace ptsycl {
 namespace {
@@ -129,7 +130,7 @@ Tensor as_strided(const Tensor& self, c10::IntArrayRef size,
 
 // Gathers a strided tensor into a contiguous buffer (same dtype).
 void device_gather_contiguous(compat::Queue& q, const Tensor& src, void* dst) {
-    const auto spec = make_spec(src);
+    const auto spec = make_flat_spec(src);
     const int64_t n = src.numel();
     switch (src.scalar_type()) {
 #define CASE(T, ST)                                                           \
@@ -151,7 +152,7 @@ void device_gather_contiguous(compat::Queue& q, const Tensor& src, void* dst) {
 
 // Scatters a contiguous buffer into a strided tensor (same dtype).
 void device_scatter_strided(compat::Queue& q, const void* src, Tensor& dst) {
-    const auto spec = make_spec(dst);
+    const auto spec = make_flat_spec(dst);
     const int64_t n = dst.numel();
     switch (dst.scalar_type()) {
 #define CASE(T, ST)                                                           \
@@ -233,6 +234,11 @@ void device_to_device_copy(const Tensor& src, Tensor& dst) {
     if (!src_contig) device_gather_contiguous(q, src, src_c.data_ptr());
 
    
+    if (!same_type && dst_contig) {
+        device_convert(q, src_c, dst);
+        return;
+    }
+
     Tensor conv = src_c;
     if (!same_type) {
         conv = new_paras_tensor(dst.sizes(), dst.device(), dst.scalar_type());
@@ -259,6 +265,9 @@ Tensor _copy_from(const Tensor& self, const Tensor& dst, bool non_blocking) {
     // paras -> CPU
     if (src_paras && dst.device().is_cpu()) {
         auto& q = queue_for(self);
+        telemetry::record_transfer(telemetry::Transfer::DeviceToHost,
+                                   static_cast<std::size_t>(self.numel()) *
+                                       dst.element_size());
        
         Tensor staged = self;
         if (!self.is_contiguous() || self.scalar_type() != dst.scalar_type()) {
@@ -286,6 +295,9 @@ Tensor _copy_from(const Tensor& self, const Tensor& dst, bool non_blocking) {
     // CPU -> paras
     if (self.device().is_cpu() && dst_paras) {
         auto& q = queue_for(dst);
+        telemetry::record_transfer(telemetry::Transfer::HostToDevice,
+                                   static_cast<std::size_t>(self.numel()) *
+                                       dst.element_size());
         Tensor src_c = self;
         if (!self.is_contiguous() || self.scalar_type() != dst.scalar_type()) {
             src_c = self.to(dst.scalar_type()).contiguous();
@@ -321,7 +333,6 @@ Tensor _copy_from(const Tensor& self, const Tensor& dst, bool non_blocking) {
             return self;
         }
         device_to_device_copy(self, const_cast<Tensor&>(dst));
-        if (!non_blocking) queue_for(dst).synchronize();
         return self;
     }
 
@@ -353,7 +364,7 @@ Tensor& fill_(Tensor& self, const c10::Scalar& value) {
             if (self.is_contiguous()) {
                 launch_flat(q, n, [=](std::size_t i) { d[i] = val; });
             } else {
-                const auto spec = make_spec(self);
+                const auto spec = make_flat_spec(self);
                 launch_flat(q, n, [=](std::size_t i) {
                     d[spec.index(static_cast<int64_t>(i))] = val;
                 });
@@ -381,12 +392,12 @@ c10::Scalar _local_scalar_dense(const Tensor& self) {
     TORCH_CHECK(self.numel() == 1,
                 "_local_scalar_dense expects a single-element tensor");
     auto& q = queue_for(self);
-    q.synchronize(); // order after pending kernels before host read
+    telemetry::record_scalar_read();
 
     switch (self.scalar_type()) {
 #define CASE(T, ST)                                                           \
     case ST:                                                                  \
-        return c10::Scalar(*data_ptr<T>(self));
+        return c10::Scalar(read_scalar(q, data_ptr<T>(self)));
         PTSYCL_COPY_TYPES(CASE)
 #undef CASE
         default:
@@ -524,32 +535,31 @@ Tensor embedding_dense_backward(const Tensor& grad_output,
     Tensor grad_weight = at::zeros({num_weights, dim}, go.options());
     if (n == 0 || dim == 0 || num_weights == 0) return grad_weight;
 
+    const Tensor flat_idx = idx.reshape({n});
+    const Tensor order = at::argsort(flat_idx, true);
+    const Tensor sorted = flat_idx.index_select(0, order).contiguous();
+    const Tensor go2 = go.reshape({n, dim});
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, go.scalar_type(),
         "ptsycl_embedding_backward", [&] {
-            const scalar_t* pg = data_ptr<scalar_t>(go);
-            const int64_t*  pi = data_ptr<int64_t>(idx);
+            const scalar_t* pg = data_ptr<scalar_t>(go2);
+            const int64_t*  ps = data_ptr<int64_t>(sorted);
+            const int64_t*  po = data_ptr<int64_t>(order);
             scalar_t*       pw = data_ptr<scalar_t>(grad_weight);
 
-            launch_flat(q, num_weights, [=](std::size_t flat) {
-                const int64_t w = static_cast<int64_t>(flat);
-                if (w == padding_idx) return;
-
-                int64_t count = 0;
-                for (int64_t i = 0; i < n; ++i)
-                    if (pi[i] == w) ++count;
-                if (count == 0) return;
-
+            launch_flat(q, n * dim, [=](std::size_t t) {
+                const int64_t i = static_cast<int64_t>(t) / dim;
+                const int64_t col = static_cast<int64_t>(t) % dim;
+                const int64_t w = ps[i];
+                if ((i > 0 && ps[i - 1] == w) || w == padding_idx) return;
+                double acc = 0.0;
+                int64_t j = i;
+                for (; j < n && ps[j] == w; ++j)
+                    acc += static_cast<double>(pg[po[j] * dim + col]);
                 const double scale =
-                    scale_grad_by_freq ? 1.0 / static_cast<double>(count)
-                                       : 1.0;
-                for (int64_t col = 0; col < dim; ++col) {
-                    double acc = 0.0;
-                    for (int64_t i = 0; i < n; ++i)
-                        if (pi[i] == w)
-                            acc += static_cast<double>(pg[i * dim + col]);
-                    pw[w * dim + col] = static_cast<scalar_t>(acc * scale);
-                }
+                    scale_grad_by_freq ? 1.0 / static_cast<double>(j - i) : 1.0;
+                pw[w * dim + col] = static_cast<scalar_t>(acc * scale);
             });
         });
     return grad_weight;
@@ -659,119 +669,6 @@ Tensor narrow(const Tensor& self, int64_t dim, c10::SymInt start_sym, c10::SymIn
     new_sizes[d] = length;
     const int64_t new_offset = self.storage_offset() + start * self.stride(d);
     return ptsycl::as_strided(self, new_sizes, self.strides(), new_offset);
-}
-
-Tensor contiguous(const Tensor& self, c10::MemoryFormat memory_format) {
-    PTSYCL_TRACE_OP("contiguous");
-    TORCH_CHECK(memory_format == c10::MemoryFormat::Contiguous,
-                "paras contiguous supports only Contiguous memory format");
-    if (self.is_contiguous(memory_format)) return self;
-    Tensor result = ptsycl::allocate_empty(self.sizes(), self.scalar_type(),
-                                           c10::kStrided, self.device(),
-                                           std::nullopt, std::nullopt);
-    ptsycl::_copy_from(self, result, /*non_blocking=*/false);
-    return result;
-}
-
-Tensor reshape(const Tensor& self, c10::SymIntArrayRef shape_sym) {
-    PTSYCL_TRACE_OP("reshape");
-    const auto shape = c10::asIntArrayRefUnchecked(shape_sym);
-    auto inferred = at::infer_size_dv(shape, self.numel());
-    auto stride = at::detail::computeStride(self.sizes(), self.strides(), inferred);
-    if (stride.has_value()) {
-        return ptsycl::view(self, inferred);
-    }
-    return ptsycl::view(ptsycl::contiguous(self, c10::MemoryFormat::Contiguous), inferred);
-}
-
-Tensor repeat_interleave_int(const Tensor& self, c10::SymInt repeats_sym,
-                             std::optional<int64_t> dim,
-                             std::optional<c10::SymInt> /*output_size*/) {
-    PTSYCL_TRACE_OP("repeat_interleave.self_int");
-    const int64_t repeats = repeats_sym.expect_int();
-    TORCH_CHECK(repeats >= 0, "repeat_interleave: repeats must be non-negative");
-
-    Tensor src = self;
-    int64_t d = 0;
-    if (!dim.has_value()) {
-        src = ptsycl::reshape(self, {self.numel()});
-        d = 0;
-    } else {
-        d = c10::maybe_wrap_dim(*dim, self.dim());
-    }
-
-    const int64_t size_at_d = src.size(d);
-    std::vector<int64_t> target_sizes = src.sizes().vec();
-    target_sizes[d] = size_at_d * repeats;
-
-    if (repeats == 0 || src.numel() == 0) {
-        return ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
-    }
-
-    std::vector<int64_t> exp_sizes;
-    std::vector<int64_t> exp_strides;
-    for (int64_t i = 0; i < src.dim(); ++i) {
-        if (i == d) {
-            exp_sizes.push_back(size_at_d);
-            exp_sizes.push_back(repeats);
-            exp_strides.push_back(src.stride(i));
-            exp_strides.push_back(0);
-        } else {
-            exp_sizes.push_back(src.size(i));
-            exp_strides.push_back(src.stride(i));
-        }
-    }
-
-    Tensor expanded = ptsycl::as_strided(src, exp_sizes, exp_strides, src.storage_offset());
-    Tensor out = ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
-    ptsycl::_copy_from(expanded, out, /*non_blocking=*/false);
-    return out;
-}
-
-Tensor repeat_interleave_tensor(const Tensor& self, const Tensor& repeats,
-                                std::optional<int64_t> dim,
-                                std::optional<c10::SymInt> /*output_size*/) {
-    PTSYCL_TRACE_OP("repeat_interleave.self_Tensor");
-    Tensor rep = repeats.to(c10::kCPU).to(c10::kLong).contiguous();
-    const int64_t n_rep = rep.numel();
-
-    Tensor src = self;
-    int64_t d = 0;
-    if (!dim.has_value()) {
-        src = ptsycl::reshape(self, {self.numel()});
-        d = 0;
-    } else {
-        d = c10::maybe_wrap_dim(*dim, self.dim());
-    }
-
-    TORCH_CHECK(n_rep == src.size(d), "repeat_interleave: repeats length does not match dim size");
-    const int64_t* p_rep = rep.data_ptr<int64_t>();
-
-    int64_t total_out_dim = 0;
-    std::vector<int64_t> offsets(n_rep + 1, 0);
-    for (int64_t i = 0; i < n_rep; ++i) {
-        TORCH_CHECK(p_rep[i] >= 0, "repeat_interleave: repeats must be non-negative");
-        offsets[i] = total_out_dim;
-        total_out_dim += p_rep[i];
-    }
-    offsets[n_rep] = total_out_dim;
-
-    std::vector<int64_t> target_sizes = src.sizes().vec();
-    target_sizes[d] = total_out_dim;
-
-    Tensor out = ptsycl::allocate_empty(target_sizes, src.scalar_type(), c10::kStrided, src.device(), std::nullopt, std::nullopt);
-    if (total_out_dim == 0 || src.numel() == 0) return out;
-
-    for (int64_t i = 0; i < n_rep; ++i) {
-        const int64_t count = p_rep[i];
-        if (count > 0) {
-            Tensor src_slice = ptsycl::narrow(src, d, i, 1);
-            Tensor dst_slice = ptsycl::narrow(out, d, offsets[i], count);
-            Tensor rep_src = ptsycl::repeat_interleave_int(src_slice, c10::SymInt(count), d, std::nullopt);
-            ptsycl::_copy_from(rep_src, dst_slice, /*non_blocking=*/false);
-        }
-    }
-    return out;
 }
 
 std::vector<Tensor> split_with_sizes(const Tensor& self, c10::SymIntArrayRef split_sizes_sym, int64_t dim) {
@@ -969,9 +866,16 @@ Tensor _to_copy(
 // Boxed CPU fallback for everything not implemented natively.
 // -----------------------------------------------------------------------------
 void fallback(const c10::OperatorHandle& op, torch::jit::Stack* stack) {
+    const auto& name = op.schema().operator_name();
+    const std::string full =
+        name.overload_name.empty() ? name.name : name.name + "." + name.overload_name;
+    telemetry::record_fallback(full);
+    TORCH_CHECK(!telemetry::strict(),
+                "torch_paras strict mode: ", full, " has no ParaS kernel and "
+                "would run on the CPU fallback (PTSYCL_STRICT / "
+                "torch_paras.set_strict)");
     if (log::level() >= log::kInfo) {
-        PTSYCL_INFO("falling back to CPU for %s",
-                    op.schema().operator_name().name.c_str());
+        PTSYCL_INFO("falling back to CPU for %s", full.c_str());
     }
     at::native::cpu_fallback(op, stack);
 }
@@ -1004,13 +908,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::permute", &ptsycl::permute);
     m.impl("aten::expand", &ptsycl::expand);
     m.impl("aten::repeat", &ptsycl::repeat);
-    m.impl("aten::repeat_interleave.self_int", &ptsycl::repeat_interleave_int);
-    m.impl("aten::repeat_interleave.self_Tensor", &ptsycl::repeat_interleave_tensor);
     m.impl("aten::split.Tensor", &ptsycl::split);
     m.impl("aten::split_with_sizes", &ptsycl::split_with_sizes);
     m.impl("aten::chunk", &ptsycl::chunk);
-    m.impl("aten::contiguous", &ptsycl::contiguous);
-    m.impl("aten::reshape", &ptsycl::reshape);
     m.impl("aten::squeeze", &ptsycl::squeeze_all);
     m.impl("aten::squeeze.dim", &ptsycl::squeeze_dim);
     m.impl("aten::squeeze.dims", &ptsycl::squeeze_dims);

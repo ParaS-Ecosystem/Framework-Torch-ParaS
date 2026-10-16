@@ -18,6 +18,7 @@
 
 
 #include "core/kernels.h"
+#include "core/telemetry.h"
 #include <ATen/ATen.h>
 #include <torch/torch.h>
 
@@ -30,12 +31,17 @@ static Tensor to_cpu(const Tensor& t) {
     return t.contiguous().to(c10::Device(c10::kCPU));
 }
 
+static void upload(const Tensor& cpu_src, const Tensor& dst) {
+    Tensor c = cpu_src.contiguous();
+    telemetry::record_transfer(telemetry::Transfer::HostToDevice,
+                               static_cast<std::size_t>(c.nbytes()));
+    queue_for(dst).copy(dst.data_ptr(), c.data_ptr(),
+                        static_cast<std::size_t>(c.nbytes()), true);
+}
+
 static Tensor to_device(const Tensor& cpu_t, c10::Device dev) {
     Tensor result = at::empty(cpu_t.sizes(), at::device(dev).dtype(cpu_t.scalar_type()));
-    auto& q = queue_for(result);
-    q.copy(result.data_ptr(), cpu_t.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_t.contiguous().nbytes()),
-           /*blocking=*/true);
+    upload(cpu_t, result);
     return result;
 }
 
@@ -45,9 +51,7 @@ static c10::optional<Tensor> opt_to_cpu(const c10::optional<Tensor>& t) {
 }
 
 static void copy_cpu_to_device_inplace(const Tensor& cpu_src, Tensor& dst) {
-    Tensor c = cpu_src.contiguous();
-    auto& q = queue_for(dst);
-    q.copy(dst.data_ptr(), c.data_ptr(), static_cast<std::size_t>(c.nbytes()), true);
+    upload(cpu_src, dst);
 }
 
 ::std::tuple<Tensor, Tensor, Tensor> native_batch_norm(

@@ -18,6 +18,8 @@
 
 #include "core/kernels.h"
 
+#include <ATen/native/Resize.h>
+
 namespace ptsycl {
 namespace {
 
@@ -441,15 +443,6 @@ Tensor index_tensor(const Tensor& self,
 // -----------------------------------------------------------------------------
 // Split into two dispatches rather than one: the plain-store path
 // (accumulate=false) never touches atomic_add and keeps the full
-// AT_DISPATCH_ALL_TYPES_AND3 range. The accumulate=true path goes
-// through atomic_add(), and this parascc install's atomic_ref::fetch_add
-// is a direct passthrough to a native CUDA atomicAdd() overload with NO
-// generic/CAS fallback beneath it (kernels.h's atomic_add<T> static_asserts
-// on this). Only {int32_t, float, double, bool} are safe -- bool never
-// reaches a hardware atomic, it's a plain store via atomic_add's
-// if-constexpr branch. int8_t/int16_t/int64_t/Half/BFloat16 accumulate is
-// NOT dispatched here; see the open item re: atomic_ref::compare_exchange
-// before adding those.
 Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
                    const Tensor& values, bool accumulate) {
     PTSYCL_TRACE_OP("index_put_");
@@ -460,6 +453,17 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
         } else {
             self.copy_(values);
         }
+        return self;
+    }
+
+    const c10::ScalarType st = self.scalar_type();
+    if (accumulate && (st == c10::kHalf || st == c10::kBFloat16 ||
+                       st == c10::kChar || st == c10::kByte || st == c10::kShort)) {
+        const c10::ScalarType acc_t =
+            (st == c10::kHalf || st == c10::kBFloat16) ? c10::kFloat : c10::kLong;
+        Tensor acc = self.to(acc_t);
+        ptsycl::index_put_(acc, indices, values.to(acc_t), true);
+        self.copy_(acc);
         return self;
     }
 
@@ -510,16 +514,17 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
         PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES(CASE)
 #undef CASE
         default:
-            TORCH_CHECK(false, "paras index_put_ (accumulate=True): dtype ",
-                        self.scalar_type(), " is not yet supported -- this "
-                        "parascc install's atomic_ref::fetch_add only has "
-                        "native hardware support for int32, float, double, "
-                        "and bool. int8/int16/int64/Half/BFloat16 "
-                        "accumulating index_put_ is pending a verified "
-                        "compare-exchange-based atomic implementation.");
+            TORCH_CHECK(false, "paras index_put_ (accumulate=True): unsupported dtype ",
+                        self.scalar_type());
     }
 #undef PTSYCL_INDEX_PUT_ATOMIC_SAFE_TYPES
     return self;
+}
+
+Tensor& index_put_impl_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
+                        const Tensor& values, bool accumulate, bool ) {
+    PTSYCL_TRACE_OP("_index_put_impl_");
+    return ptsycl::index_put_(self, indices, values, accumulate);
 }
 
 Tensor index_put(const Tensor& self,
@@ -533,17 +538,20 @@ Tensor index_put(const Tensor& self,
 // -----------------------------------------------------------------------------
 // where.self
 // -----------------------------------------------------------------------------
-Tensor where_self(const Tensor& condition, const Tensor& self,
-                  const Tensor& other) {
-    PTSYCL_TRACE_OP("where.self");
+Tensor& where_self_out(const Tensor& condition, const Tensor& self,
+                       const Tensor& other, Tensor& out) {
+    PTSYCL_TRACE_OP("where.self_out");
     TORCH_CHECK(condition.scalar_type() == c10::kBool,
                 "paras where: condition must be a bool tensor");
 
     const auto out_dtype = at::result_type(self, other);
+    TORCH_CHECK(out.scalar_type() == out_dtype,
+                "paras where: out dtype ", out.scalar_type(),
+                " does not match the result type ", out_dtype);
     auto out_sizes =
         at::infer_size(at::infer_size(condition.sizes(), self.sizes()),
                        other.sizes());
-    Tensor out = at::empty(out_sizes, self.options().dtype(out_dtype));
+    at::native::resize_output(out, out_sizes);
 
     auto& q = queue_for(out);
     const int64_t n = out.numel();
@@ -571,6 +579,13 @@ Tensor where_self(const Tensor& condition, const Tensor& self,
             });
         });
     return out;
+}
+
+Tensor where_self(const Tensor& condition, const Tensor& self,
+                  const Tensor& other) {
+    PTSYCL_TRACE_OP("where.self");
+    Tensor out = at::empty({0}, self.options().dtype(at::result_type(self, other)));
+    return ptsycl::where_self_out(condition, self, other, out);
 }
 
 // -----------------------------------------------------------------------------
@@ -646,6 +661,253 @@ Tensor& tril_(Tensor& self, int64_t diagonal) {
     return ptsycl::tril_out(self, diagonal, self);
 }
 
+constexpr int64_t kNonzeroChunk = 256;
+
+#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+constexpr int64_t kScanLanes = 64;
+constexpr int64_t kScanPerLane = 16;
+constexpr int64_t kScanBlock = kScanLanes * kScanPerLane;
+
+template <typename T> class ScanBlockTotals;
+template <typename T> class ScanAddOffsets;
+template <typename T> class NonzeroCount;
+template <typename T> class NonzeroWrite;
+
+void exclusive_scan_device(compat::Queue& q, Tensor& v) {
+    const int64_t n = v.numel();
+    if (n == 0) return;
+    int64_t* pv = data_ptr<int64_t>(v);
+    const int64_t blocks = (n + kScanBlock - 1) / kScanBlock;
+    Tensor totals = at::empty({blocks}, v.options());
+    int64_t* pt = data_ptr<int64_t>(totals);
+    q.sycl_queue().template parallel_for<ScanBlockTotals<int64_t>>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
+                          sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
+        [=](sycl::nd_item<1> it) {
+            const auto sg = it.get_sub_group();
+            const int64_t blk = static_cast<int64_t>(it.get_group(0));
+            const int64_t lane = static_cast<int64_t>(it.get_local_id(0));
+            const int64_t base = blk * kScanBlock + lane * kScanPerLane;
+            int64_t vals[kScanPerLane];
+            int64_t c = 0;
+#pragma unroll
+            for (int e = 0; e < kScanPerLane; ++e) {
+                vals[e] = base + e < n ? pv[base + e] : 0;
+                c += vals[e];
+            }
+            const int64_t incl = sycl::inclusive_scan_over_group(sg, c, sycl::plus<int64_t>());
+            int64_t run = incl - c;
+#pragma unroll
+            for (int e = 0; e < kScanPerLane; ++e) {
+                if (base + e < n) pv[base + e] = run;
+                run += vals[e];
+            }
+            if (lane == kScanLanes - 1) pt[blk] = incl;
+        });
+    if (blocks == 1) return;
+    exclusive_scan_device(q, totals);
+    q.sycl_queue().template parallel_for<ScanAddOffsets<int64_t>>(
+        sycl::range<1>(static_cast<std::size_t>(n)), [=](sycl::id<1> i) {
+            pv[i[0]] += pt[static_cast<int64_t>(i[0]) / kScanBlock];
+        });
+}
+
+template <typename scalar_t>
+PTSYCL_HOST_DEVICE inline bool is_nonzero(scalar_t x) {
+    if constexpr (std::is_same_v<scalar_t, double>) return x != 0.0;
+    else return static_cast<float>(x) != 0.0f;
+}
+
+void nonzero_gpu(compat::Queue& q, const Tensor& self, Tensor& out) {
+    const int64_t n = self.numel();
+    const int ndim = static_cast<int>(self.dim());
+    const int64_t blocks = (n + kScanBlock - 1) / kScanBlock;
+    Tensor offsets = at::empty({blocks + 1}, self.options().dtype(c10::kLong));
+    int64_t* poff = data_ptr<int64_t>(offsets);
+    const auto flat = make_flat_spec(self);
+    const auto spec = make_spec(self);
+
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_nonzero_count", [&] {
+            const scalar_t* p = data_ptr<scalar_t>(self);
+            q.sycl_queue().template parallel_for<NonzeroCount<scalar_t>>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
+                                  sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
+                [=](sycl::nd_item<1> it) {
+                    const auto sg = it.get_sub_group();
+                    const int64_t blk = static_cast<int64_t>(it.get_group(0));
+                    const int64_t base = blk * kScanBlock +
+                                         static_cast<int64_t>(it.get_local_id(0)) * kScanPerLane;
+                    int64_t c = 0;
+_Pragma("unroll")
+                    for (int e = 0; e < kScanPerLane; ++e)
+                        if (base + e < n && is_nonzero(p[flat.index(base + e)])) ++c;
+                    c = sycl::reduce_over_group(sg, c, sycl::plus<int64_t>());
+                    if (it.get_local_id(0) == 0) poff[blk] = c;
+                    if (blk == 0 && it.get_local_id(0) == 0) poff[blocks] = 0;
+                });
+        });
+    exclusive_scan_device(q, offsets);
+    const int64_t total = offsets[blocks].item<int64_t>();
+    out.resize_({total, ndim});
+    if (total == 0 || ndim == 0) return;
+
+    Tensor dst = out.is_contiguous() ? out : at::empty({total, ndim}, out.options());
+    int64_t* pdst = data_ptr<int64_t>(dst);
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_nonzero_write", [&] {
+            const scalar_t* p = data_ptr<scalar_t>(self);
+            q.sycl_queue().template parallel_for<NonzeroWrite<scalar_t>>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
+                                  sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
+                [=](sycl::nd_item<1> it) {
+                    const auto sg = it.get_sub_group();
+                    const int64_t blk = static_cast<int64_t>(it.get_group(0));
+                    const int64_t base = blk * kScanBlock +
+                                         static_cast<int64_t>(it.get_local_id(0)) * kScanPerLane;
+                    bool nz[kScanPerLane];
+                    int64_t c = 0;
+_Pragma("unroll")
+                    for (int e = 0; e < kScanPerLane; ++e) {
+                        nz[e] = base + e < n && is_nonzero(p[flat.index(base + e)]);
+                        c += nz[e] ? 1 : 0;
+                    }
+                    int64_t row = poff[blk] +
+                                  sycl::inclusive_scan_over_group(sg, c, sycl::plus<int64_t>()) - c;
+_Pragma("unroll")
+                    for (int e = 0; e < kScanPerLane; ++e) {
+                        if (!nz[e]) continue;
+                        int64_t rem = base + e;
+                        for (int dd = ndim - 1; dd >= 0; --dd) {
+                            pdst[row * ndim + dd] = rem % spec.sizes[dd];
+                            rem /= spec.sizes[dd];
+                        }
+                        ++row;
+                    }
+                });
+        });
+    if (!dst.is_same(out)) out.copy_(dst);
+}
+#endif
+
+Tensor& nonzero_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("nonzero.out");
+    TORCH_CHECK(out.scalar_type() == c10::kLong,
+                "paras nonzero: out must be an int64 tensor");
+    TORCH_CHECK(spec_supported(self), "paras nonzero: rank exceeds kernel limit");
+
+    const int64_t n = self.numel();
+    const int ndim = static_cast<int>(self.dim());
+    if (n == 0) {
+        out.resize_({0, ndim});
+        return out;
+    }
+
+    auto& q = queue_for(self);
+#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+    if (q.is_gpu()) {
+        nonzero_gpu(q, self, out);
+        return out;
+    }
+#endif
+    const int64_t chunks = (n + kNonzeroChunk - 1) / kNonzeroChunk;
+    Tensor offsets = at::empty({chunks + 1}, self.options().dtype(c10::kLong));
+    int64_t* poff = data_ptr<int64_t>(offsets);
+    const auto spec = make_spec(self);
+
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
+        "ptsycl_nonzero_count", [&] {
+            const scalar_t* p = data_ptr<scalar_t>(self);
+            launch_flat(q, chunks, [=](std::size_t c_) {
+                const int64_t c = static_cast<int64_t>(c_);
+                const int64_t begin = c * kNonzeroChunk;
+                const int64_t end = begin + kNonzeroChunk < n ? begin + kNonzeroChunk : n;
+                int64_t count = 0;
+                for (int64_t i = begin; i < end; ++i)
+                    if constexpr (std::is_same_v<scalar_t, double>)
+                        count += p[spec.index(i)] != 0.0 ? 1 : 0;
+                    else
+                        count += static_cast<float>(p[spec.index(i)]) != 0.0f ? 1 : 0;
+                poff[c + 1] = count;
+            });
+        });
+    launch_flat(q, 1, [=](std::size_t) {
+        poff[0] = 0;
+        for (int64_t c = 1; c <= chunks; ++c) poff[c] += poff[c - 1];
+    });
+
+    const int64_t total = offsets[chunks].item<int64_t>();
+    out.resize_({total, ndim});
+    if (total == 0 || ndim == 0) return out;
+
+    Tensor dst = out.is_contiguous() ? out : at::empty({total, ndim}, out.options());
+    int64_t* pdst = data_ptr<int64_t>(dst);
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),
+        "ptsycl_nonzero_write", [&] {
+            const scalar_t* p = data_ptr<scalar_t>(self);
+            launch_flat(q, chunks, [=](std::size_t c_) {
+                const int64_t c = static_cast<int64_t>(c_);
+                const int64_t begin = c * kNonzeroChunk;
+                const int64_t end = begin + kNonzeroChunk < n ? begin + kNonzeroChunk : n;
+                int64_t row = poff[c];
+                for (int64_t i = begin; i < end; ++i) {
+                    bool nonzero_elem;
+                    if constexpr (std::is_same_v<scalar_t, double>)
+                        nonzero_elem = p[spec.index(i)] != 0.0;
+                    else
+                        nonzero_elem = static_cast<float>(p[spec.index(i)]) != 0.0f;
+                    if (!nonzero_elem) continue;
+                    int64_t rem = i;
+                    for (int dd = ndim - 1; dd >= 0; --dd) {
+                        pdst[row * ndim + dd] = rem % spec.sizes[dd];
+                        rem /= spec.sizes[dd];
+                    }
+                    ++row;
+                }
+            });
+        });
+    if (!dst.is_same(out)) out.copy_(dst);
+    return out;
+}
+
+Tensor nonzero(const Tensor& self) {
+    PTSYCL_TRACE_OP("nonzero");
+    Tensor out = at::empty({0, self.dim()}, self.options().dtype(c10::kLong));
+    return ptsycl::nonzero_out(self, out);
+}
+
+Tensor repeat_interleave_counts(const Tensor& repeats,
+                                std::optional<c10::SymInt> output_size) {
+    PTSYCL_TRACE_OP("repeat_interleave.Tensor");
+    TORCH_CHECK(repeats.dim() == 1, "repeat_interleave: repeats must be 1-D");
+    TORCH_CHECK(repeats.scalar_type() == c10::kLong || repeats.scalar_type() == c10::kInt,
+                "repeat_interleave: repeats must be an int32 or int64 tensor");
+    Tensor rep = to_long(repeats).contiguous();
+    const int64_t n = rep.numel();
+    if (n == 0) return at::empty({0}, rep.options());
+    TORCH_CHECK(rep.min().item<int64_t>() >= 0, "repeat_interleave: repeats can not be negative");
+
+    Tensor ends = rep.cumsum(0);
+    const int64_t total = output_size.has_value()
+        ? output_size->expect_int()
+        : ends[n - 1].item<int64_t>();
+    Tensor out = at::empty({total}, rep.options());
+    if (total == 0) return out;
+
+    auto& q = queue_for(rep);
+    const int64_t* prep = data_ptr<int64_t>(rep);
+    const int64_t* pend = data_ptr<int64_t>(ends);
+    int64_t*       pout = data_ptr<int64_t>(out);
+    launch_flat(q, n, [=](std::size_t i_) {
+        const int64_t i = static_cast<int64_t>(i_);
+        const int64_t end = pend[i] < total ? pend[i] : total;
+        for (int64_t j = pend[i] - prep[i]; j < end; ++j) pout[j] = i;
+    });
+    return out;
+}
+
 } // namespace
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -661,8 +923,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::index.Tensor", &ptsycl::index_tensor);
     m.impl("aten::index_put", &ptsycl::index_put);
     m.impl("aten::index_put_", &ptsycl::index_put_);
+    m.impl("aten::_index_put_impl_", &ptsycl::index_put_impl_);
 
     m.impl("aten::where.self", &ptsycl::where_self);
+    m.impl("aten::where.self_out", &ptsycl::where_self_out);
 
     m.impl("aten::triu", &ptsycl::triu);
     m.impl("aten::triu_", &ptsycl::triu_);
@@ -670,6 +934,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::tril", &ptsycl::tril);
     m.impl("aten::tril_", &ptsycl::tril_);
     m.impl("aten::tril.out", &ptsycl::tril_out);
+
+    m.impl("aten::nonzero", &ptsycl::nonzero);
+    m.impl("aten::nonzero.out", &ptsycl::nonzero_out);
+
+    m.impl("aten::repeat_interleave.Tensor", &ptsycl::repeat_interleave_counts);
 }
 
 } // namespace ptsycl
