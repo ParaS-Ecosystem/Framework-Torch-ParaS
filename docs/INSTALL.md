@@ -87,9 +87,13 @@ scripts/build.sh hip             # CPU engine + AMD GPUs
 
 Notes:
 
-- The build is intentionally serial (`-j1`). parascc names its temporary
-  files with second resolution, so parallel compiles would race on them.
-  A full CUDA or HIP build takes around 15 minutes on our machine.
+- The build runs in parallel (`-j$(nproc)`, override with
+  `PTSYCL_BUILD_JOBS`): current `parascc` gives every intermediate file a
+  unique name. A full HIP build takes about 2.5 minutes on a 256-core node.
+- Set `CLAP_HOME` to a CLAP install to build with CLAP BLAS. On GPU builds
+  this is what runs `mm`/`addmm`/`bmm` (and therefore `linear` and its
+  backward) on the device through the vendor BLAS behind CLAP; without it
+  those operators stage their operands through host memory.
 - The built extension is copied to `python/torch_paras/_C.so`. Whichever
   flavor you built last is the one `import torch_paras` loads.
 - Build trees live under `build/cpu`, `build/cuda`, and `build/hip`;
@@ -119,8 +123,12 @@ export CLAP_HOME=/opt/clap/install
 PTSYCL_ENABLE_CLAP=ON scripts/build.sh cuda
 ```
 
-Make the vendor libraries (oneDNN for CPU, cuDNN for NVIDIA) available on
-`LD_LIBRARY_PATH`. See [Testing](TESTING.md) for focused CLAP and fast-build
+Make the vendor libraries (oneDNN for CPU, cuDNN for NVIDIA, MIOpen for AMD)
+available on `LD_LIBRARY_PATH`. MIOpen also needs a writable kernel
+database: if its default location is read-only (for example inside a Python
+environment), set `MIOPEN_USER_DB_PATH` and `MIOPEN_CUSTOM_CACHE_DIR` to a
+writable directory. MIOpen has no bfloat16 activation kernels, so bfloat16
+sigmoid/SiLU on AMD GPUs always run the ParaS kernel. See [Testing](TESTING.md) for focused CLAP and fast-build
 checks and the current activation limits.
 
 In a GPU-enabled build with `N` visible GPUs, `paras:0` through

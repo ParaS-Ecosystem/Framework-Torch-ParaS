@@ -17,9 +17,8 @@ this file in the same PR.
   `PARAS_HOME`, `PTSYCL_GCC_TOOLCHAIN`, `PTSYCL_LLVM_DIR`,
   `PTSYCL_CUDA_HOME`, and `PTSYCL_PYTHON` — a stale environment from a
   previous shell session is a common cause of confusing errors.
-- The build is intentionally single-threaded (`-j1`) because `parascc`
-  names temporary files with second-resolution timestamps; a full CUDA
-  build taking ~15 minutes is expected, not a sign something is stuck.
+- `scripts/build.sh` builds in parallel. If an older `parascc` that names
+  temporary files by timestamp is in use, set `PTSYCL_BUILD_JOBS=1`.
 
 ### Wrong GPU architecture / CUDA build targets the wrong compute capability
 
@@ -72,6 +71,33 @@ or check `build/cpu` vs `build/cuda` to see which was built most recently.
 - Check `docs/TESTING.md` for what each test module covers, and
   `docs/OPERATOR_COVERAGE.md` for whether the failing area has known
   gaps already.
+
+### `MIOpen ... attempt to write a readonly database` / `miopenActivationForward status=5`
+
+CLAP-DNN reached MIOpen, but MIOpen cannot write its kernel database (its
+default lives inside the installation). Point it at a writable directory:
+
+```bash
+export MIOPEN_USER_DB_PATH=$HOME/.cache/miopen/db
+export MIOPEN_CUSTOM_CACHE_DIR=$HOME/.cache/miopen/cache
+```
+
+### `CLAP-DNN ROCM backend unavailable, using ParaS kernels: ... missing symbol miopenGetLayerNormBackwardWorkspaceSize`
+
+CLAP-DNN requires MIOpen's layer-norm backward entry points; the MIOpen that
+ships with PyTorch's ROCm wheels does not have them, so the ROCm DNN backend
+cannot load. Torch-ParaS reports this once and runs sigmoid/SiLU on its own
+kernels (results are correct). Use a MIOpen that provides those symbols, or
+build with `PTSYCL_ENABLE_CLAP=OFF` (CLAP BLAS is unaffected).
+
+### `opt_ready_stream && opt_parent_stream INTERNAL ASSERT FAILED` in a CUDA/ROCm backward
+
+Once `torch_paras` is imported, PyTorch treats the `paras` (PrivateUse1)
+backend as the process's accelerator (`torch.accelerator.current_accelerator()`),
+and its autograd engine tracks streams for that accelerator only: a backward
+pass on `cuda` tensors in the same process then fails with this assertion.
+Inference on both backends in one process works; run CUDA/ROCm training
+before importing `torch_paras`, or in a separate process.
 
 ### A model produces different output on `paras` vs `cpu`/`cuda`
 
