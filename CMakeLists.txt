@@ -110,10 +110,10 @@ if(NOT PTSYCL_FAST_BUILD)
     csrc/ops/loss_ops.cpp
     csrc/ops/norm_ops.cpp
     csrc/ops/vision_ops.cpp
-    csrc/ops/attention_ops.cpp
     csrc/ops/rms_swiglu_ops.cpp
     csrc/ops/sort_ops.cpp
     csrc/ops/creation_ops.cpp
+    csrc/ops/sdpa_ops.cpp
     )
 else()
     message(STATUS "Fast build: only tensor_ops.cpp; other operator registrations are omitted")
@@ -134,6 +134,13 @@ if(PTSYCL_FLATTEN_HEADERS AND PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL
         list(APPEND PTSYCL_GENERATED_SOURCES "${generated}")
     endforeach()
     set(PTSYCL_SOURCES ${PTSYCL_GENERATED_SOURCES})
+endif()
+
+if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/sdpa_ops.cpp"
+        "${CMAKE_BINARY_DIR}/paras_sources/csrc/ops/sdpa_ops.cpp"
+        PROPERTIES COMPILE_OPTIONS "--gpu-max-threads-per-block=256")
 endif()
 
 add_library(torch_paras_C SHARED ${PTSYCL_SOURCES})
