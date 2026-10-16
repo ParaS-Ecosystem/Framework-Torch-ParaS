@@ -25,6 +25,7 @@
 #include "core/common.h"
 #include "core/allocator.h"
 #include "ops/clap_dnn_adapter.h"
+#include "core/telemetry.h"
 
 namespace py = pybind11;
 
@@ -104,5 +105,33 @@ PYBIND11_MODULE(_C, m) {
     m.def("clap_dnn_last_backend", [] {
         py::gil_scoped_release no_gil;
         return ptsycl::clap_dnn::last_backend_name();
+    });
+
+    m.def("clap_blas_enabled", [] {
+#ifdef PTSYCL_USE_CLAP_BLAS
+        return true;
+#else
+        return false;
+#endif
+    });
+
+    m.def("runtime_stats", [] {
+        const auto s = ptsycl::telemetry::snapshot();
+        py::dict d;
+        d["cpu_fallbacks"] = s.fallbacks;
+        d["device_to_host_copies"] = s.d2h_count;
+        d["device_to_host_bytes"] = s.d2h_bytes;
+        d["host_to_device_copies"] = s.h2d_count;
+        d["host_to_device_bytes"] = s.h2d_bytes;
+        d["scalar_reads"] = s.scalar_reads;
+        return d;
+    });
+
+    m.def("reset_runtime_stats", [] { ptsycl::telemetry::reset(); });
+
+    m.def("strict", [] { return ptsycl::telemetry::strict(); });
+
+    m.def("set_strict", [](bool enabled) {
+        ptsycl::telemetry::set_strict(enabled);
     });
 }
