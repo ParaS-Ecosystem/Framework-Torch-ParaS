@@ -74,8 +74,8 @@ into separate package directories (such as `build/fast-on-package` and
 `lib/_C.so`. Pass `--package-root <package-dir>` to check that exact package
 without overwriting another build. Configure each tree with the toolchain
 arguments used by `scripts/build.sh`, `-DPTSYCL_FAST_BUILD=ON`, and the
-appropriate `-DPTSYCL_ENABLE_CLAP=ON` or `OFF`. Build serially (`-j1`),
-waiting for each build to finish before starting another.
+appropriate `-DPTSYCL_ENABLE_CLAP=ON` or `OFF`. parascc gives every
+intermediate file a unique name, so each build may use `-j$(nproc)`.
 
 ## What is covered
 
