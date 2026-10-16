@@ -33,6 +33,7 @@ MODULES = [
     "test_attention_norm_ops",
     "test_matmul_sort_creation_ops",
     "test_clap_dnn_multigpu",
+    "test_device_blas_and_runtime",
 ]
 
 

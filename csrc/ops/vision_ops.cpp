@@ -18,10 +18,12 @@
 
 
 #include "core/kernels.h"
+#include "core/telemetry.h"
 #include <ATen/ATen.h>
 #include <torch/torch.h>
 #include <ATen/ops/_native_multi_head_attention_cpu_dispatch.h>
 #include <cmath>
+#include <limits>
 
 
 
@@ -40,12 +42,21 @@ static Tensor to_cpu(const Tensor& t) {
     return t.contiguous().to(c10::Device(c10::kCPU));
 }
 
+static void upload(const Tensor& cpu_src, const Tensor& dst) {
+    if (!dst.is_contiguous()) {
+        const_cast<Tensor&>(dst).copy_(cpu_src);
+        return;
+    }
+    Tensor c = cpu_src.contiguous();
+    telemetry::record_transfer(telemetry::Transfer::HostToDevice,
+                               static_cast<std::size_t>(c.nbytes()));
+    queue_for(dst).copy(dst.data_ptr(), c.data_ptr(),
+                        static_cast<std::size_t>(c.nbytes()), true);
+}
+
 static Tensor to_device(const Tensor& cpu_t, c10::Device dev) {
     Tensor result = at::empty(cpu_t.sizes(), at::device(dev).dtype(cpu_t.scalar_type()));
-    auto& q = queue_for(result);
-    q.copy(result.data_ptr(), cpu_t.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_t.contiguous().nbytes()),
-           /*blocking=*/true);
+    upload(cpu_t, result);
     return result;
 }
 
@@ -218,9 +229,7 @@ Tensor& avg_pool2d_out(
     Tensor cpu_out = at::avg_pool2d(cpu_in, kernel_size, eff_stride,
                                      padding, ceil_mode, count_include_pad,
                                      divisor_override);
-    auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    upload(cpu_out, out);
     return out;
 }
 
@@ -243,120 +252,8 @@ Tensor& avg_pool2d_backward_out(
     Tensor cpu_dx = at::avg_pool2d_backward(
         cpu_dy, cpu_x, kernel_size, eff_stride, padding,
         ceil_mode, count_include_pad, divisor_override);
-    auto& q = queue_for(grad_input);
-    q.copy(grad_input.data_ptr(), cpu_dx.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_dx.contiguous().nbytes()), true);
+    upload(cpu_dx, grad_input);
     return grad_input;
-}
-
-class LinearFunction : public torch::autograd::Function<LinearFunction> {
-public:
-    static Tensor forward(AutogradContext* ctx,
-                          const Tensor& input,
-                          const Tensor& weight,
-                          const c10::optional<Tensor>& bias)
-    {
-        at::AutoDispatchBelowADInplaceOrView g;
-        c10::Device dev = input.device();
-
-        Tensor cpu_x = to_cpu(input).contiguous();
-        Tensor cpu_w = to_cpu(weight).contiguous();
-        auto cpu_b = opt_to_cpu(bias);
-
-        Tensor cpu_out;
-        bool used_clap = false;
-
-        if (cpu_x.dim() >= 1 &&
-            cpu_w.dim() == 2 &&
-            cpu_w.size(1) > 0 &&
-            cpu_x.size(-1) == cpu_w.size(1) &&
-            cpu_x.scalar_type() == cpu_w.scalar_type() &&
-            clap_blas::supported_dtype(cpu_x)) {
-
-            const int64_t fi = cpu_w.size(1);
-            const int64_t fo = cpu_w.size(0);
-            const int64_t batch = cpu_x.numel() / fi;
-
-            Tensor cpu_x2 = cpu_x.view({batch, fi});
-
-            Tensor cpu_out2 = at::empty(
-                {batch, fo},
-                at::TensorOptions()
-                    .dtype(cpu_x.scalar_type())
-                    .device(c10::kCPU));
-
-            if (clap_blas::gemm_cpu(
-                    cpu_x2,
-                    cpu_w,
-                    cpu_out2,
-                    1.0,
-                    true)) {
-                PTSYCL_TRACE_OP("linear.clap_blas");
-                if (cpu_b.has_value() && cpu_b->defined() && cpu_b->numel() > 0)
-                    cpu_out2.add_(*cpu_b);
-
-                auto out_sizes = cpu_x.sizes().vec();
-                out_sizes.back() = fo;
-                cpu_out = cpu_out2.view(out_sizes);
-                used_clap = true;
-            }
-        }
-
-        if (!used_clap) {
-            PTSYCL_TRACE_OP("linear.fallback");
-            cpu_out = at::linear(
-                cpu_x,
-                cpu_w,
-                cpu_b.has_value() ? *cpu_b : Tensor{});
-        }
-
-        Tensor result = to_device(cpu_out.contiguous(), dev);
-
-        ctx->save_for_backward({input.contiguous(), weight});
-        ctx->saved_data["has_bias"] =
-            bias.has_value() && bias->numel() > 0;
-
-        return result;
-    }
-
-    static tensor_list backward(AutogradContext* ctx,
-                                 tensor_list grad_outputs)
-    {
-        Tensor input  = ctx->get_saved_variables()[0];
-        Tensor weight = ctx->get_saved_variables()[1];
-        bool has_bias = ctx->saved_data["has_bias"].toBool();
-        c10::Device dev = input.device();
-
-        Tensor dy    = grad_outputs[0].contiguous();
-        Tensor cpu_dy = to_cpu(dy);
-        Tensor cpu_x  = to_cpu(input);
-        Tensor cpu_w  = to_cpu(weight);
-
-        Tensor cpu_dx = at::mm(cpu_dy.view({-1, cpu_dy.size(-1)}), cpu_w);
-        cpu_dx = cpu_dx.view(cpu_x.sizes());
-
-        int64_t fi = cpu_w.size(1), fo = cpu_w.size(0);
-        int64_t batch = cpu_x.numel() / fi;
-        Tensor cpu_x2  = cpu_x.view({batch, fi});
-        Tensor cpu_dy2 = cpu_dy.view({batch, fo});
-        Tensor cpu_dw  = at::mm(cpu_dy2.t(), cpu_x2);
-
-        Tensor dx = to_device(cpu_dx.contiguous(), dev);
-        Tensor dw = to_device(cpu_dw.contiguous(), dev);
-        Tensor db;
-        if (has_bias) {
-            Tensor cpu_db = cpu_dy2.sum(0);
-            db = to_device(cpu_db.contiguous(), dev);
-        }
-        return {dx, dw, db};
-    }
-};
-
-Tensor linear(const Tensor& input, const Tensor& weight,
-              const c10::optional<Tensor>& bias)
-{
-    PTSYCL_TRACE_OP("linear");
-    return LinearFunction::apply(input, weight, bias);
 }
 
 class MaxPool2dFunction : public torch::autograd::Function<MaxPool2dFunction> {
@@ -436,9 +333,138 @@ Tensor max_pool2d_autograd(
                                     padding, dilation, ceil_mode);
 }
 
+struct GemmOperand {
+    Tensor storage;
+    bool trans = false;
+    int64_t ld = 0;
+    int64_t batch_stride = 0;
+};
+
+GemmOperand gemm_operand(const Tensor& t) {
+    const int64_t rows = t.size(-2), cols = t.size(-1);
+    const int64_t s_r = t.stride(-2), s_c = t.stride(-1);
+    GemmOperand op;
+    op.storage = t;
+    if ((s_c == 1 || cols == 1) &&
+        (rows == 1 || s_r >= std::max<int64_t>(1, cols))) {
+        op.ld = rows == 1 ? std::max<int64_t>(1, cols) : s_r;
+    } else if ((s_r == 1 || rows == 1) &&
+               (cols == 1 || s_c >= std::max<int64_t>(1, rows))) {
+        op.trans = true;
+        op.ld = cols == 1 ? std::max<int64_t>(1, rows) : s_c;
+    } else {
+        op.storage = t.contiguous();
+        op.ld = std::max<int64_t>(1, cols);
+    }
+    op.batch_stride = t.dim() == 3 ? op.storage.stride(0) : 0;
+    return op;
+}
+
+int clap_dtype(c10::ScalarType st) {
+    switch (st) {
+    case c10::kFloat:    return PTSYCL_CLAP_F32;
+    case c10::kDouble:   return PTSYCL_CLAP_F64;
+    case c10::kHalf:     return PTSYCL_CLAP_F16;
+    case c10::kBFloat16: return PTSYCL_CLAP_BF16;
+    default:             return -1;
+    }
+}
+
+bool fits_int(int64_t v) {
+    return v >= 0 && v <= std::numeric_limits<int>::max();
+}
+
+bool device_gemm_eligible(const Tensor& a, const Tensor& b, const Tensor& out,
+                          bool widen = false) {
+#ifdef PTSYCL_USE_CLAP_BLAS
+    if (!is_paras_tensor(a) || !is_paras_tensor(b) || !is_paras_tensor(out))
+        return false;
+    if (a.device() != out.device() || b.device() != out.device())
+        return false;
+    if (!queue_for(out).is_gpu())
+        return false;
+    if (clap_dtype(out.scalar_type()) < 0 || b.scalar_type() != a.scalar_type())
+        return false;
+    if (widen ? !((a.scalar_type() == c10::kHalf || a.scalar_type() == c10::kBFloat16) &&
+                  out.scalar_type() == c10::kFloat)
+              : a.scalar_type() != out.scalar_type())
+        return false;
+    const int64_t d = out.dim();
+    if ((d != 2 && d != 3) || a.dim() != d || b.dim() != d)
+        return false;
+    if (d == 3 && (a.size(0) != out.size(0) || b.size(0) != out.size(0)))
+        return false;
+    return a.size(-2) == out.size(-2) && b.size(-1) == out.size(-1) &&
+           a.size(-1) == b.size(-2) && fits_int(out.size(0)) &&
+           fits_int(out.size(-2)) && fits_int(out.size(-1)) &&
+           fits_int(a.size(-1));
+#else
+    (void)a; (void)b; (void)out; (void)widen;
+    return false;
+#endif
+}
+
+bool device_gemm(const Tensor& a, const Tensor& b, Tensor& out,
+                 double alpha, double beta) {
+#ifdef PTSYCL_USE_CLAP_BLAS
+    const bool batched = out.dim() == 3;
+    const int64_t batch = batched ? out.size(0) : 1;
+    const int64_t m = out.size(-2), n = out.size(-1), k = a.size(-1);
+    if (batch == 0 || m == 0 || n == 0) return true;
+    if (k == 0) {
+        if (beta == 0.0) out.zero_();
+        else out.mul_(beta);
+        return true;
+    }
+
+    const GemmOperand A = gemm_operand(a);
+    const GemmOperand B = gemm_operand(b);
+    if (!fits_int(A.ld) || !fits_int(B.ld)) return false;
+    const bool direct = out.stride(-1) == 1 && out.is_non_overlapping_and_dense() &&
+                        out.stride(-2) >= n && fits_int(out.stride(-2));
+    Tensor c = direct ? out : out.contiguous();
+    const int64_t ldc = direct ? out.stride(-2) : n;
+    const int64_t stride_c = batched ? (direct ? out.stride(0) : m * n) : 0;
+
+    bool ok = false;
+    const bool ran = queue_for(out).run_native([&](void* stream) {
+        ok = ptsycl_clap_blas_gemm_device_raw(
+            static_cast<int>(out.device().index()), A.trans, B.trans,
+            static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+            alpha, A.storage.data_ptr(), static_cast<int>(A.ld),
+            A.batch_stride, B.storage.data_ptr(), static_cast<int>(B.ld),
+            B.batch_stride, beta, c.data_ptr(), static_cast<int>(ldc),
+            stride_c, static_cast<int>(batch),
+            clap_dtype(a.scalar_type()), clap_dtype(out.scalar_type()), stream);
+    });
+    if (!ran) return false;
+    if (!ok) {
+        if (a.scalar_type() == c10::kFloat || a.scalar_type() == c10::kDouble)
+            return false;
+        Tensor out32 = beta == 0.0 ? at::empty(out.sizes(), out.options().dtype(c10::kFloat))
+                                   : out.to(c10::kFloat);
+        if (!device_gemm(a.to(c10::kFloat), b.to(c10::kFloat), out32, alpha, beta))
+            return false;
+        out.copy_(out32);
+        PTSYCL_TRACE_OP("gemm.clap_device_fp32");
+        return true;
+    }
+    if (!c.is_same(out)) out.copy_(c);
+    PTSYCL_TRACE_OP("gemm.clap_device");
+    return true;
+#else
+    (void)a; (void)b; (void)out; (void)alpha; (void)beta;
+    return false;
+#endif
+}
+
 Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("mm.out");
+
+    if (device_gemm_eligible(self, mat2, out) &&
+        device_gemm(self, mat2, out, 1.0, 0.0))
+        return out;
 
     Tensor cpu_a = to_cpu(self).contiguous();
     Tensor cpu_b = to_cpu(mat2).contiguous();
@@ -474,34 +500,26 @@ Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 
         if (clap_blas::gemm_cpu(cpu_a, cpu_b, cpu_out)) {
             PTSYCL_TRACE_OP("mm.out.clap_blas");
-            auto& q = queue_for(out);
-            q.copy(
-                out.data_ptr(),
-                cpu_out.data_ptr(),
-                static_cast<std::size_t>(cpu_out.nbytes()),
-                true);
+            upload(cpu_out, out);
             return out;
         }
     }
 
     PTSYCL_TRACE_OP("mm.out.fallback");
     Tensor cpu_out = at::mm(cpu_a, cpu_b);
-    auto& q = queue_for(out);
-    q.copy(
-        out.data_ptr(),
-        cpu_out.contiguous().data_ptr(),
-        static_cast<std::size_t>(cpu_out.nbytes()),
-        true);
+    upload(cpu_out, out);
     return out;
 }
 
 Tensor& bmm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("bmm.out");
+
+    if (device_gemm_eligible(self, mat2, out) &&
+        device_gemm(self, mat2, out, 1.0, 0.0))
+        return out;
     Tensor cpu_out = at::bmm(to_cpu(self), to_cpu(mat2));
-    auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    upload(cpu_out, out);
     return out;
 }
 
@@ -514,6 +532,17 @@ Tensor& addmm_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("addmm.out");
+
+    if (device_gemm_eligible(mat1, mat2, out) &&
+        self.scalar_type() == out.scalar_type() &&
+        is_paras_tensor(self) && self.device() == out.device() &&
+        at::is_expandable_to(self.sizes(), out.sizes())) {
+        const double b = beta.toDouble();
+        if (b != 0.0 && !self.is_same(out))
+            out.copy_(self.expand(out.sizes()));
+        if (device_gemm(mat1, mat2, out, alpha.toDouble(), b))
+            return out;
+    }
 
     Tensor cpu_self = to_cpu(self).contiguous();
     Tensor cpu_a = to_cpu(mat1).contiguous();
@@ -583,13 +612,7 @@ Tensor& addmm_out(
 
             if (beta.toDouble() != 0.0)
                 cpu_out.add_(cpu_self, beta);
-
-            auto& q = queue_for(out);
-            q.copy(
-                out.data_ptr(),
-                cpu_out.contiguous().data_ptr(),
-                static_cast<std::size_t>(cpu_out.nbytes()),
-                true);
+            upload(cpu_out, out);
             return out;
         }
     }
@@ -597,13 +620,7 @@ Tensor& addmm_out(
     PTSYCL_TRACE_OP("addmm.out.fallback");
     Tensor cpu_out =
         at::addmm(cpu_self, cpu_a, cpu_b, beta, alpha);
-
-    auto& q = queue_for(out);
-    q.copy(
-        out.data_ptr(),
-        cpu_out.contiguous().data_ptr(),
-        static_cast<std::size_t>(cpu_out.nbytes()),
-        true);
+    upload(cpu_out, out);
     return out;
 }
 
@@ -710,9 +727,7 @@ static Tensor& upsample_fwd_cpu(
 {
     Tensor cpu_in  = to_cpu(self);
     Tensor cpu_out = cpu_fn(cpu_in);
-    auto& q = queue_for(out);
-    q.copy(out.data_ptr(), cpu_out.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_out.contiguous().nbytes()), true);
+    upload(cpu_out, out);
     return out;
 }
 
@@ -723,9 +738,7 @@ static Tensor& upsample_bwd_cpu(
 {
     Tensor cpu_dy  = to_cpu(grad_output);
     Tensor cpu_dx  = cpu_fn(cpu_dy);
-    auto& q = queue_for(grad_input);
-    q.copy(grad_input.data_ptr(), cpu_dx.contiguous().data_ptr(),
-           static_cast<std::size_t>(cpu_dx.contiguous().nbytes()), true);
+    upload(cpu_dx, grad_input);
     return grad_input;
 }
 
@@ -834,6 +847,12 @@ Tensor& upsample_bilinear2d_backward_out(
 }
 
 } // namespace
+
+bool device_bmm_widened(const Tensor& a, const Tensor& b, Tensor& out) {
+    return device_gemm_eligible(a, b, out, true) &&
+           device_gemm(a, b, out, 1.0, 0.0);
+}
+
 } // namespace ptsycl
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -876,6 +895,5 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 }
 
 TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
-    m.impl("aten::linear",     &ptsycl::linear);
     m.impl("aten::max_pool2d", &ptsycl::max_pool2d_autograd);
 }
