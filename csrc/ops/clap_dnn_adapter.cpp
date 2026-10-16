@@ -27,6 +27,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -274,24 +275,28 @@ bool parse_cmdline_backend_arg(
 }
 
 
+const std::optional<clap::DnnBackendType>& cmdline_backend()
+{
+    static const std::optional<clap::DnnBackendType> backend =
+        []() -> std::optional<clap::DnnBackendType> {
+            std::ifstream cmdline("/proc/self/cmdline", std::ios::in | std::ios::binary);
+            std::string arg;
+            while (cmdline.is_open() && std::getline(cmdline, arg, '\0')) {
+                clap::DnnBackendType cli_backend{};
+                if (parse_cmdline_backend_arg(arg, cli_backend))
+                    return cli_backend;
+            }
+            return std::nullopt;
+        }();
+    return backend;
+}
+
+
 bool cmdline_override_matches(
     clap::DnnBackendType requested)
 {
-    std::ifstream cmdline("/proc/self/cmdline", std::ios::in | std::ios::binary);
-
-    if (!cmdline.is_open())
-        return true;
-
-    std::string arg;
-
-    while (std::getline(cmdline, arg, '\0')) {
-        clap::DnnBackendType cli_backend{};
-        if (parse_cmdline_backend_arg(arg, cli_backend)) {
-            return override_matches_requested(cli_backend, requested);
-        }
-    }
-
-    return true;
+    const auto& cli_backend = cmdline_backend();
+    return !cli_backend || override_matches_requested(*cli_backend, requested);
 }
 
 
@@ -314,7 +319,7 @@ bool backend_override_matches(
 }
 
 
-clap::IDnnBackend& backend_for(
+clap::IDnnBackend* backend_for(
     clap::DnnBackendType requested)
 {
     struct Cache {
@@ -351,8 +356,27 @@ clap::IDnnBackend& backend_for(
                 "Torch-ParaS CLAP-DNN requires an explicit backend");
     }
 
-    if (!*slot)
-        *slot = clap::DnnFactory::create(requested);
+    if (!*slot) {
+        static std::mutex create_mutex;
+        static bool failed[3] = {false, false, false};
+        const int kind = requested == clap::DnnBackendType::CPU    ? 0
+                       : requested == clap::DnnBackendType::CUDA   ? 1
+                                                                    : 2;
+        std::lock_guard<std::mutex> lock(create_mutex);
+        if (failed[kind])
+            return nullptr;
+        try {
+            *slot = clap::DnnFactory::create(requested);
+        } catch (const std::exception& e) {
+            failed[kind] = true;
+            TORCH_WARN(
+                "Torch-ParaS: CLAP-DNN ",
+                clap::executionBackendName(expected_exec),
+                " backend unavailable, using ParaS kernels: ",
+                e.what());
+            return nullptr;
+        }
+    }
 
     TORCH_CHECK(
         *slot,
@@ -366,7 +390,7 @@ clap::IDnnBackend& backend_for(
             clap::executionBackendName(expected_exec));
     }
 
-    return **slot;
+    return slot->get();
 }
 
 
@@ -422,6 +446,8 @@ bool try_activation_forward(
     clap::DnnBackendType requested;
 
     if (!select_backend(out, requested) ||
+        (requested == clap::DnnBackendType::ROCM &&
+         dtype == clap::DataType::BFloat16) ||
         !backend_override_matches(requested)) {
 
         record_fallback();
@@ -442,7 +468,12 @@ bool try_activation_forward(
     clap::ActivationDesc activation;
     activation.mode = mode;
 
-    auto& backend = backend_for(requested);
+    clap::IDnnBackend* selected = backend_for(requested);
+    if (selected == nullptr) {
+        record_fallback();
+        return false;
+    }
+    auto& backend = *selected;
 
     const void* input_ptr = self.data_ptr();
     void* output_ptr = out.data_ptr();
