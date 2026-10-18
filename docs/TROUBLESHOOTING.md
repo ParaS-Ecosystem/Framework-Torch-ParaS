@@ -87,7 +87,8 @@ export MIOPEN_CUSTOM_CACHE_DIR=$HOME/.cache/miopen/cache
 CLAP-DNN requires MIOpen's layer-norm backward entry points; the MIOpen that
 ships with PyTorch's ROCm wheels does not have them, so the ROCm DNN backend
 cannot load. Torch-ParaS reports this once and runs sigmoid/SiLU on its own
-kernels (results are correct). Use a MIOpen that provides those symbols, or
+kernels (results are correct). CLAP-Library releases that load these two
+symbols optionally fix this; otherwise use a MIOpen that provides them, or
 build with `PTSYCL_ENABLE_CLAP=OFF` (CLAP BLAS is unaffected).
 
 ### `opt_ready_stream && opt_parent_stream INTERNAL ASSERT FAILED` in a CUDA/ROCm backward
@@ -117,6 +118,16 @@ before importing `torch_paras`, or in a separate process.
   `docs/MODEL_VALIDATION.md` and `docs/OPERATOR_COVERAGE.md`.
 - If a *native* kernel regressed, see `docs/BENCHMARKS.md` and consider
   filing a performance-regression issue.
+- Host waiting on the GPU: Torch-ParaS sets `PARAS_ASYNC_KERNELS=1` so ParaS
+  returns from kernel launches, memsets and device copies without waiting.
+  ParaS-Compiler builds without that option wait after every command (for
+  Param2-17B decode, about 70 % of each token). Setting
+  `PARAS_ASYNC_KERNELS=0` restores synchronous launches, which helps when
+  locating a failing kernel.
+- bf16 matrix multiplies running as fp32 (`[ptsycl op] gemm.clap_device_fp32`
+  with `PTSYCL_LOG=2`): the installed CLAP's rocBLAS bf16 GEMM is
+  rejected by rocBLAS; a CLAP-Library with the bf16 datatype fix runs them
+  in bf16.
 
 ## Device Issues
 
