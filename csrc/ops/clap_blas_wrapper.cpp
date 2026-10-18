@@ -135,6 +135,14 @@ bool run_device_gemm(DeviceBackend& entry,
         if (entry.bf16_unsupported)
             return false;
         try {
+#if defined(PTSYCL_CLAP_HAS_BF16_BATCHED)
+            if (batch > 1)
+                backend->gemm_strided_batched_bf16_device(
+                    kRow, ta, tb, m, n, k, static_cast<float>(alpha), a, lda, stride_a,
+                    b, ldb, stride_b, static_cast<float>(beta), c, ldc, stride_c,
+                    batch, stream);
+            else
+#endif
             for (int i = 0; i < batch; ++i)
                 backend->gemm_bf16_device(kRow, ta, tb, m, n, k, static_cast<float>(alpha),
                                           pa + i * stride_a, lda, pb + i * stride_b, ldb,

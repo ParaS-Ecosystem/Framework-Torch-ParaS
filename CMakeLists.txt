@@ -338,6 +338,11 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
         elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
             set(PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_DEVICE_BACKEND_CUDA")
         endif()
+        file(READ "${PTSYCL_CLAP_INCLUDE_DIR}/clap/blas_factory.hpp" _ptsycl_clap_blas_api)
+        if(_ptsycl_clap_blas_api MATCHES "gemm_strided_batched_bf16_device")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_BF16_BATCHED")
+        endif()
+        message(STATUS "CLAP device GEMM: ${PTSYCL_CLAP_WRAPPER_DEFS}")
 
         add_custom_command(
             OUTPUT "${PTSYCL_CLAP_WRAPPER_OBJ}"
