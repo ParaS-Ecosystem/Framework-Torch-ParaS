@@ -142,6 +142,7 @@ void Queue::init(const DeviceInfo& dev) {
     native_id_ = dev.native_id;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
+        ::setenv("PARAS_ASYNC_KERNELS", "1", 0);
         sycl::device& device = device_by_native_id(native_id_);
         try {
             auto impl = std::make_unique<Impl>();
