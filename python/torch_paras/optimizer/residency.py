@@ -28,6 +28,9 @@ Classification uses the dispatcher's registration tables:
 * ``composite`` - a PyTorch composite that decomposes into other operators
                   (each of which is dispatched, and counted by
                   torch_paras.runtime_stats(), when it runs).
+* ``constant``  - AOTAutograd's wrapper for a tensor literal in the code
+                  (``torch.tensor(...)``): a copy of a constant, not an
+                  operator on paras tensors.
 * ``cpu``       - no ParaS kernel: the operator would run on the boxed CPU
                   fallback.
 """
@@ -37,6 +40,8 @@ from functools import lru_cache
 
 import torch
 from torch import fx
+
+_CONSTANT_OPS = ("aten::lift_fresh", "aten::lift_fresh_copy")
 
 _COMPOSITE_KEYS = (
     "CompositeExplicitAutograd",
@@ -72,6 +77,8 @@ def _out_variant(op: torch._ops.OpOverload):
 @lru_cache(maxsize=None)
 def classify(op: torch._ops.OpOverload) -> str:
     name = _qualified(op)
+    if op._schema.name in _CONSTANT_OPS:
+        return "constant"
     if _has_kernel(name, "PrivateUse1"):
         return "paras"
     if _has_kernel(name, "CompositeExplicitAutogradNonFunctional"):

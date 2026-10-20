@@ -395,6 +395,18 @@ def test_specialize_repeated_blocks(device):
             assert not any("forward" in vars(layer) for layer in stack.layers)
 
 
+def test_strict_allows_tensor_constants(device):
+    _reset()
+
+    def f(x):
+        return x * torch.tensor([2.0], device=x.device)
+
+    x = torch.randn(4, device=device)
+    out = torch_paras.compile(f, strict=True)(x)
+    assert torch.equal(out.cpu(), f(x).cpu())
+    assert all(r.fully_on_paras for r in optimizer.reports()), [r.summary() for r in optimizer.reports()]
+
+
 def test_fusions_option(device):
     _reset()
     mlp = SwiGLU(16, 32).to(device)

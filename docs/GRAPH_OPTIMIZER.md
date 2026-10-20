@@ -31,6 +31,8 @@ For every graph TorchDynamo captures:
      functional form whose out= variant has one);
    * `composite`: a PyTorch composite that decomposes into other operators,
      each dispatched (and counted, see below) when it runs;
+   * `constant`: `lift_fresh` / `lift_fresh_copy`, AOTAutograd's copy of a
+     tensor literal in the code (`torch.tensor(...)`);
    * `cpu`: no ParaS kernel; the op would run on the boxed CPU fallback.
    With `strict=True` a graph containing a `cpu` op raises
    `ParasCompileError`.
