@@ -55,14 +55,14 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto dt = q.scalar_type();
     if (dt != c10::kFloat && dt != c10::kHalf && dt != c10::kBFloat16) return false;
     if (k.scalar_type() != dt || v.scalar_type() != dt) return false;
-    if (q.size(0) != k.size(0) || k.size(0) != v.size(0)) return false;
-    if (q.size(1) != k.size(1) || k.size(1) != v.size(1)) return false;
+    if (q.sym_size(0) != k.sym_size(0) || k.sym_size(0) != v.sym_size(0)) return false;
+    if (q.sym_size(1) != k.sym_size(1) || k.sym_size(1) != v.sym_size(1)) return false;
     (void)enable_gqa;
-    if (q.size(3) != k.size(3) || k.size(2) != v.size(2)) return false;
-    if (k.size(2) == 0) return false;
-    if (q.size(2) > kFusedMaxQuery) {
+    if (q.sym_size(3) != k.sym_size(3) || k.sym_size(2) != v.sym_size(2)) return false;
+    if (k.sym_size(2) == 0) return false;
+    if (q.sym_size(2) > kFusedMaxQuery) {
 #if PTSYCL_SDPA_GEMM_PATH
-        if (!queue_for(q).is_gpu() || k.size(2) > kRowLanes * kRowPerLane) return false;
+        if (!queue_for(q).is_gpu() || k.sym_size(2) > kRowLanes * kRowPerLane) return false;
 #else
         return false;
 #endif
@@ -75,9 +75,9 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
         const Tensor& m = *mask;
         if (m.scalar_type() != c10::kBool && m.scalar_type() != dt) return false;
         if (m.dim() > 4) return false;
-        const int64_t want[4] = {q.size(0), q.size(1), q.size(2), k.size(2)};
+        const c10::SymInt want[4] = {q.sym_size(0), q.sym_size(1), q.sym_size(2), k.sym_size(2)};
         for (int64_t i = 0; i < m.dim(); ++i) {
-            const int64_t s = m.size(m.dim() - 1 - i);
+            const c10::SymInt s = m.sym_size(m.dim() - 1 - i);
             if (s != 1 && s != want[3 - i]) return false;
         }
     }
