@@ -82,6 +82,10 @@ PYBIND11_MODULE(_C, m) {
         return ptsycl::clap_dnn::is_enabled();
     });
 
+    m.def("clap_dnn_activation_uses_vendor", [](int device_index, const std::string& dtype) {
+        return ptsycl::clap_dnn::activation_uses_vendor(device_index, dtype);
+    });
+
     m.def("clap_dnn_reset_stats", [] {
         py::gil_scoped_release no_gil;
         ptsycl::clap_dnn::reset_stats();

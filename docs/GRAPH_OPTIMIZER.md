@@ -42,7 +42,7 @@ or inference graph.
 | Pass | Matches | Becomes |
 |---|---|---|
 | `rms_norm` | `w * (x32 * rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)` with `x32 = x.to(float32)` (or `x` already fp32; `x*x` accepted for `pow(2)`) | `paras::rms_norm(x, w, eps)` |
-| `swiglu` | `silu(gate) * up` (skipped in builds with CLAP-DNN, see below) | `paras::swiglu(gate, up)` |
+| `swiglu` | `silu(gate) * up` (skipped where CLAP-DNN runs eager SiLU, see below) | `paras::swiglu(gate, up)` |
 | `rotate_half` | `cat((-x[..., h:], x[..., :h]), -1)` with `h = x.shape[-1] // 2` | `paras::rotate_half(x)` |
 
 Method, function and operator spellings are all recognised (`x.pow(2)`,
@@ -56,8 +56,11 @@ a tensor (in-place method, `out=`, module call) between the pattern's first
 and last node -- the fused kernel reads its operands where the pattern ends.
 
 In a build with CLAP-DNN (`PTSYCL_ENABLE_CLAP=ON`) eager SiLU may run in the
-vendor DNN library, whose rounding the fused kernel does not reproduce, so the
-SwiGLU pass leaves the pattern unfused there.
+vendor DNN library, whose rounding the fused kernel does not reproduce. The
+SwiGLU pass asks the runtime which dtype/device combinations those are
+(`torch_paras._C.clap_dnn_activation_uses_vendor`) and leaves the pattern
+unfused there: e.g. fp32 through MIOpen or oneDNN. bf16 on ROCm stays on the
+ParaS kernel (MIOpen has no bf16 activations), so bf16 models are fused.
 
 **Fused kernels are bit-exact with the eager decomposition** on the same
 device: they perform the same rounding steps in the same order (RMSNorm

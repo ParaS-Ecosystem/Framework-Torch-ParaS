@@ -418,6 +418,24 @@ bool map_dtype(
 }
 
 
+clap::IDnnBackend* activation_backend(
+    const at::Tensor& like,
+    clap::DataType& dtype,
+    clap::DnnBackendType& requested)
+{
+    if (!map_dtype(like.scalar_type(), dtype))
+        return nullptr;
+
+    if (!select_backend(like, requested) ||
+        (requested == clap::DnnBackendType::ROCM &&
+         dtype == clap::DataType::BFloat16) ||
+        !backend_override_matches(requested))
+        return nullptr;
+
+    return backend_for(requested);
+}
+
+
 bool try_activation_forward(
     const at::Tensor& self,
     at::Tensor& out,
@@ -437,22 +455,14 @@ bool try_activation_forward(
     }
 
     clap::DataType dtype;
-
-    if (!map_dtype(self.scalar_type(), dtype)) {
-        record_fallback();
-        return false;
-    }
-
     clap::DnnBackendType requested;
 
-    if (!select_backend(out, requested) ||
-        (requested == clap::DnnBackendType::ROCM &&
-         dtype == clap::DataType::BFloat16) ||
-        !backend_override_matches(requested)) {
-
+    clap::IDnnBackend* selected = activation_backend(out, dtype, requested);
+    if (selected == nullptr) {
         record_fallback();
         return false;
     }
+    auto& backend = *selected;
 
     std::vector<std::int64_t> dims;
 
@@ -467,13 +477,6 @@ bool try_activation_forward(
 
     clap::ActivationDesc activation;
     activation.mode = mode;
-
-    clap::IDnnBackend* selected = backend_for(requested);
-    if (selected == nullptr) {
-        record_fallback();
-        return false;
-    }
-    auto& backend = *selected;
 
     const void* input_ptr = self.data_ptr();
     void* output_ptr = out.data_ptr();
@@ -649,6 +652,29 @@ bool try_silu_forward(
     record_fallback();
     return false;
 
+#endif
+}
+
+
+bool activation_uses_vendor(int device_index, const std::string& dtype_name)
+{
+#ifdef USE_CLAP_BACKEND
+    c10::ScalarType scalar_type;
+    if (dtype_name == "float32")       scalar_type = at::kFloat;
+    else if (dtype_name == "float16")  scalar_type = at::kHalf;
+    else if (dtype_name == "bfloat16") scalar_type = at::kBFloat16;
+    else return false;
+    const at::Tensor like = at::empty(
+        {1}, at::TensorOptions().dtype(scalar_type).device(
+                 c10::Device(c10::DeviceType::PrivateUse1,
+                             static_cast<c10::DeviceIndex>(device_index))));
+    clap::DataType dtype;
+    clap::DnnBackendType requested;
+    return activation_backend(like, dtype, requested) != nullptr;
+#else
+    (void)device_index;
+    (void)dtype_name;
+    return false;
 #endif
 }
 

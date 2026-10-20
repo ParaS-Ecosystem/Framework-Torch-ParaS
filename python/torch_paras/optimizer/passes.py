@@ -290,17 +290,22 @@ def _silu_input(node):
     return node.args[0]
 
 
-def _eager_silu_is_paras() -> bool:
-    """With CLAP-DNN enabled, eager silu runs in the vendor DNN library, whose
-    rounding the fused kernel does not reproduce; fusing would then change
-    results."""
+def _eager_silu_is_paras(value) -> bool:
+    """Whether eager silu on tensors like ``value`` runs the ParaS kernel.
+    Where CLAP-DNN runs it in the vendor DNN library (e.g. fp32 through
+    MIOpen; bf16 stays on ParaS on ROCm), the fused kernel would not
+    reproduce its rounding, so fusing would change results."""
     from .. import _C
-    return not (hasattr(_C, "clap_dnn_enabled") and _C.clap_dnn_enabled())
+    if not (hasattr(_C, "clap_dnn_enabled") and _C.clap_dnn_enabled()):
+        return True
+    query = getattr(_C, "clap_dnn_activation_uses_vendor", None)
+    if query is None:
+        return False
+    dtype = str(value.dtype).replace("torch.", "")
+    return not query(value.device.index or 0, dtype)
 
 
 def fuse_swiglu(gm: fx.GraphModule) -> int:
-    if not _eager_silu_is_paras():
-        return 0
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "mul" or _operands(node) is None:
@@ -315,6 +320,8 @@ def fuse_swiglu(gm: fx.GraphModule) -> int:
             if g_v.shape != u_v.shape or g_v.dtype != u_v.dtype or o_v.dtype != g_v.dtype:
                 continue
             if not g_v.dtype.is_floating_point or not _on_paras(gate, up):
+                continue
+            if not _eager_silu_is_paras(g_v):
                 continue
             if not _private(act, {node}) or not _no_mutation_within([act, node]):
                 continue

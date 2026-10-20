@@ -160,14 +160,24 @@ def test_rms_norm_shared_intermediate_not_fused(device):
     assert_close(var, rvar, "leaky var")
 
 
+def _silu_fusable(device, dtype):
+    """SwiGLU is fused only where eager silu runs the ParaS kernel; where
+    CLAP-DNN runs it in the vendor library it is deliberately left unfused."""
+    C = torch_paras._C
+    if not C.clap_dnn_enabled():
+        return True
+    index = torch.device(device).index or 0
+    return not C.clap_dnn_activation_uses_vendor(index, str(dtype).replace("torch.", ""))
+
+
 def test_swiglu_fused_and_matches_eager(device):
-    dnn = torch_paras._C.clap_dnn_enabled()
     for dtype in (torch.float32, torch.bfloat16):
         _reset()
         mlp = SwiGLU(32, 64).to(device, dtype)
         x = torch.randn(2, 7, 32).to(device, dtype)
         out = torch.compile(mlp, backend="paras")(x)
-        assert _fusions() == ({} if dnn else {"swiglu": 1}), _fusions()
+        expected = {"swiglu": 1} if _silu_fusable(device, dtype) else {}
+        assert _fusions() == expected, (dtype, _fusions())
         assert torch.equal(out.cpu(), mlp(x).cpu()), f"swiglu {dtype} not bit-exact"
 
 
@@ -212,7 +222,7 @@ def test_block_inference_parity_and_reports(device):
         out = torch.compile(block, backend="paras")(x, cos, sin)
     _close(out, ref, 1e-5, "block inference")
     expected = {"rms_norm": 2, "rotate_half": 2}
-    if not torch_paras._C.clap_dnn_enabled():
+    if _silu_fusable(device, torch.float32):
         expected["swiglu"] = 1
     assert _fusions() == expected, _fusions()
     for r in optimizer.reports():
