@@ -42,17 +42,30 @@ For every graph TorchDynamo captures:
    whose expert MLPs are compiled regions called from an eager expert loop
    (Param2-17B: ~1,200 calls per forward) that made compiled training 15 %
    slower than eager.
-5. **Small dynamic-shape graphs run eagerly.** When Dynamo recompiles a frame
-   with dynamic shapes, each later call evaluates guards over several cache
-   entries and runs a SymInt prologue, about 10-20 us. A frame captured whole
-   (no graph break) whose graph has fewer than `min_dynamic_graph_ops`
-   tensor operators (default 8) cannot win that back, so after its first call
-   Dynamo skips its code and it runs in the interpreter -- bit-identical to the
-   graph's forward. The typical case is an MoE's expert MLP called once per
-   expert with a different token count: for Param2-17B prefill this removes
-   ~1,200 Dynamo frame entries per forward. `GraphReport.runs_eagerly` marks
-   such graphs; `torch_paras.compile(model, min_dynamic_graph_ops=0)` compiles
-   every graph.
+5. **Frames handed back to the interpreter.** Dynamo skips them from then on
+   and they run as plain eager code -- which is what their graphs compute
+   (`GraphReport.runs_eagerly` gives the reason).
+   * *Small dynamic-shape graphs*: when Dynamo recompiles a frame with
+     dynamic shapes, each later call evaluates guards over several cache
+     entries and runs a SymInt prologue, about 10-20 us. A frame captured
+     whole (no graph break) with fewer than `min_dynamic_graph_ops` tensor
+     operators (default 8) cannot win that back; Dynamo is switched off for
+     it and what it calls. Typical case: an MoE's expert MLP called once per
+     expert with a different token count (Param2-17B prefill: ~1,200 Dynamo
+     frame entries per forward).
+   * *Frames Dynamo refuses to recompile*: at its recompile limit Dynamo
+     keeps evaluating the frame's cached guards on every call without ever
+     compiling a matching graph again. The backend learns of the refused
+     compile through Dynamo's recompile hook and skips the frame from the next
+     call of a paras graph on; the functions it calls keep their graphs. A
+     frame that needs exactly the limit keeps its graphs. Typical cases: a
+     decoder layer reading a growing KV cache without per-layer code objects
+     (below), and a model's top-level forward called by `generate()` with
+     ever new keyword sets. `eager_at_recompile_limit=False` keeps Dynamo's
+     behaviour.
+
+   `torch_paras.compile(model, min_dynamic_graph_ops=0,
+   eager_at_recompile_limit=False)` compiles and keeps every graph.
 
 `torch_paras.optimizer.reports()` returns one `GraphReport` per captured
 graph: the Python function it came from (`frame`, "name (file:line)"), the

@@ -64,6 +64,7 @@ __all__ = [
 
 def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False,
             min_dynamic_graph_ops: int | None = None,
+            eager_at_recompile_limit: bool | None = None,
             fullgraph: bool = False, dynamic: bool | None = None):
     """``torch.compile`` with the paras backend.
 
@@ -72,9 +73,12 @@ def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False
                operator without a ParaS kernel.
     min_dynamic_graph_ops: dynamic-shape graphs with fewer tensor operators
                run eagerly (default 8; 0 compiles every graph).
+    eager_at_recompile_limit: frames that reach Dynamo's recompile limit run
+               eagerly with Dynamo off for their callees (default True).
     fullgraph, dynamic: forwarded to torch.compile.
     """
     options = Options.make(fusions=fusions, strict=strict,
-                           min_dynamic_graph_ops=min_dynamic_graph_ops)
+                           min_dynamic_graph_ops=min_dynamic_graph_ops,
+                           eager_at_recompile_limit=eager_at_recompile_limit)
     return torch.compile(model, backend=make_backend(options),
                          fullgraph=fullgraph, dynamic=dynamic)

@@ -297,7 +297,7 @@ def test_small_dynamic_graph_runs_eagerly(device):
             for _ in range(3):
                 out = compiled(x, counts)
         assert torch.equal(out.cpu(), moe(x, counts).cpu()), f"limit {limit}: result differs"
-        eager = [r for r in optimizer.reports() if r.runs_eagerly]
+        eager = [r for r in optimizer.reports() if r.runs_eagerly == "small dynamic-shape graph"]
         assert bool(eager) == eager_expected, [r.summary() for r in optimizer.reports()]
     _reset()
     compiled = torch_paras.compile(_expert_loop(experts))
@@ -307,6 +307,39 @@ def test_small_dynamic_graph_runs_eagerly(device):
         graphs = len(optimizer.reports())
         compiled(x, torch.tensor([4, 3, 2, 1]))
     assert len(optimizer.reports()) == graphs, "a skipped frame was compiled again"
+
+
+def test_recompile_limit_runs_eagerly(device):
+    """A frame whose guards specialise on a Python value (here a list's
+    length, like a growing KV cache) keeps asking Dynamo for new graphs. Once
+    Dynamo refuses one (recompile limit), the frame is handed back (its
+    callees may still be compiled); a frame that needs exactly the limit
+    keeps its graphs. Results are unchanged either way."""
+    def helper(x):
+        return F.silu(x) * x
+
+    def f(x, items):
+        return helper(x) * len(items)
+
+    x = torch.randn(4, 8, device=device)
+    eager_reason = "recompile limit reached"
+    for lengths, at_limit, eager_expected in (
+            (range(1, 4), None, False),
+            (range(1, 8), None, True),
+            (range(1, 8), False, False)):
+        _reset()
+        with torch._dynamo.config.patch(recompile_limit=3):
+            compiled = torch_paras.compile(f, eager_at_recompile_limit=at_limit)
+            for n in list(lengths) + [1, 2]:
+                assert torch.equal(compiled(x, [0] * n).cpu(), f(x, [0] * n).cpu()), n
+            f_graphs = sum(r.frame.startswith("f (") for r in optimizer.reports())
+            if eager_expected:
+                compiled(x, [0] * 9)
+        eager = [r for r in optimizer.reports() if r.runs_eagerly == eager_reason]
+        assert bool(eager) == eager_expected, (list(lengths), [r.summary() for r in optimizer.reports()])
+        if eager_expected:
+            assert sum(r.frame.startswith("f (") for r in optimizer.reports()) == f_graphs, \
+                "a handed-back frame was compiled again"
 
 
 def test_fusions_option(device):

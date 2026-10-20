@@ -36,13 +36,24 @@ AOTAutograd's per-call runtime wrapper and its Python-level backward, which
 dominate for models that call many small compiled regions (an MoE's expert
 MLPs called from an eager expert loop: ~40 us per call).
 
-Small dynamic-shape graphs run eagerly. When Dynamo recompiles a frame with
-dynamic shapes, every later call pays guard evaluation over several cache
-entries and a SymInt prologue (~10-20 us). A graph of a few operators cannot
-win that back -- an MoE's expert MLP, called once per expert with a different
-token count, is the typical case -- so after its first call a frame captured
-whole (no graph break) is handed back to the interpreter: Dynamo skips its
-code from then on. The eager forward is what the graph computes, bit for bit.
+Some frames are handed back to the interpreter: Dynamo skips them from then
+on, and they run as plain eager code -- which is what their graphs compute,
+bit for bit. Two cases:
+
+* small dynamic-shape graphs. When Dynamo recompiles a frame with dynamic
+  shapes, every later call pays guard evaluation over several cache entries
+  and a SymInt prologue (~10-20 us). A frame captured whole (no graph break)
+  whose graph has a few operators cannot win that back -- an MoE's expert
+  MLP, called once per expert with a different token count, is the typical
+  case. Dynamo is also switched off for what such a frame calls.
+* frames Dynamo refuses to recompile (recompile limit). Dynamo itself then
+  keeps evaluating the frame's cached guards on every call without ever
+  compiling a matching graph again. A decoder layer reading a growing KV cache
+  without per-layer code objects (see blocks.py), or a model's top-level
+  forward called by transformers' generate() with ever new keyword sets, are
+  the typical cases. The frame alone is skipped; the functions it calls keep
+  their compiled graphs. (A frame that needs exactly the limit keeps its
+  graphs.)
 """
 
 import itertools
@@ -71,15 +82,20 @@ class Options:
              instead of letting them run on the CPU fallback.
     min_dynamic_graph_ops: dynamic-shape graphs with fewer tensor operators
              than this run eagerly (see the module docstring); 0 disables.
+    eager_at_recompile_limit: frames Dynamo refuses to recompile run
+             eagerly (their callees keep their graphs; see the module
+             docstring); False keeps Dynamo's own behaviour.
     """
 
     fusions: tuple = ALL_FUSIONS
     strict: bool = False
     min_dynamic_graph_ops: int = 8
+    eager_at_recompile_limit: bool = True
 
     @classmethod
     def make(cls, fusions: Iterable[str] | None = None, strict: bool = False,
-             min_dynamic_graph_ops: int | None = None) -> "Options":
+             min_dynamic_graph_ops: int | None = None,
+             eager_at_recompile_limit: bool | None = None) -> "Options":
         chosen = ALL_FUSIONS if fusions is None else tuple(fusions)
         unknown = set(chosen) - set(ALL_FUSIONS)
         if unknown:
@@ -87,7 +103,10 @@ class Options:
         limit = cls.min_dynamic_graph_ops if min_dynamic_graph_ops is None else int(min_dynamic_graph_ops)
         if limit < 0:
             raise ValueError("min_dynamic_graph_ops must be >= 0")
-        return cls(fusions=chosen, strict=bool(strict), min_dynamic_graph_ops=limit)
+        at_limit = (cls.eager_at_recompile_limit if eager_at_recompile_limit is None
+                    else bool(eager_at_recompile_limit))
+        return cls(fusions=chosen, strict=bool(strict), min_dynamic_graph_ops=limit,
+                   eager_at_recompile_limit=at_limit)
 
 
 @dataclass
@@ -99,7 +118,7 @@ class GraphReport:
     fusions: Counter = field(default_factory=Counter)
     residency: dict = field(default_factory=dict)
     cpu_fallback_ops: Counter = field(default_factory=Counter)
-    runs_eagerly: bool = False
+    runs_eagerly: str = ""
 
     @property
     def fully_on_paras(self) -> bool:
@@ -114,7 +133,7 @@ class GraphReport:
         if self.cpu_fallback_ops:
             parts.append("CPU fallback: " + ", ".join(sorted(self.cpu_fallback_ops)))
         if self.runs_eagerly:
-            parts.append("runs eagerly (small dynamic-shape graph)")
+            parts.append(f"runs eagerly ({self.runs_eagerly})")
         return " | ".join(parts)
 
 
@@ -178,20 +197,67 @@ def _frame_name(code) -> str:
     return f"{code.co_name} ({os.path.basename(code.co_filename)}:{code.co_firstlineno})"
 
 
-def _run_eagerly_from_now_on(gm: fx.GraphModule):
-    """The graph's callable for this call; Dynamo skips the frame's code
-    afterwards. The code object is the root of the current trace. Skipping
-    is applied at the first call because Dynamo sets the code's execution
-    strategy itself when the compile returns."""
-    from torch._dynamo.eval_frame import skip_code
+def _hand_back(code, recursive: bool) -> None:
+    """Dynamo skips `code` from now on -- with `recursive`, also everything
+    it calls; otherwise the functions it calls keep their compiled graphs."""
+    from torch._dynamo.eval_frame import set_code_exec_strategy
+    from torch._dynamo.types import FrameAction, FrameExecStrategy
 
-    code = _root_code()
+    callees = FrameAction.SKIP if recursive else FrameAction.DEFAULT
+    set_code_exec_strategy(code, FrameExecStrategy(FrameAction.SKIP, callees))
+
+
+_frames: dict = {}
+_exceeded: list = []
+
+
+def _on_recompile() -> str:
+    import torch
+    from torch._guards import CompileContext
+
+    cid = CompileContext.current_compile_id()
+    if cid is None or cid.frame_compile_id is None:
+        return ""
+    if cid.frame_compile_id >= torch._dynamo.config.recompile_limit:
+        entry = _frames.get(cid.frame_id)
+        if entry is not None and entry[1]:
+            with _lock:
+                _exceeded.append((cid.frame_id, entry))
+    return ""
+
+
+def _install_recompile_hook() -> None:
+    from torch._dynamo.utils import (get_hook_for_recompile_user_context,
+                                     register_hook_for_recompile_user_context)
+
+    if _on_recompile not in (get_hook_for_recompile_user_context() or []):
+        register_hook_for_recompile_user_context(_on_recompile)
+
+
+def _hand_back_exceeded() -> None:
+    with _lock:
+        pending = list(_exceeded)
+        _exceeded.clear()
+    for frame_id, entry in pending:
+        if _frames.get(frame_id) is not entry:
+            continue
+        code, _, reports = entry
+        _hand_back(code, recursive=False)
+        for r in reports:
+            r.runs_eagerly = "recompile limit reached"
+
+
+def _graph_callable(gm: fx.GraphModule, code, hand_back_now: bool):
+    """The graph's callable. With `hand_back_now`, the frame is handed back
+    after this call. Dynamo sets the code's execution strategy itself when
+    the compile returns, so the first call is the earliest point."""
     forward = gm.forward
-    if code is None:
-        return forward
 
     def run(*args):
-        skip_code(code)
+        if _exceeded:
+            _hand_back_exceeded()
+        if hand_back_now and code is not None:
+            _hand_back(code, recursive=True)
         return forward(*args)
 
     return run
@@ -205,8 +271,20 @@ def make_backend(options: Options = Options()):
         from torch._dynamo.backends.common import aot_autograd
         from torch._functorch import config as functorch_config
 
+        from torch._guards import CompileContext
+
         ops.register()
-        report = GraphReport(graph_id=next(_ids), frame=_frame_name(_root_code()))
+        code = _root_code()
+        report = GraphReport(graph_id=next(_ids), frame=_frame_name(code))
+        cid = CompileContext.current_compile_id()
+        if cid is not None and code is not None:
+            _install_recompile_hook()
+            with _lock:
+                entry = _frames.get(cid.frame_id)
+                if entry is None or cid.frame_compile_id == 0 or entry[0] is not code:
+                    entry = (code, options.eager_at_recompile_limit, [])
+                    _frames[cid.frame_id] = entry
+                entry[2].append(report)
         report.fusions.update(passes.run(gm, set(options.fusions)))
 
         def analyser(stage):
@@ -231,10 +309,8 @@ def make_backend(options: Options = Options()):
         if (options.min_dynamic_graph_ops and _is_whole_frame(gm)
                 and _has_dynamic_shapes(example_inputs)
                 and _tensor_op_count(gm) < options.min_dynamic_graph_ops):
-            report.runs_eagerly = True
-            compiled = _run_eagerly_from_now_on(gm)
-        else:
-            compiled = gm.forward
+            report.runs_eagerly = "small dynamic-shape graph"
+        compiled = _graph_callable(gm, code, bool(report.runs_eagerly))
         with _lock:
             _reports.append(report)
         return compiled
