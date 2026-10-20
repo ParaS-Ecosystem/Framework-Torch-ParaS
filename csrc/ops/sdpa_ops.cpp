@@ -24,6 +24,7 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 #include "core/kernels.h"
 #include "ops/device_gemm.h"
@@ -218,7 +219,13 @@ struct FlashArgs {
     int64_t H, Lq, Lk, q_blocks;
     float scale;
     bool causal;
+    const signed char* mcls; const unsigned char* mqok;
+    int64_t k_blocks, mb_stride, mh_stride;
 };
+
+constexpr signed char kMaskDead = 0;
+constexpr signed char kMaskZero = 1;
+constexpr signed char kMaskMixed = 2;
 
 template <typename T, int D> class FlashKernel;
 
@@ -359,7 +366,16 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     }
 
     const int64_t k_end = a.causal ? (q0 + kFlashBlockQ < a.Lk ? q0 + kFlashBlockQ : a.Lk) : a.Lk;
+    const bool has_mask = a.mf != nullptr || a.mb != nullptr;
+    const int64_t msum = a.mcls == nullptr ? 0
+        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
+    const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
     for (int64_t j0 = 0; j0 < k_end; j0 += kFlashBlockK) {
+        const signed char tile = a.mcls == nullptr
+                                     ? (has_mask ? kMaskMixed : kMaskZero)
+                                     : a.mcls[msum * a.k_blocks + j0 / kFlashBlockK];
+        if (tile == kMaskDead && may_skip) continue;
+        const bool masked = tile != kMaskZero;
         flash_load_kv<T, D, kPer>(kp, vp, a, j0, tid, kvec, vvec, kreg, vreg);
         flash_store_kv<D, kPer>(klds, vlds, tid, kreg, vreg);
         sycl::group_barrier(it.get_group());
@@ -385,7 +401,6 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
             const int64_t tile_row0 = row0 + 16 * mt;
             const bool edge = j0 + kFlashBlockK > a.Lk || tile_row0 + 16 > a.Lq ||
                               (a.causal && j0 + kFlashBlockK - 1 > tile_row0);
-            const bool masked = a.mf != nullptr || a.mb != nullptr;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int row_l = 16 * mt + 4 * lg + i;
@@ -472,6 +487,121 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
 #endif
 }
 
+template <typename T> class MaskSummaryKernel;
+
+template <typename T, typename Item>
+PTSYCL_HOST_DEVICE inline void mask_summary_block(
+    const T* mf, const bool* mb, Strides4 ms, int64_t Hm, int64_t Lq, int64_t Lk,
+    int64_t q_blocks, int64_t k_blocks, float dead_below, signed char* cls,
+    unsigned char* qok, const Item& it, int* flags, int* rowlive) {
+    const int tid = static_cast<int>(it.get_local_id(0));
+    const int64_t g = static_cast<int64_t>(it.get_group(0));
+    const int64_t qb = g % q_blocks, bh = g / q_blocks;
+    const int64_t bm = bh / Hm, hm = bh % Hm;
+    if (tid < kFlashBlockQ) rowlive[tid] = 0;
+    for (int64_t kb = 0; kb < k_blocks; ++kb) {
+        if (tid < 2) flags[tid] = 0;
+        sycl::group_barrier(it.get_group());
+        for (int e = tid; e < kFlashBlockQ * kFlashBlockK; e += kFlashThreads) {
+            const int r = e / kFlashBlockK;
+            const int64_t row = qb * kFlashBlockQ + r, key = kb * kFlashBlockK + e % kFlashBlockK;
+            if (row >= Lq || key >= Lk) continue;
+            const int64_t o = bm * ms.s[0] + hm * ms.s[1] + row * ms.s[2] + key * ms.s[3];
+            bool dead, zero;
+            if (mb != nullptr) {
+                dead = !mb[o];
+                zero = mb[o];
+            } else {
+                const float v = static_cast<float>(mf[o]);
+                dead = v <= dead_below;
+                zero = v == 0.f;
+            }
+            if (!dead) { flags[0] = 1; rowlive[r] = 1; }
+            if (!zero) flags[1] = 1;
+        }
+        sycl::group_barrier(it.get_group());
+        if (tid == 0)
+            cls[(bh * q_blocks + qb) * k_blocks + kb] =
+                !flags[0] ? kMaskDead : (!flags[1] ? kMaskZero : kMaskMixed);
+        sycl::group_barrier(it.get_group());
+    }
+    if (tid == 0) {
+        unsigned char ok = 1;
+        for (int r = 0; r < kFlashBlockQ; ++r)
+            if (qb * kFlashBlockQ + r < Lq && !rowlive[r]) ok = 0;
+        qok[bh * q_blocks + qb] = ok;
+    }
+}
+
+struct MaskSummary {
+    Tensor cls, qok;
+    int64_t k_blocks = 0, mb_stride = 0, mh_stride = 0;
+};
+
+template <typename T>
+MaskSummary mask_block_summary(compat::Queue& queue, const Tensor& attn_bias,
+                               const Tensor& mask, int64_t B, int64_t H, int64_t Lq,
+                               int64_t Lk) {
+    struct Cached {
+        c10::weak_intrusive_ptr<c10::StorageImpl> storage{c10::intrusive_ptr<c10::StorageImpl>()};
+        int64_t offset = -1, version = -1, Lq = -1, Lk = -1, B = -1, H = -1;
+        std::vector<int64_t> sizes, strides;
+        c10::ScalarType dtype = c10::ScalarType::Undefined;
+        MaskSummary summary;
+    };
+    thread_local Cached& cached = *new Cached;
+    const bool cacheable = !attn_bias.is_inference();
+    if (cacheable) {
+        auto live = cached.storage.lock();
+        if (live && live.get() == attn_bias.storage().unsafeGetStorageImpl() &&
+            cached.offset == attn_bias.storage_offset() &&
+            cached.version == attn_bias._version() && cached.dtype == attn_bias.scalar_type() &&
+            cached.sizes == attn_bias.sizes().vec() && cached.strides == attn_bias.strides().vec() &&
+            cached.B == B && cached.H == H && cached.Lq == Lq && cached.Lk == Lk &&
+            cached.summary.cls.device() == mask.device())
+            return cached.summary;
+    }
+    const Strides4 ms = strides4(mask);
+    const int64_t Bm = ms.s[0] ? B : 1, Hm = ms.s[1] ? H : 1;
+    const int64_t q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
+    const int64_t k_blocks = (Lk + kFlashBlockK - 1) / kFlashBlockK;
+    MaskSummary out;
+    out.cls = at::empty({Bm * Hm * q_blocks * k_blocks}, mask.options().dtype(c10::kChar));
+    out.qok = at::empty({Bm * Hm * q_blocks}, mask.options().dtype(c10::kByte));
+    out.k_blocks = k_blocks;
+    out.mb_stride = ms.s[0] ? Hm : 0;
+    out.mh_stride = ms.s[1] ? 1 : 0;
+    const bool is_bool = mask.scalar_type() == c10::kBool;
+    const T* mf = is_bool ? nullptr : data_ptr<T>(mask);
+    const bool* mb = is_bool ? mask.data_ptr<bool>() : nullptr;
+    const float dead_below = 0.5f * static_cast<float>(std::numeric_limits<T>::lowest());
+    signed char* cls = out.cls.data_ptr<signed char>();
+    unsigned char* qok = out.qok.data_ptr<unsigned char>();
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> flags(sycl::range<1>(2), cgh);
+        sycl::local_accessor<int, 1> rowlive(sycl::range<1>(kFlashBlockQ), cgh);
+        cgh.template parallel_for<MaskSummaryKernel<T>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(Bm * Hm * q_blocks * kFlashThreads)),
+                              sycl::range<1>(static_cast<std::size_t>(kFlashThreads))),
+            [=](sycl::nd_item<1> it) {
+                mask_summary_block<T>(mf, mb, ms, Hm, Lq, Lk, q_blocks, k_blocks, dead_below,
+                                      cls, qok, it, &flags[0], &rowlive[0]);
+            });
+    });
+    if (cacheable) {
+        cached.storage = c10::weak_intrusive_ptr<c10::StorageImpl>(
+            attn_bias.storage().getWeakStorageImpl());
+        cached.offset = attn_bias.storage_offset();
+        cached.version = attn_bias._version();
+        cached.dtype = attn_bias.scalar_type();
+        cached.sizes = attn_bias.sizes().vec();
+        cached.strides = attn_bias.strides().vec();
+        cached.B = B; cached.H = H; cached.Lq = Lq; cached.Lk = Lk;
+        cached.summary = out;
+    }
+    return out;
+}
+
 template <typename T, int D>
 void flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t groups) {
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
@@ -526,6 +656,15 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             fa.H = H; fa.Lq = Lq; fa.Lk = Lk;
             fa.q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
             fa.scale = sc; fa.causal = is_causal;
+            MaskSummary summary;
+            if (has_mask) {
+                summary = mask_block_summary<scalar_t>(queue, *attn_bias, mask, B, H, Lq, Lk);
+                fa.mcls = summary.cls.data_ptr<signed char>();
+                fa.mqok = summary.qok.data_ptr<unsigned char>();
+                fa.k_blocks = summary.k_blocks;
+                fa.mb_stride = summary.mb_stride;
+                fa.mh_stride = summary.mh_stride;
+            }
             const int64_t groups = B * H * fa.q_blocks;
             if (D == 64) flash_attention<scalar_t, 64>(queue, fa, groups);
             else flash_attention<scalar_t, 128>(queue, fa, groups);

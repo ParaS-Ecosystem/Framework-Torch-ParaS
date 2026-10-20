@@ -333,3 +333,33 @@ def test_sdpa_flash_kernel_cases(device):
                 assert out.dtype == dtype and out.shape == (B, H, Lq, D)
                 err = ((out.cpu().double() - ref).norm() / ref.norm()).item()
                 assert err < tol, (dtype, B, H, Lq, Lk, D, list(kw), err)
+
+
+def test_sdpa_flash_block_masks(device):
+    torch.manual_seed(0)
+    B, H, L, D = 1, 2, 300, 64
+    for dtype in (torch.bfloat16, torch.float16):
+        q = torch.randn(B, L, H, D).transpose(1, 2).to(dtype).to(device)
+        k = torch.randn(B, H, L, D).to(dtype).to(device)
+        v = torch.randn(B, H, L, D).to(dtype).to(device)
+        causal = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        additive = torch.triu(torch.full((L, L), torch.finfo(dtype).min), 1)[None, None].to(dtype)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=additive.to(device))
+        assert torch.equal(out.cpu(), causal.cpu()), dtype
+        boolean = torch.ones(L, L, dtype=torch.bool).tril()[None, None]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=boolean.to(device))
+        assert torch.equal(out.cpu(), causal.cpu()), dtype
+        plain = F.scaled_dot_product_attention(q, k, v)
+        zero = torch.zeros(B, 1, L, L, dtype=dtype, device=device)
+        assert torch.equal(F.scaled_dot_product_attention(q, k, v, attn_mask=zero).cpu(), plain.cpu())
+        pad = additive.clone()
+        pad[..., :, :20] = torch.finfo(dtype).min
+        ref = F.scaled_dot_product_attention(q.cpu().double(), k.cpu().double(), v.cpu().double(),
+                                             attn_mask=pad.double())
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=pad.to(device))
+        err = ((out.cpu().double() - ref).norm() / ref.norm()).item()
+        assert err < 2.5e-2, (dtype, err)
+        m = additive.to(device)
+        F.scaled_dot_product_attention(q, k, v, attn_mask=m)
+        m.zero_()
+        assert torch.equal(F.scaled_dot_product_attention(q, k, v, attn_mask=m).cpu(), plain.cpu())
