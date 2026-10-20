@@ -67,6 +67,47 @@ For every graph TorchDynamo captures:
    `torch_paras.compile(model, min_dynamic_graph_ops=0,
    eager_at_recompile_limit=False)` compiles and keeps every graph.
 
+## One Dynamo cache per layer
+
+Dynamo keeps compiled graphs per code object, and the layers of a transformer
+share one `forward`. Each layer specialises its graphs on its own Python
+attributes -- `layer_idx`, and through it its own slot of the KV cache -- so
+when the layers run as separate frames (a graph break inside the layer, e.g.
+an MoE's host read) all their variants compete in one cache: lookups scan
+dozens of entries and the frame soon reaches Dynamo's recompile limit.
+
+`torch_paras.compile` therefore gives each instance of a repeated block its own
+copy of the `forward` code object (`optimizer.specialize_repeated_blocks`; same
+bytecode, bound as an instance attribute). A block qualifies when it is one of
+two or more instances of a class in an `nn.ModuleList` / `nn.Sequential` and
+the instances differ in a Python scalar attribute of the block or one of its
+submodules (Param2-17B: `attention.layer_idx`). Blocks that differ only in their
+weights, such as an MoE's experts, share graphs anyway and are left alone.
+Each layer is then compiled on its own, after which a cached decode keeps every
+layer compiled. The price is compilation time: Param2-17B's benchmark shape
+mix (prefill at four shapes, generate() at batch 1 and 4) compiles in ~235 s
+instead of ~30 s. A layer then
+legitimately needs more graphs than Dynamo's default recompile limit (8)
+allows -- uncached and cached prefill, decode, each first static and then
+dynamic, per batch size; a `generate()` workload reaches ~12 -- so
+specialising raises `torch._dynamo.config.recompile_limit` to at least 32
+(process-wide; each layer keeps its own cache, so a lookup only scans that
+layer's entries).
+
+`specialize_blocks=False` turns this off; `optimizer.unspecialize(model)`
+removes the per-instance copies (e.g. before pickling the module).
+`torch.compile(model, backend="paras")` cannot do it: a Dynamo backend only
+sees graphs.
+
+For transformers' `generate()`, compile `forward` in place -- `generate()` on
+the wrapper returned by `torch.compile` runs the original, uncompiled module:
+
+```python
+torch_paras.optimizer.specialize_repeated_blocks(model)
+model.forward = torch.compile(model.forward, backend="paras")
+model.generate(input_ids, max_new_tokens=128)
+```
+
 `torch_paras.optimizer.reports()` returns one `GraphReport` per captured
 graph: the Python function it came from (`frame`, "name (file:line)"), the
 fusions applied and the residency counts of its forward, backward or

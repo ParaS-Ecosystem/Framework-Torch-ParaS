@@ -342,6 +342,59 @@ def test_recompile_limit_runs_eagerly(device):
                 "a handed-back frame was compiled again"
 
 
+class _Layer(nn.Module):
+    """A transformer-style layer: specialises on its own index and breaks
+    the graph (like an MoE's host read), so each call is its own frame."""
+
+    def __init__(self, layer_idx):
+        super().__init__()
+        self.proj = nn.Linear(8, 8)
+        self.proj.layer_idx = layer_idx
+
+    def forward(self, x):
+        x = self.proj(x) * (self.proj.layer_idx + 1)
+        torch._dynamo.graph_break()
+        return x + self.proj.layer_idx
+
+
+class _Stack(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.layers = nn.ModuleList([_Layer(i) for i in range(n)])
+        self.experts = nn.ModuleList([nn.Linear(8, 8) for _ in range(n)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return sum(e(x) for e in self.experts)
+
+
+def test_specialize_repeated_blocks(device):
+    torch.manual_seed(0)
+    x = torch.randn(3, 8, device=device)
+    for specialize, eager_expected in ((True, False), (False, True)):
+        _reset()
+        stack = _Stack(4).to(device)
+        ref = stack(x)
+        with torch._dynamo.config.patch(recompile_limit=2):
+            compiled = torch_paras.compile(stack, specialize_blocks=specialize)
+            raised = torch._dynamo.config.recompile_limit >= 32
+            for _ in range(3):
+                out = compiled(x)
+        assert raised == specialize, "recompile budget"
+        assert torch.equal(out.cpu(), ref.cpu()), specialize
+        own = ["forward" in vars(layer) for layer in stack.layers]
+        assert own == [specialize] * 4, own
+        assert not any("forward" in vars(e) for e in stack.experts), "experts differ only in weights"
+        codes = {id(layer.forward.__code__) for layer in stack.layers}
+        assert len(codes) == (4 if specialize else 1), len(codes)
+        at_limit = [r for r in optimizer.reports() if r.runs_eagerly == "recompile limit reached"]
+        assert bool(at_limit) == eager_expected, [r.summary() for r in optimizer.reports()]
+        if specialize:
+            assert optimizer.unspecialize(stack) == 4
+            assert not any("forward" in vars(layer) for layer in stack.layers)
+
+
 def test_fusions_option(device):
     _reset()
     mlp = SwiGLU(16, 32).to(device)

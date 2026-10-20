@@ -28,7 +28,9 @@
 
 Works for inference and training: fused subgraphs carry ParaS backward
 kernels, and every other operator runs on its ParaS kernel exactly as in
-eager mode. ``reports()`` describes what was fused and where each operator of
+eager mode. ``torch_paras.compile`` also gives each layer of a transformer its
+own Dynamo cache (``specialize_repeated_blocks``), which plain
+``torch.compile(backend="paras")`` cannot do. ``reports()`` describes what was fused and where each operator of
 the compiled graphs executes.
 """
 
@@ -36,6 +38,7 @@ from typing import Iterable
 
 import torch
 
+from .blocks import specialize_repeated_blocks, unspecialize
 from .backend import (
     ALL_FUSIONS,
     GraphReport,
@@ -59,12 +62,15 @@ __all__ = [
     "register",
     "reports",
     "reset_reports",
+    "specialize_repeated_blocks",
+    "unspecialize",
 ]
 
 
 def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False,
             min_dynamic_graph_ops: int | None = None,
             eager_at_recompile_limit: bool | None = None,
+            specialize_blocks: bool = True,
             fullgraph: bool = False, dynamic: bool | None = None):
     """``torch.compile`` with the paras backend.
 
@@ -73,12 +79,18 @@ def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False
                operator without a ParaS kernel.
     min_dynamic_graph_ops: dynamic-shape graphs with fewer tensor operators
                run eagerly (default 8; 0 compiles every graph).
-    eager_at_recompile_limit: frames that reach Dynamo's recompile limit run
-               eagerly with Dynamo off for their callees (default True).
+    eager_at_recompile_limit: frames Dynamo refuses to recompile run eagerly;
+               their callees keep their graphs (default True).
+    specialize_blocks: give each instance of a repeated, per-instance block
+               (a transformer's layers) its own forward code object, so each
+               keeps its own Dynamo cache (``specialize_repeated_blocks``;
+               ``unspecialize`` undoes it). Modules only; default True.
     fullgraph, dynamic: forwarded to torch.compile.
     """
     options = Options.make(fusions=fusions, strict=strict,
                            min_dynamic_graph_ops=min_dynamic_graph_ops,
                            eager_at_recompile_limit=eager_at_recompile_limit)
+    if specialize_blocks and isinstance(model, torch.nn.Module):
+        specialize_repeated_blocks(model)
     return torch.compile(model, backend=make_backend(options),
                          fullgraph=fullgraph, dynamic=dynamic)
