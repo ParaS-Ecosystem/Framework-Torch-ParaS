@@ -23,11 +23,18 @@
 Pipeline for every graph Dynamo captures:
 
 1. fusion passes on the Dynamo graph (passes.py),
-2. AOTAutograd: functionalised ATen forward / backward graphs (the backward of
-   a fused operator is its ParaS backward kernel, see ops.py),
-3. residency analysis of each ATen graph (residency.py); with ``strict`` a
-   graph containing an operator without a ParaS kernel is rejected,
-4. the ATen graphs execute operator by operator on the ParaS kernels.
+2. analysis at compile time: AOTAutograd traces the functionalised ATen
+   forward and backward graphs (the backward of a fused operator is its ParaS
+   backward kernel, see ops.py) and residency.py classifies every operator;
+   with ``strict`` a graph containing an operator without a ParaS kernel is
+   rejected,
+3. execution: the fused Dynamo graph runs through the dispatcher and the
+   autograd engine exactly like eager code, on the same ParaS kernels.
+
+Running the Dynamo graph rather than AOTAutograd's compiled function avoids
+AOTAutograd's per-call runtime wrapper and its Python-level backward, which
+dominate for models that call many small compiled regions (an MoE's expert
+MLPs called from an eager expert loop: ~40 us per call).
 """
 
 import itertools
@@ -114,13 +121,14 @@ def make_backend(options: Options = Options()):
     def paras_backend(gm: fx.GraphModule, example_inputs: Sequence[object]):
         from functorch.compile import make_boxed_func
         from torch._dynamo.backends.common import aot_autograd
+        from torch._functorch import config as functorch_config
 
         ops.register()
         report = GraphReport(graph_id=next(_ids))
         report.fusions.update(passes.run(gm, set(options.fusions)))
 
-        def compiler(stage):
-            def compile_stage(aten_gm: fx.GraphModule, _inputs):
+        def analyser(stage):
+            def analyse_stage(aten_gm: fx.GraphModule, _inputs):
                 kinds, cpu_ops = residency.analyse(aten_gm)
                 report.residency[stage] = dict(kinds)
                 report.cpu_fallback_ops.update(cpu_ops)
@@ -129,16 +137,18 @@ def make_backend(options: Options = Options()):
                         f"{stage} graph uses operators without a ParaS kernel: "
                         + ", ".join(sorted(cpu_ops)))
                 return make_boxed_func(aten_gm.forward)
-            return compile_stage
+            return analyse_stage
 
-        compiled = aot_autograd(
-            fw_compiler=compiler("forward"),
-            bw_compiler=compiler("backward"),
-            inference_compiler=compiler("inference"),
-        )(gm, example_inputs)
+        with functorch_config.patch(force_non_lazy_backward_lowering=True):
+            aot_autograd(
+                fw_compiler=analyser("forward"),
+                bw_compiler=analyser("backward"),
+                inference_compiler=analyser("inference"),
+            )(gm, example_inputs)
         with _lock:
             _reports.append(report)
-        return compiled
+        gm.recompile()
+        return gm.forward
 
     return paras_backend
 

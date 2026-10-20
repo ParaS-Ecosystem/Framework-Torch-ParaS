@@ -1,7 +1,8 @@
 # Graph optimizer (`torch.compile(backend="paras")`)
 
 `torch_paras.optimizer` is a TorchDynamo backend for paras devices. It works
-for inference and training and never changes what a model computes.
+for inference and training; a compiled forward computes exactly what eager
+computes, and compiled gradients equal eager gradients up to rounding.
 
 ```python
 import torch, torch_paras
@@ -18,11 +19,14 @@ For every graph TorchDynamo captures:
 
 1. **Fusion passes** (`optimizer/passes.py`) run on the Dynamo graph, before
    autograd. A matched subgraph is replaced by one `paras::` kernel.
-2. **AOTAutograd** produces functionalised ATen forward and backward graphs.
-   Fused kernels carry registered backward formulas (`optimizer/ops.py`), so
-   the backward of a fused RMSNorm is `paras::rms_norm_backward`.
+2. **AOTAutograd** traces functionalised ATen forward and backward graphs at
+   compile time (the backward is traced immediately, not at the first
+   backward call). Fused kernels have C++ autograd kernels
+   (`csrc/ops/fused_ops.cpp`), so the backward of a fused RMSNorm is
+   `paras::rms_norm_backward`; `optimizer/ops.py` gives tracing their fake
+   kernels.
 3. **Residency analysis** (`optimizer/residency.py`) classifies every ATen
-   operator of each graph from the dispatcher tables:
+   operator of each traced graph from the dispatcher tables:
    * `paras`: ParaS registers a PrivateUse1 kernel (or the op is a structured
      functional form whose out= variant has one);
    * `composite`: a PyTorch composite that decomposes into other operators,
@@ -30,8 +34,14 @@ For every graph TorchDynamo captures:
    * `cpu`: no ParaS kernel; the op would run on the boxed CPU fallback.
    With `strict=True` a graph containing a `cpu` op raises
    `ParasCompileError`.
-4. The ATen graphs execute operator by operator on the ParaS kernels -- the
-   same kernels eager mode uses.
+4. **Execution**: the fused Dynamo graph runs through the dispatcher and the
+   autograd engine like eager code, on the same ParaS kernels eager mode
+   uses. The traced ATen graphs are used for analysis only: running
+   AOTAutograd's compiled function instead adds a runtime wrapper and a
+   Python-level backward to every call, about 40 us per call -- for an MoE
+   whose expert MLPs are compiled regions called from an eager expert loop
+   (Param2-17B: ~1,200 calls per forward) that made compiled training 15 %
+   slower than eager.
 
 `torch_paras.optimizer.reports()` returns one `GraphReport` per captured
 graph: the fusions applied and the residency counts of its forward, backward
@@ -69,6 +79,13 @@ summation order matches). Fusing therefore cannot change a model's result --
 which matters for mixture-of-experts models, where a one-ulp difference can
 flip a top-k routing decision. `tests/test_optimizer.py` asserts
 `torch.equal` between fused and eager outputs.
+
+The fused **backward** kernels (`paras::*_backward`) compute the same
+gradients as autograd's decomposed backward but not bit for bit (they
+accumulate in a different order), so compiled and eager training agree to
+rounding (the tests check 1e-4) and an MoE's later training steps can route a
+few tokens differently. With `fusions=()` compiled training reproduces eager
+exactly.
 
 ## Execution telemetry and strict mode
 

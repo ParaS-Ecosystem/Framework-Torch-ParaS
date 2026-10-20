@@ -68,9 +68,9 @@ for report in torch_paras.optimizer.reports():
 
 TorchDynamo graphs are rewritten by fusion passes (RMSNorm, SwiGLU,
 rotate-half -> `paras::` fused kernels that reproduce the eager result bit
-for bit), lowered by AOTAutograd, and checked so that every operator has a
-ParaS kernel (`torch_paras.compile(model, strict=True)` rejects any that
-would fall back to the CPU).
+for bit), traced by AOTAutograd so that every forward and backward operator
+is checked for a ParaS kernel (`torch_paras.compile(model, strict=True)`
+rejects any that would fall back to the CPU), and executed like eager code.
 
 ## Repository layout
 
