@@ -63,14 +63,18 @@ __all__ = [
 
 
 def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False,
+            min_dynamic_graph_ops: int | None = None,
             fullgraph: bool = False, dynamic: bool | None = None):
     """``torch.compile`` with the paras backend.
 
     fusions:   fusion passes to apply (default: all of ``ALL_FUSIONS``).
     strict:    raise ParasCompileError if a compiled graph contains an
                operator without a ParaS kernel.
+    min_dynamic_graph_ops: dynamic-shape graphs with fewer tensor operators
+               run eagerly (default 8; 0 compiles every graph).
     fullgraph, dynamic: forwarded to torch.compile.
     """
-    options = Options.make(fusions=fusions, strict=strict)
+    options = Options.make(fusions=fusions, strict=strict,
+                           min_dynamic_graph_ops=min_dynamic_graph_ops)
     return torch.compile(model, backend=make_backend(options),
                          fullgraph=fullgraph, dynamic=dynamic)

@@ -42,6 +42,17 @@ For every graph TorchDynamo captures:
    whose expert MLPs are compiled regions called from an eager expert loop
    (Param2-17B: ~1,200 calls per forward) that made compiled training 15 %
    slower than eager.
+5. **Small dynamic-shape graphs run eagerly.** When Dynamo recompiles a frame
+   with dynamic shapes, each later call evaluates guards over several cache
+   entries and runs a SymInt prologue, about 10-20 us. A frame captured whole
+   (no graph break) whose graph has fewer than `min_dynamic_graph_ops`
+   tensor operators (default 8) cannot win that back, so after its first call
+   Dynamo skips its code and it runs in the interpreter -- bit-identical to the
+   graph's forward. The typical case is an MoE's expert MLP called once per
+   expert with a different token count: for Param2-17B prefill this removes
+   ~1,200 Dynamo frame entries per forward. `GraphReport.runs_eagerly` marks
+   such graphs; `torch_paras.compile(model, min_dynamic_graph_ops=0)` compiles
+   every graph.
 
 `torch_paras.optimizer.reports()` returns one `GraphReport` per captured
 graph: the fusions applied and the residency counts of its forward, backward

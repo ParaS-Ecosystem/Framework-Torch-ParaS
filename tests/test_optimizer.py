@@ -270,6 +270,45 @@ def test_dynamic_sequence_lengths(device):
             _close(compiled(x, cos, sin), block(x, cos, sin), 1e-5, f"seq {seq}")
 
 
+def _expert_loop(experts):
+    """An MoE's eager expert loop: Dynamo cannot trace the data-dependent
+    branch, so each expert MLP is a nested frame with a varying token count."""
+    def moe(x, counts):
+        out, start = [], 0
+        for i, n in enumerate(counts.cpu().numpy()):
+            if n == 0:
+                continue
+            out.append(experts[i](x[start:start + n]))
+            start += n
+        return torch.cat(out)
+    return moe
+
+
+def test_small_dynamic_graph_runs_eagerly(device):
+    torch.manual_seed(0)
+    experts = nn.ModuleList([SwiGLU(16, 32) for _ in range(4)]).to(device)
+    counts = torch.tensor([3, 0, 5, 2])
+    x = torch.randn(int(counts.sum()), 16, device=device)
+    for limit, eager_expected in ((None, True), (0, False)):
+        _reset()
+        moe = _expert_loop(experts)
+        compiled = torch_paras.compile(moe, min_dynamic_graph_ops=limit)
+        with torch.no_grad():
+            for _ in range(3):
+                out = compiled(x, counts)
+        assert torch.equal(out.cpu(), moe(x, counts).cpu()), f"limit {limit}: result differs"
+        eager = [r for r in optimizer.reports() if r.runs_eagerly]
+        assert bool(eager) == eager_expected, [r.summary() for r in optimizer.reports()]
+    _reset()
+    compiled = torch_paras.compile(_expert_loop(experts))
+    with torch.no_grad():
+        for n in ([3, 0, 5, 2], [1, 4, 2, 3], [2, 2, 2, 4], [5, 1, 1, 3]):
+            compiled(x, torch.tensor(n))
+        graphs = len(optimizer.reports())
+        compiled(x, torch.tensor([4, 3, 2, 1]))
+    assert len(optimizer.reports()) == graphs, "a skipped frame was compiled again"
+
+
 def test_fusions_option(device):
     _reset()
     mlp = SwiGLU(16, 32).to(device)
