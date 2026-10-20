@@ -95,6 +95,7 @@ class GraphReport:
     """What the backend did with one captured graph."""
 
     graph_id: int
+    frame: str = ""
     fusions: Counter = field(default_factory=Counter)
     residency: dict = field(default_factory=dict)
     cpu_fallback_ops: Counter = field(default_factory=Counter)
@@ -105,7 +106,7 @@ class GraphReport:
         return not self.cpu_fallback_ops
 
     def summary(self) -> str:
-        parts = [f"graph {self.graph_id}"]
+        parts = [f"graph {self.graph_id}" + (f" [{self.frame}]" if self.frame else "")]
         if self.fusions:
             parts.append("fused " + ", ".join(f"{k} x{v}" for k, v in sorted(self.fusions.items())))
         for stage, kinds in self.residency.items():
@@ -162,16 +163,29 @@ def _is_whole_frame(gm: fx.GraphModule) -> bool:
     return reason is not None and not reason.graph_break
 
 
+def _root_code():
+    """Code object of the frame Dynamo is compiling, or None."""
+    from torch._guards import TracingContext
+
+    ctx = TracingContext.try_get()
+    return ctx.traced_code[0] if ctx is not None and ctx.traced_code else None
+
+
+def _frame_name(code) -> str:
+    if code is None:
+        return ""
+    import os
+    return f"{code.co_name} ({os.path.basename(code.co_filename)}:{code.co_firstlineno})"
+
+
 def _run_eagerly_from_now_on(gm: fx.GraphModule):
     """The graph's callable for this call; Dynamo skips the frame's code
     afterwards. The code object is the root of the current trace. Skipping
     is applied at the first call because Dynamo sets the code's execution
     strategy itself when the compile returns."""
     from torch._dynamo.eval_frame import skip_code
-    from torch._guards import TracingContext
 
-    ctx = TracingContext.try_get()
-    code = ctx.traced_code[0] if ctx is not None and ctx.traced_code else None
+    code = _root_code()
     forward = gm.forward
     if code is None:
         return forward
@@ -192,7 +206,7 @@ def make_backend(options: Options = Options()):
         from torch._functorch import config as functorch_config
 
         ops.register()
-        report = GraphReport(graph_id=next(_ids))
+        report = GraphReport(graph_id=next(_ids), frame=_frame_name(_root_code()))
         report.fusions.update(passes.run(gm, set(options.fusions)))
 
         def analyser(stage):

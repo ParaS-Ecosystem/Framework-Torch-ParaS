@@ -55,8 +55,9 @@ For every graph TorchDynamo captures:
    every graph.
 
 `torch_paras.optimizer.reports()` returns one `GraphReport` per captured
-graph: the fusions applied and the residency counts of its forward, backward
-or inference graph.
+graph: the Python function it came from (`frame`, "name (file:line)"), the
+fusions applied and the residency counts of its forward, backward or
+inference graph.
 
 ## Fusions
 
