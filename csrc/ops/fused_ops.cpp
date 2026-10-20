@@ -19,6 +19,8 @@
 
 #include <cmath>
 
+#include <torch/torch.h>
+
 #include "core/kernels.h"
 
 // NOTE: these are registered under a new "paras::" op namespace rather than
@@ -29,8 +31,6 @@
 // autograd for training, since AutogradPrivateUse1 is registered as a plain
 // fallthrough elsewhere in this codebase. swiglu and rotate_half have no
 // aten:: identity at all. All three are exposed with an explicit backward
-// counterpart and a torch.autograd.Function wrapper on the Python side
-// (python/torch_paras/nn.py) instead.
 
 namespace ptsycl {
 namespace {
@@ -332,4 +332,90 @@ TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
     m.impl("swiglu_backward", &ptsycl::swiglu_backward);
     m.impl("rotate_half", &ptsycl::rotate_half);
     m.impl("rotate_half_backward", &ptsycl::rotate_half_backward);
+}
+
+namespace ptsycl {
+namespace {
+
+using torch::autograd::AutogradContext;
+using torch::autograd::variable_list;
+
+template <typename Sig>
+c10::TypedOperatorHandle<Sig> paras_op(const char* name) {
+    return c10::Dispatcher::singleton().findSchemaOrThrow(name, "").typed<Sig>();
+}
+
+struct RmsNormFunction : public torch::autograd::Function<RmsNormFunction> {
+    static variable_list forward(AutogradContext* ctx, const Tensor& input,
+                                 const Tensor& weight, double eps) {
+        static const auto op = paras_op<std::tuple<Tensor, Tensor>(
+            const Tensor&, const Tensor&, double)>("paras::rms_norm");
+        at::AutoDispatchBelowADInplaceOrView guard;
+        auto [out, rstd] = op.call(input, weight, eps);
+        ctx->save_for_backward({input, weight, rstd});
+        ctx->mark_non_differentiable({rstd});
+        return {out, rstd};
+    }
+    static variable_list backward(AutogradContext* ctx, variable_list grads) {
+        static const auto op = paras_op<std::tuple<Tensor, Tensor>(
+            const Tensor&, const Tensor&, const Tensor&, const Tensor&)>(
+            "paras::rms_norm_backward");
+        const auto saved = ctx->get_saved_variables();
+        auto [grad_input, grad_weight] =
+            op.call(grads[0].contiguous(), saved[0], saved[1], saved[2]);
+        return {grad_input, grad_weight, Tensor()};
+    }
+};
+
+struct SwigluFunction : public torch::autograd::Function<SwigluFunction> {
+    static Tensor forward(AutogradContext* ctx, const Tensor& gate, const Tensor& up) {
+        static const auto op =
+            paras_op<Tensor(const Tensor&, const Tensor&)>("paras::swiglu");
+        at::AutoDispatchBelowADInplaceOrView guard;
+        ctx->save_for_backward({gate, up});
+        return op.call(gate, up);
+    }
+    static variable_list backward(AutogradContext* ctx, variable_list grads) {
+        static const auto op = paras_op<std::tuple<Tensor, Tensor>(
+            const Tensor&, const Tensor&, const Tensor&)>("paras::swiglu_backward");
+        const auto saved = ctx->get_saved_variables();
+        auto [grad_gate, grad_up] = op.call(grads[0].contiguous(), saved[0], saved[1]);
+        return {grad_gate, grad_up};
+    }
+};
+
+struct RotateHalfFunction : public torch::autograd::Function<RotateHalfFunction> {
+    static Tensor forward(AutogradContext*, const Tensor& x) {
+        static const auto op = paras_op<Tensor(const Tensor&)>("paras::rotate_half");
+        at::AutoDispatchBelowADInplaceOrView guard;
+        return op.call(x);
+    }
+    static variable_list backward(AutogradContext*, variable_list grads) {
+        static const auto op =
+            paras_op<Tensor(const Tensor&)>("paras::rotate_half_backward");
+        return {op.call(grads[0].contiguous())};
+    }
+};
+
+std::tuple<Tensor, Tensor> rms_norm_autograd(const Tensor& input, const Tensor& weight,
+                                             double eps) {
+    auto out = RmsNormFunction::apply(input, weight, eps);
+    return {out[0], out[1]};
+}
+
+Tensor swiglu_autograd(const Tensor& gate, const Tensor& up) {
+    return SwigluFunction::apply(gate, up);
+}
+
+Tensor rotate_half_autograd(const Tensor& x) {
+    return RotateHalfFunction::apply(x);
+}
+
+}
+}
+
+TORCH_LIBRARY_IMPL(paras, AutogradPrivateUse1, m) {
+    m.impl("rms_norm", &ptsycl::rms_norm_autograd);
+    m.impl("swiglu", &ptsycl::swiglu_autograd);
+    m.impl("rotate_half", &ptsycl::rotate_half_autograd);
 }

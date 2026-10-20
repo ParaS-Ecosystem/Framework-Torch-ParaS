@@ -18,12 +18,12 @@
 // -----------------------------------------------------------------------------
 """
 
-"""Fake kernels and autograd formulas for the fused ``paras::`` operators.
+"""Fake kernels for the fused ``paras::`` operators.
 
-The kernels live in csrc/ops/fused_ops.cpp. Registering their shape/dtype
-rules (fake kernels) lets FakeTensor tracing see through them, and
-registering their backward formulas lets AOTAutograd build training graphs in
-which the backward also runs on the ParaS backward kernels.
+The kernels and their autograd (backward = the ParaS backward kernel) live in
+csrc/ops/fused_ops.cpp. Registering their shape/dtype rules (fake kernels)
+lets FakeTensor tracing -- Dynamo and AOTAutograd -- see through them, so
+training graphs also run their backward on the ParaS backward kernels.
 """
 
 import torch
@@ -66,38 +66,4 @@ def register() -> None:
     def _rotate_half_backward_fake(grad_out):
         return torch.empty_like(grad_out)
 
-    def _rms_norm_setup(ctx, inputs, output):
-        input, weight, _eps = inputs
-        _out, rstd = output
-        ctx.mark_non_differentiable(rstd)
-        ctx.save_for_backward(input, weight, rstd)
-
-    def _rms_norm_backward(ctx, grad_out, _grad_rstd):
-        input, weight, rstd = ctx.saved_tensors
-        grad_input, grad_weight = torch.ops.paras.rms_norm_backward(
-            grad_out.contiguous(), input, weight, rstd)
-        return grad_input, grad_weight, None
-
-    torch.library.register_autograd(
-        "paras::rms_norm", _rms_norm_backward, setup_context=_rms_norm_setup)
-
-    def _swiglu_setup(ctx, inputs, output):
-        ctx.save_for_backward(*inputs)
-
-    def _swiglu_backward(ctx, grad_out):
-        gate, up = ctx.saved_tensors
-        return torch.ops.paras.swiglu_backward(grad_out.contiguous(), gate, up)
-
-    torch.library.register_autograd(
-        "paras::swiglu", _swiglu_backward, setup_context=_swiglu_setup)
-
-    def _rotate_half_setup(ctx, inputs, output):
-        pass
-
-    def _rotate_half_backward(ctx, grad_out):
-        return torch.ops.paras.rotate_half_backward(grad_out.contiguous())
-
-    torch.library.register_autograd(
-        "paras::rotate_half", _rotate_half_backward,
-        setup_context=_rotate_half_setup)
     _registered = True
