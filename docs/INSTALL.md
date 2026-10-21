@@ -127,8 +127,9 @@ Make the vendor libraries (oneDNN for CPU, cuDNN for NVIDIA, MIOpen for AMD)
 available on `LD_LIBRARY_PATH`. MIOpen also needs a writable kernel
 database: if its default location is read-only (for example inside a Python
 environment), set `MIOPEN_USER_DB_PATH` and `MIOPEN_CUSTOM_CACHE_DIR` to a
-writable directory. MIOpen has no bfloat16 activation kernels, so bfloat16
-sigmoid/SiLU on AMD GPUs always run the ParaS kernel. See [Testing](TESTING.md) for focused CLAP and fast-build
+writable directory. On AMD GPUs SiLU always runs the ParaS kernel (MIOpen's
+SiLU is several times slower), and so does bfloat16 sigmoid (MIOpen has no
+bfloat16 activation kernels); fp32/fp16 sigmoid runs in MIOpen. See [Testing](TESTING.md) for focused CLAP and fast-build
 checks and the current activation limits.
 
 In a GPU-enabled build with `N` visible GPUs, `paras:0` through

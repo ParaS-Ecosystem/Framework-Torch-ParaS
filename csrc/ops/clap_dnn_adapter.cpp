@@ -420,6 +420,7 @@ bool map_dtype(
 
 clap::IDnnBackend* activation_backend(
     const at::Tensor& like,
+    clap::ActivationMode mode,
     clap::DataType& dtype,
     clap::DnnBackendType& requested)
 {
@@ -428,7 +429,7 @@ clap::IDnnBackend* activation_backend(
 
     if (!select_backend(like, requested) ||
         (requested == clap::DnnBackendType::ROCM &&
-         dtype == clap::DataType::BFloat16) ||
+         (dtype == clap::DataType::BFloat16 || mode == clap::ActivationMode::SiLU)) ||
         !backend_override_matches(requested))
         return nullptr;
 
@@ -457,7 +458,7 @@ bool try_activation_forward(
     clap::DataType dtype;
     clap::DnnBackendType requested;
 
-    clap::IDnnBackend* selected = activation_backend(out, dtype, requested);
+    clap::IDnnBackend* selected = activation_backend(out, mode, dtype, requested);
     if (selected == nullptr) {
         record_fallback();
         return false;
@@ -670,7 +671,7 @@ bool activation_uses_vendor(int device_index, const std::string& dtype_name)
                              static_cast<c10::DeviceIndex>(device_index))));
     clap::DataType dtype;
     clap::DnnBackendType requested;
-    return activation_backend(like, dtype, requested) != nullptr;
+    return activation_backend(like, clap::ActivationMode::SiLU, dtype, requested) != nullptr;
 #else
     (void)device_index;
     (void)dtype_name;

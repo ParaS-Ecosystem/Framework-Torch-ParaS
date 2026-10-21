@@ -293,7 +293,7 @@ def _silu_input(node):
 def _eager_silu_is_paras(value) -> bool:
     """Whether eager silu on tensors like ``value`` runs the ParaS kernel.
     Where CLAP-DNN runs it in the vendor DNN library (e.g. fp32 through
-    MIOpen; bf16 stays on ParaS on ROCm), the fused kernel would not
+    oneDNN or cuDNN; on ROCm SiLU stays on ParaS), the fused kernel would not
     reproduce its rounding, so fusing would change results."""
     from .. import _C
     if not (hasattr(_C, "clap_dnn_enabled") and _C.clap_dnn_enabled()):

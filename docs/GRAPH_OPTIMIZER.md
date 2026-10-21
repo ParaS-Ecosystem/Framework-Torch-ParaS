@@ -143,8 +143,8 @@ In a build with CLAP-DNN (`PTSYCL_ENABLE_CLAP=ON`) eager SiLU may run in the
 vendor DNN library, whose rounding the fused kernel does not reproduce. The
 SwiGLU pass asks the runtime which dtype/device combinations those are
 (`torch_paras._C.clap_dnn_activation_uses_vendor`) and leaves the pattern
-unfused there: e.g. fp32 through MIOpen or oneDNN. bf16 on ROCm stays on the
-ParaS kernel (MIOpen has no bf16 activations), so bf16 models are fused.
+unfused there: e.g. fp32 through oneDNN or cuDNN. On ROCm SiLU always runs
+the ParaS kernel, so SwiGLU is fused in every dtype.
 
 **Fused kernels are bit-exact with the eager decomposition** on the same
 device: they perform the same rounding steps in the same order (RMSNorm
