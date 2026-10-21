@@ -27,7 +27,9 @@ Pipeline for every graph Dynamo captures:
    forward and backward graphs (the backward of a fused operator is its ParaS
    backward kernel, see ops.py) and residency.py classifies every operator;
    with ``strict`` a graph containing an operator without a ParaS kernel is
-   rejected,
+   rejected. Graphs that are the same code on the same input metadata --
+   the layers of a transformer compiled one by one (see blocks.py) -- are
+   analysed once,
 3. execution: the fused Dynamo graph runs through the dispatcher and the
    autograd engine exactly like eager code, on the same ParaS kernels.
 
@@ -56,12 +58,14 @@ bit for bit. Two cases:
   graphs.)
 """
 
+import hashlib
 import itertools
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
+import torch
 from torch import fx
 
 from . import ops, passes, residency
@@ -151,6 +155,32 @@ def reports() -> list[GraphReport]:
 def reset_reports() -> None:
     with _lock:
         _reports.clear()
+
+
+_analyses: dict[bytes, list] = {}
+
+
+def _symbolic(s) -> object:
+    if not isinstance(s, torch.SymInt):
+        return s
+    node = s.node
+    ranges = node.shape_env.var_to_range
+    return (str(node.expr), sorted((str(v), str(ranges.get(v))) for v in node.expr.free_symbols))
+
+
+def _analysis_key(gm: fx.GraphModule, example_inputs: Sequence[object]) -> bytes:
+    """What the ATen graphs depend on: the graph's code, grad mode and, per
+    input, its kind, dtype, device, requires_grad and (symbolic) sizes."""
+    def meta(x):
+        if isinstance(x, torch.Tensor):
+            return ("tensor", x.dtype, x.device.type, x.requires_grad,
+                    tuple(_symbolic(d) for d in x.shape))
+        if isinstance(x, torch.SymInt):
+            return ("symint", _symbolic(x))
+        return (type(x).__name__, x if isinstance(x, (bool, int, float, str)) else None)
+
+    key = (gm.code, torch.is_grad_enabled(), tuple(meta(x) for x in example_inputs))
+    return hashlib.sha256(repr(key).encode()).digest()
 
 
 def _tensor_op_count(gm: fx.GraphModule) -> int:
@@ -287,25 +317,40 @@ def make_backend(options: Options = Options()):
                 entry[2].append(report)
         report.fusions.update(passes.run(gm, set(options.fusions)))
 
-        def analyser(stage):
-            def analyse_stage(aten_gm: fx.GraphModule, _inputs):
-                kinds, cpu_ops = residency.analyse(aten_gm)
-                report.residency[stage] = dict(kinds)
-                report.cpu_fallback_ops.update(cpu_ops)
-                if options.strict and cpu_ops:
-                    raise ParasCompileError(
-                        f"{stage} graph uses operators without a ParaS kernel: "
-                        + ", ".join(sorted(cpu_ops)))
-                return make_boxed_func(aten_gm.forward)
-            return analyse_stage
+        def record(stage, kinds, cpu_ops):
+            report.residency[stage] = dict(kinds)
+            report.cpu_fallback_ops.update(cpu_ops)
+            if options.strict and cpu_ops:
+                raise ParasCompileError(
+                    f"{stage} graph uses operators without a ParaS kernel: "
+                    + ", ".join(sorted(cpu_ops)))
 
-        with functorch_config.patch(force_non_lazy_backward_lowering=True):
-            aot_autograd(
-                fw_compiler=analyser("forward"),
-                bw_compiler=analyser("backward"),
-                inference_compiler=analyser("inference"),
-            )(gm, example_inputs)
-        gm.recompile()
+        key = _analysis_key(gm, example_inputs)
+        with _lock:
+            cached = _analyses.get(key)
+        if cached is not None:
+            for stage, kinds, cpu_ops in cached:
+                record(stage, kinds, cpu_ops)
+        else:
+            stages = []
+
+            def analyser(stage):
+                def analyse_stage(aten_gm: fx.GraphModule, _inputs):
+                    kinds, cpu_ops = residency.analyse(aten_gm)
+                    stages.append((stage, kinds, cpu_ops))
+                    record(stage, kinds, cpu_ops)
+                    return make_boxed_func(aten_gm.forward)
+                return analyse_stage
+
+            with functorch_config.patch(force_non_lazy_backward_lowering=True):
+                aot_autograd(
+                    fw_compiler=analyser("forward"),
+                    bw_compiler=analyser("backward"),
+                    inference_compiler=analyser("inference"),
+                )(gm, example_inputs)
+            gm.recompile()
+            with _lock:
+                _analyses[key] = stages
         if (options.min_dynamic_graph_ops and _is_whole_frame(gm)
                 and _has_dynamic_shapes(example_inputs)
                 and _tensor_op_count(gm) < options.min_dynamic_graph_ops):

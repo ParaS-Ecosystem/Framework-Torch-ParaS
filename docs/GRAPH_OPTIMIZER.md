@@ -35,7 +35,11 @@ For every graph TorchDynamo captures:
      tensor literal in the code (`torch.tensor(...)`);
    * `cpu`: no ParaS kernel; the op would run on the boxed CPU fallback.
    With `strict=True` a graph containing a `cpu` op raises
-   `ParasCompileError`.
+   `ParasCompileError`. Steps 2 and 3 run once per distinct graph: a graph
+   with the same code and the same input metadata (dtype, device,
+   `requires_grad`, sizes with their symbolic ranges) and grad mode as an
+   earlier one -- typically another layer of the same transformer -- reuses
+   that analysis.
 4. **Execution**: the fused Dynamo graph runs through the dispatcher and the
    autograd engine like eager code, on the same ParaS kernels eager mode
    uses. The traced ATen graphs are used for analysis only: running
@@ -87,8 +91,10 @@ submodules (Param2-17B: `attention.layer_idx`). Blocks that differ only in their
 weights, such as an MoE's experts, share graphs anyway and are left alone.
 Each layer is then compiled on its own, after which a cached decode keeps every
 layer compiled. The price is compilation time: Param2-17B's benchmark shape
-mix (prefill at four shapes, generate() at batch 1 and 4) compiles in ~235 s
-instead of ~30 s. A layer then
+mix (prefill at four shapes, generate() at batch 1 and 4) compiles in ~200 s
+instead of ~30 s. (Without reusing identical graphs' analysis, see
+"Pipeline", it would be ~235 s; most of the rest is Dynamo's own
+bytecode tracing.) A layer then
 legitimately needs more graphs than Dynamo's default recompile limit (8)
 allows -- uncached and cached prefill, decode, each first static and then
 dynamic, per batch size; a `generate()` workload reaches ~12 -- so

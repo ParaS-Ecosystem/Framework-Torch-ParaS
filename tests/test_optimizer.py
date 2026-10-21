@@ -395,6 +395,48 @@ def test_specialize_repeated_blocks(device):
             assert not any("forward" in vars(layer) for layer in stack.layers)
 
 
+def test_identical_graphs_analysed_once(device):
+    import sys
+    residency = sys.modules["torch_paras.optimizer.residency"]
+    sys.modules["torch_paras.optimizer.backend"]._analyses.clear()
+    calls = []
+    analyse = residency.analyse
+
+    def counting(gm):
+        calls.append(gm)
+        return analyse(gm)
+
+    def f(x):
+        return torch.relu(x) * 2.0
+
+    def g(x):
+        return torch.special.zeta(x, x + 1.0)
+
+    residency.analyse = counting
+    try:
+        x = torch.rand(8, device=device) + 1.0
+        runs = []
+        for inp in (x, x, torch.rand(5, device=device)):
+            _reset()
+            torch_paras.compile(f)(inp)
+            runs.append((len(calls), optimizer.reports()[0].residency))
+        assert runs[1] == runs[0], runs
+        assert runs[2][0] > runs[1][0], runs
+        _reset()
+        torch_paras.compile(g)(x)
+        n = len(calls)
+        _reset()
+        try:
+            torch_paras.compile(g, strict=True)(x)
+        except Exception as e:
+            assert "special_zeta" in str(e), e
+        else:
+            raise AssertionError("strict mode accepted a reused analysis with a CPU fallback")
+        assert len(calls) == n, "strict check re-traced"
+    finally:
+        residency.analyse = analyse
+
+
 def test_strict_allows_tensor_constants(device):
     _reset()
 
