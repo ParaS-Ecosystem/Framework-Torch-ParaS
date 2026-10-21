@@ -556,7 +556,7 @@ MaskSummary mask_block_summary(compat::Queue& queue, const Tensor& attn_bias,
         MaskSummary summary;
     };
     thread_local Cached& cached = *new Cached;
-    const bool cacheable = !attn_bias.is_inference();
+    const bool cacheable = !attn_bias.is_inference() && !queue.capturing();
     if (cacheable) {
         auto live = cached.storage.lock();
         if (live && live.get() == attn_bias.storage().unsafeGetStorageImpl() &&

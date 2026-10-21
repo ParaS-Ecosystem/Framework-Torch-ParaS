@@ -97,6 +97,7 @@ set(PTSYCL_SOURCES
     csrc/compat/paras_compat.cpp
     csrc/core/context.cpp
     csrc/core/allocator.cpp
+    csrc/core/graphs.cpp
     csrc/core/registration.cpp
     csrc/core/telemetry.cpp
     csrc/ops/tensor_ops.cpp

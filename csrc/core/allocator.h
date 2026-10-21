@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <list>
 #include <map>
 #include <mutex>
@@ -40,13 +41,22 @@ public:
     void  release(void* ptr);
     void  clear();
 
+    void begin_private(std::uint64_t pool);
+    void end_private();
+    void release_private(std::uint64_t pool);
+
     std::size_t allocated_bytes() const { return allocated_; }
     std::size_t cached_bytes()    const { return cached_; }
 
 private:
-    struct Block {
-        void*       ptr;
-        std::size_t rounded;
+    struct Live {
+        std::size_t   rounded;
+        std::uint64_t pool;
+    };
+    struct Private {
+        std::map<std::size_t, std::list<void*>> free_lists;
+        std::size_t live     = 0;
+        bool        released = false;
     };
 
     static std::size_t round_size(std::size_t v);
@@ -58,7 +68,9 @@ private:
 
     std::mutex                              mutex_;
     std::map<std::size_t, std::list<void*>> free_lists_;
-    std::map<void*, std::size_t>            live_; // ptr -> rounded size
+    std::map<void*, Live>                   live_;
+    std::map<std::uint64_t, Private>        private_;
+    std::uint64_t                           active_private_ = 0;
     std::size_t                             allocated_ = 0;
     std::size_t                             cached_    = 0;
 };

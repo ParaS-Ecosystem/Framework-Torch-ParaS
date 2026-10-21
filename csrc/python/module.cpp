@@ -24,6 +24,7 @@
 
 #include "core/common.h"
 #include "core/allocator.h"
+#include "core/graphs.h"
 #include "ops/clap_dnn_adapter.h"
 #include "core/telemetry.h"
 
@@ -77,6 +78,23 @@ PYBIND11_MODULE(_C, m) {
     });
 
     m.def("is_bad_fork", [] { return ptsycl::Context::bad_fork(); });
+
+    m.def("_graphs_supported", [] { return ptsycl::graphs::supported(); });
+    m.def("_graph_capturing", [](int index) { return ptsycl::graphs::capturing(index); });
+    m.def("_graph_pool_new", [] { return ptsycl::graphs::new_pool(); });
+    m.def("_graph_capture_begin", [](int index, uint64_t pool) {
+        py::gil_scoped_release no_gil;
+        ptsycl::graphs::capture_begin(index, pool);
+    });
+    m.def("_graph_capture_end", [](int index) { return ptsycl::graphs::capture_end(index); });
+    m.def("_graph_replay", [](int64_t graph) {
+        py::gil_scoped_release no_gil;
+        ptsycl::graphs::replay(graph);
+    });
+    m.def("_graph_release", [](int64_t graph) { ptsycl::graphs::release(graph); });
+    m.def("_graph_pool_release", [](int index, uint64_t pool) {
+        ptsycl::graphs::release_pool(index, pool);
+    });
 
     m.def("clap_dnn_enabled", [] {
         return ptsycl::clap_dnn::is_enabled();

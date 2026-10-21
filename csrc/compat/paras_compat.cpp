@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #endif
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -39,10 +40,27 @@
 namespace ptsycl {
 namespace compat {
 
+#if defined(PTSYCL_BACKEND_SYCL) && defined(PARAS_EXT_ONEAPI_GRAPH_RECORD_REPLAY)
+#define PTSYCL_HAVE_GRAPHS 1
+namespace sycl_exp = sycl::ext::oneapi::experimental;
+#endif
+
 struct Queue::Impl {
 #if defined(PTSYCL_BACKEND_SYCL)
     ~Impl() { delete queue; }
     sycl::queue* queue = nullptr;
+#endif
+#if defined(PTSYCL_HAVE_GRAPHS)
+    std::optional<sycl_exp::command_graph<sycl_exp::graph_state::modifiable>> recording;
+#endif
+};
+
+class Graph {
+public:
+#if defined(PTSYCL_HAVE_GRAPHS)
+    explicit Graph(sycl_exp::command_graph<sycl_exp::graph_state::executable> exec)
+        : exec_(std::move(exec)) {}
+    sycl_exp::command_graph<sycl_exp::graph_state::executable> exec_;
 #endif
 };
 
@@ -345,6 +363,61 @@ bool Queue::run_native(const std::function<void(void* native_stream)>& fn) {
 #else
     (void)fn;
     return false;
+#endif
+}
+
+bool Queue::graphs_supported() {
+#if defined(PTSYCL_HAVE_GRAPHS)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Queue::begin_capture() {
+#if defined(PTSYCL_HAVE_GRAPHS)
+    if (!is_gpu_) fail("graph capture needs a GPU device");
+    if (capturing_) fail("the device is already capturing a graph");
+    auto& q = *impl_->queue;
+    impl_->recording.emplace(q);
+    try {
+        impl_->recording->begin_recording(q);
+    } catch (const sycl::exception& e) {
+        impl_->recording.reset();
+        fail(std::string("graph capture could not start: ") + e.what());
+    }
+    capturing_ = true;
+#else
+    fail("graph capture needs a ParaS build with record-and-replay command graphs");
+#endif
+}
+
+std::shared_ptr<Graph> Queue::end_capture() {
+#if defined(PTSYCL_HAVE_GRAPHS)
+    if (!capturing_) fail("the device is not capturing a graph");
+    capturing_ = false;
+    auto& q = *impl_->queue;
+    try {
+        impl_->recording->end_recording(q);
+        auto exec = impl_->recording->finalize();
+        impl_->recording.reset();
+        return std::make_shared<Graph>(std::move(exec));
+    } catch (const sycl::exception& e) {
+        impl_->recording.reset();
+        fail(std::string("graph capture failed: ") + e.what());
+    }
+#else
+    fail("graph capture needs a ParaS build with record-and-replay command graphs");
+#endif
+}
+
+void Queue::replay(const Graph& graph) {
+#if defined(PTSYCL_HAVE_GRAPHS)
+    if (capturing_) fail("a graph cannot be replayed while capturing");
+    impl_->queue->ext_oneapi_graph(graph.exec_);
+#else
+    (void)graph;
+    fail("graph replay needs a ParaS build with record-and-replay command graphs");
 #endif
 }
 

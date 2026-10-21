@@ -35,6 +35,7 @@ MODULES = [
     "test_clap_dnn_multigpu",
     "test_device_blas_and_runtime",
     "test_optimizer",
+    "test_graphs",
 ]
 
 

@@ -60,14 +60,21 @@ std::size_t MemoryPool::round_size(std::size_t v) {
 
 void* MemoryPool::acquire(std::size_t nbytes) {
     const std::size_t rounded = round_size(nbytes);
+    std::uint64_t pool = 0;
     {
         std::lock_guard<std::mutex> g(mutex_);
-        auto it = free_lists_.find(rounded);
-        if (it != free_lists_.end() && !it->second.empty()) {
+        pool = active_private_;
+        auto& lists = pool ? private_[pool].free_lists : free_lists_;
+        auto it = lists.find(rounded);
+        if (it != lists.end() && !it->second.empty()) {
             void* p = it->second.front();
             it->second.pop_front();
-            cached_ -= rounded;
-            live_[p] = rounded;
+            if (pool) {
+                ++private_[pool].live;
+            } else {
+                cached_ -= rounded;
+            }
+            live_[p] = Live{rounded, pool};
             if (debug_)
                 PTSYCL_WARN("pool[%d] reuse %zu bytes @%p", device_index_, rounded, p);
             return p;
@@ -76,7 +83,8 @@ void* MemoryPool::acquire(std::size_t nbytes) {
     void* p = queue_.alloc(rounded);
     {
         std::lock_guard<std::mutex> g(mutex_);
-        live_[p] = rounded;
+        live_[p] = Live{rounded, pool};
+        if (pool) ++private_[pool].live;
         allocated_ += rounded;
     }
     if (debug_)
@@ -92,16 +100,28 @@ void MemoryPool::release(void* ptr) {
         auto it = live_.find(ptr);
         TORCH_CHECK(it != live_.end(),
                     "paras allocator: release of unknown pointer");
-        rounded = it->second;
+        rounded = it->second.rounded;
+        const std::uint64_t pool = it->second.pool;
         live_.erase(it);
-        if (caching_enabled_) {
+        if (pool) {
+            auto pit = private_.find(pool);
+            Private& pr = pit->second;
+            --pr.live;
+            if (!pr.released) {
+                pr.free_lists[rounded].push_back(ptr);
+                return;
+            }
+            if (pr.live == 0) private_.erase(pit);
+            allocated_ -= rounded;
+        } else if (caching_enabled_) {
             free_lists_[rounded].push_back(ptr);
             cached_ += rounded;
             if (debug_)
                 PTSYCL_WARN("pool[%d] cache %zu bytes @%p", device_index_, rounded, ptr);
             return;
+        } else {
+            allocated_ -= rounded;
         }
-        allocated_ -= rounded;
     }
     if (debug_)
         PTSYCL_WARN("pool[%d] free %zu bytes @%p", device_index_, rounded, ptr);
@@ -119,6 +139,36 @@ void MemoryPool::clear() {
     }
     free_lists_.clear();
     cached_ = 0;
+}
+
+void MemoryPool::begin_private(std::uint64_t pool) {
+    TORCH_CHECK(pool != 0, "paras allocator: graph pool 0 is the shared cache");
+    std::lock_guard<std::mutex> g(mutex_);
+    TORCH_CHECK(active_private_ == 0, "paras allocator: a graph pool is already active");
+    auto& pr = private_[pool];
+    TORCH_CHECK(!pr.released, "paras allocator: graph pool was released");
+    active_private_ = pool;
+}
+
+void MemoryPool::end_private() {
+    std::lock_guard<std::mutex> g(mutex_);
+    active_private_ = 0;
+}
+
+void MemoryPool::release_private(std::uint64_t pool) {
+    std::lock_guard<std::mutex> g(mutex_);
+    auto it = private_.find(pool);
+    if (it == private_.end()) return;
+    TORCH_CHECK(active_private_ != pool, "paras allocator: release of the active graph pool");
+    for (auto& [size, list] : it->second.free_lists) {
+        for (void* p : list) {
+            queue_.dealloc(p);
+            allocated_ -= size;
+        }
+    }
+    it->second.free_lists.clear();
+    it->second.released = true;
+    if (it->second.live == 0) private_.erase(it);
 }
 
 // -----------------------------------------------------------------------------
