@@ -380,3 +380,25 @@ def test_sdpa_flash_block_masks(device):
         F.scaled_dot_product_attention(q, k, v, attn_mask=m)
         m.zero_()
         assert torch.equal(F.scaled_dot_product_attention(q, k, v, attn_mask=m).cpu(), plain.cpu())
+
+
+def _near(actual, expected, msg, tol=1e-5):
+    """Max error relative to the reference's largest magnitude (at least 1)."""
+    actual, expected = actual.cpu().float(), expected.cpu().float()
+    assert actual.shape == expected.shape, (msg, actual.shape, expected.shape)
+    err = ((actual - expected).abs().max() / expected.abs().max().clamp_min(1.0)).item()
+    assert err <= tol, f"{msg}: relative error {err:.3e} > {tol:.1e}"
+
+
+def test_reductions_around_work_group_rows(device):
+    torch.manual_seed(0)
+    for cols in (255, 256, 1000, 4096, 16384, 16385):
+        x = torch.randn(5, cols)
+        xd = x.to(device)
+        _near(xd.sum(-1), x.double().sum(-1).float(), f"sum {cols}", tol=1e-4)
+        _near(xd.mean(-1), x.mean(-1), f"mean {cols}", tol=1e-5)
+        _near(xd.amax(-1), x.amax(-1), f"amax {cols}", tol=0)
+        _near(torch.softmax(xd, -1), torch.softmax(x, -1), f"softmax {cols}", tol=1e-5)
+        _near(torch.log_softmax(xd, -1), torch.log_softmax(x, -1), f"log_softmax {cols}", tol=1e-4)
+        xb = x.bfloat16()
+        _near(xb.to(device).float().pow(2).mean(-1), xb.float().pow(2).mean(-1), f"bf16 mean {cols}", tol=1e-4)

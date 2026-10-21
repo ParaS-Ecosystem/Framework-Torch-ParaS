@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 #include <c10/util/Exception.h>
@@ -191,6 +192,45 @@ inline void write_scalar(compat::Queue& q, T* p, T v) {
 
 constexpr int64_t kReducePartials = 1024;
 
+#if defined(PTSYCL_BACKEND_SYCL)
+constexpr int kReduceWG = 256;
+constexpr int64_t kReduceWGMax = 16384;
+
+inline bool reduce_in_groups(compat::Queue& q, int64_t red_n) {
+    return q.is_gpu() && red_n >= kReduceWG && red_n <= kReduceWGMax;
+}
+
+template <typename acc_t, typename Map, typename Combine>
+PTSYCL_HOST_DEVICE inline acc_t reduce_row_in_group(const sycl::nd_item<1>& it, acc_t* lds,
+                                                    int64_t o, int64_t red_n, acc_t init,
+                                                    const Map& map, const Combine& combine) {
+    const int l = static_cast<int>(it.get_local_id(0));
+    acc_t acc = init;
+    for (int64_t j = l; j < red_n; j += kReduceWG) acc = combine(acc, map(o, j));
+    if constexpr (std::is_arithmetic_v<acc_t>) {
+        const auto sg = it.get_sub_group();
+        acc = sycl::reduce_over_group(sg, acc, combine);
+        const int groups = static_cast<int>(sg.get_group_linear_range());
+        if (sg.get_local_linear_id() == 0) lds[sg.get_group_linear_id()] = acc;
+        sycl::group_barrier(it.get_group());
+        acc_t out = lds[0];
+        for (int g = 1; g < groups; ++g) out = combine(out, lds[g]);
+        return out;
+    } else {
+        lds[l] = acc;
+        for (int s = kReduceWG / 2; s > 0; s >>= 1) {
+            sycl::group_barrier(it.get_group());
+            if (l < s) lds[l] = combine(lds[l], lds[l + s]);
+        }
+        sycl::group_barrier(it.get_group());
+        return lds[0];
+    }
+}
+
+template <typename acc_t, typename Map, typename Combine, typename Store>
+class ReduceRowsKernel;
+#endif
+
 template <typename acc_t, typename Map, typename Combine>
 inline acc_t reduce_full(compat::Queue& q, int64_t n, acc_t init, Map map,
                          Combine combine) {
@@ -229,6 +269,23 @@ inline void reduce_outer(compat::Queue& q, int64_t out_n, int64_t red_n,
                          acc_t init, Map map, Combine combine, Store store,
                          const at::Tensor& like, int64_t min_stripes = 1) {
     if (out_n <= 0) return;
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (reduce_in_groups(q, red_n)) {
+        q.sycl_queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<acc_t, 1> lds(sycl::range<1>(kReduceWG), cgh);
+            cgh.template parallel_for<ReduceRowsKernel<acc_t, Map, Combine, Store>>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(out_n * kReduceWG)),
+                                  sycl::range<1>(kReduceWG)),
+                [=](sycl::nd_item<1> it) {
+                    const int64_t o = static_cast<int64_t>(it.get_group(0));
+                    const acc_t acc = reduce_row_in_group<acc_t>(it, &lds[0], o, red_n, init,
+                                                                 map, combine);
+                    if (it.get_local_id(0) == 0) store(o, acc);
+                });
+        });
+        return;
+    }
+#endif
 
     constexpr int64_t kTargetItems = int64_t{1} << 16;
     constexpr int64_t kMaxSerialStripes = 1024;

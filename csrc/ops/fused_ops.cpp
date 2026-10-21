@@ -37,6 +37,10 @@ namespace {
 
 using at::Tensor;
 
+#if defined(PTSYCL_BACKEND_SYCL)
+template <typename T> class RmsNormRowsKernel;
+#endif
+
 // -----------------------------------------------------------------------------
 // rms_norm: normalizes over the last dimension only.
 // -----------------------------------------------------------------------------
@@ -68,32 +72,55 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
             scalar_t*       pout = data_ptr<scalar_t>(out);
             const double inv_h = 1.0 / static_cast<double>(H);
             const double eps32 = static_cast<double>(static_cast<float>(eps));
+            const auto square = [=](int64_t r, int64_t j) {
+                const double x = static_cast<double>(
+                    static_cast<float>(static_cast<double>(pin[r * H + j])));
+                return static_cast<double>(static_cast<float>(x * x));
+            };
+            const auto plus = [](double a, double b) { return a + b; };
+            const auto rstd_of = [=](double sum) {
+                const float mean = static_cast<float>(
+                    static_cast<double>(static_cast<float>(sum)) * inv_h);
+                const float var = static_cast<float>(static_cast<double>(mean) + eps32);
+                return static_cast<float>(1.0 / ::sqrt(static_cast<double>(var)));
+            };
+            const auto normalized = [=](int64_t i, float rs) {
+                const float x = static_cast<float>(static_cast<double>(pin[i]));
+                const float n = static_cast<float>(
+                    static_cast<double>(x) * static_cast<double>(rs));
+                const scalar_t nb = static_cast<scalar_t>(n);
+                return static_cast<scalar_t>(
+                    static_cast<double>(pw[i % H]) * static_cast<double>(nb));
+            };
+#if defined(PTSYCL_BACKEND_SYCL)
+            if (reduce_in_groups(q, H)) {
+                q.sycl_queue().submit([&](sycl::handler& cgh) {
+                    sycl::local_accessor<double, 1> lds(sycl::range<1>(kReduceWG), cgh);
+                    cgh.template parallel_for<RmsNormRowsKernel<scalar_t>>(
+                        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
+                                          sycl::range<1>(kReduceWG)),
+                        [=](sycl::nd_item<1> it) {
+                            const int64_t r = static_cast<int64_t>(it.get_group(0));
+                            const int l = static_cast<int>(it.get_local_id(0));
+                            const float rs = rstd_of(
+                                reduce_row_in_group<double>(it, &lds[0], r, H, 0.0, square, plus));
+                            if (l == 0) pr[r] = rs;
+                            for (int64_t j = l; j < H; j += kReduceWG)
+                                pout[r * H + j] = normalized(r * H + j, rs);
+                        });
+                });
+                return;
+            }
+#endif
 
             reduce_outer<double>(
-                q, rows, H, 0.0,
-                [=](int64_t r, int64_t j) {
-                    const double x = static_cast<double>(
-                        static_cast<float>(static_cast<double>(pin[r * H + j])));
-                    return static_cast<double>(static_cast<float>(::pow(x, 2.0)));
-                },
-                [](double a, double b) { return a + b; },
-                [=](int64_t r, double sum) {
-                    const float mean = static_cast<float>(
-                        static_cast<double>(static_cast<float>(sum)) * inv_h);
-                    const float var = static_cast<float>(static_cast<double>(mean) + eps32);
-                    pr[r] = static_cast<float>(1.0 / ::sqrt(static_cast<double>(var)));
-                },
+                q, rows, H, 0.0, square, plus,
+                [=](int64_t r, double sum) { pr[r] = rstd_of(sum); },
                 rstd);
 
             launch_flat(q, rows * H, [=](std::size_t idx) {
                 const int64_t i = static_cast<int64_t>(idx);
-                const int64_t r = i / H;
-                const float x = static_cast<float>(static_cast<double>(pin[i]));
-                const float n = static_cast<float>(
-                    static_cast<double>(x) * static_cast<double>(pr[r]));
-                const scalar_t nb = static_cast<scalar_t>(n);
-                pout[i] = static_cast<scalar_t>(
-                    static_cast<double>(pw[i % H]) * static_cast<double>(nb));
+                pout[i] = normalized(i, pr[i / H]);
             });
         });
     return {out, rstd};
