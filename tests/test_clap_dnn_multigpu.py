@@ -1,5 +1,7 @@
 import ctypes
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import unittest
@@ -10,6 +12,173 @@ import torch.nn.functional as F
 import torch_paras
 
 from clap_result import RESULT_MARKER, assert_clap_result
+
+
+RESOLVE_MARKER = "[ptsycl op] clap_dnn.resolve "
+
+
+def _check_resolver(
+    device, cases, *, backend=None, cli=(), log_level="2",
+) -> None:
+    """Check decisions and execution in a fresh process (logging is cached)."""
+    enabled = torch_paras._C.clap_dnn_enabled()
+    is_gpu = torch_paras.is_gpu_device(_device_index(device))
+    vendor = "cuDNN" if is_gpu else "oneDNN"
+    route = "clap_cuda" if is_gpu else "clap_cpu"
+    # Use the same package even when the parent runs from an isolated build.
+    package_root = str(Path(torch_paras.__file__).resolve().parents[1])
+    specs = []
+    expected_lines = []
+    for kind, dtype, reason, error in cases:
+        if not enabled:
+            reason, error = "clap_disabled", None
+        for op in ("sigmoid", "silu"):
+            forms = ("out",) if kind == "strided_out" else (
+                "functional", "out", "inplace",
+            )
+            for form in forms:
+                specs.append((kind, dtype, reason, error, op, form))
+                selected = route if reason == "eligible" else "paras"
+                expected_lines.append(
+                    f"{RESOLVE_MARKER}op={op} route={selected} reason={reason}"
+                )
+
+    code = f"""
+import sys
+sys.path.insert(0, {package_root!r})
+import json
+import torch
+import torch.nn.functional as F
+import torch_paras
+specs = json.loads({json.dumps(specs)!r})
+device, vendor = {device!r}, {vendor!r}
+calls = fallbacks = 0
+for kind, dtype, reason, error, op, form in specs:
+    dtype = getattr(torch, dtype)
+    ref = torch.linspace(-3, 3, 24, dtype=dtype).reshape(4, 6)
+    if kind == 'scalar':
+        ref = torch.tensor(1.25, dtype=dtype)
+    elif kind == 'empty':
+        ref = torch.empty(0, 4, dtype=dtype)
+    elif kind == 'rank9':
+        ref = torch.ones((2,) * 9, dtype=dtype)
+    x = ref.to(device)
+    if kind == 'strided':
+        ref, x = ref.t(), x.t()
+    fn = torch.sigmoid if op == 'sigmoid' else F.silu
+    expected = fn(ref.float()).to(dtype) if dtype in (torch.float16, torch.bfloat16) else fn(ref)
+    out = torch.empty_like(x)
+    if kind == 'strided_out':
+        out = torch.empty(6, 4, dtype=dtype, device=device).t()
+    torch_paras._C.clap_dnn_reset_stats()
+    try:
+        if form == 'out':
+            result = getattr(torch.ops.aten, op).out(x, out=out)
+            assert result.data_ptr() == out.data_ptr()
+        elif form == 'inplace':
+            result = x.sigmoid_() if op == 'sigmoid' else F.silu(x, inplace=True)
+            assert result.data_ptr() == x.data_ptr()
+        else:
+            result = fn(x)
+        assert result.device == x.device
+        actual = result.cpu()
+    except RuntimeError as exc:
+        assert error and error in str(exc), (op, form, kind, str(exc))
+    else:
+        assert error is None, (op, form, kind, 'expected vendor error', error)
+        tol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-6
+        torch.testing.assert_close(actual, expected, atol=tol, rtol=tol)
+    expected_calls = int(reason == 'eligible' and error is None)
+    expected_fallbacks = int(reason != 'eligible')
+    assert torch_paras._C.clap_dnn_call_count() == expected_calls, (op, form, kind)
+    assert torch_paras._C.clap_dnn_fallback_count() == expected_fallbacks, (op, form, kind)
+    for name in ('oneDNN', 'cuDNN', 'MIOpen'):
+        assert torch_paras._C.clap_dnn_backend_call_count(name) == (expected_calls if name == vendor else 0)
+    last = torch_paras._C.clap_dnn_last_backend()
+    assert vendor.lower() in last.lower() if expected_calls else last == '', last
+    calls += expected_calls
+    fallbacks += expected_fallbacks
+print({RESULT_MARKER!r} + json.dumps(dict(calls=calls, fallbacks=fallbacks)), flush=True)
+"""
+    env = dict(os.environ)
+    env.pop("CLAP_BACKEND", None)
+    if backend is not None:
+        env["CLAP_BACKEND"] = backend
+    env["PTSYCL_LOG"] = log_level
+    result = subprocess.run(
+        [sys.executable, "-c", code, *cli], env=env,
+        capture_output=True, text=True, check=False, timeout=120,
+    )
+    assert_clap_result(
+        result,
+        sum(reason == "eligible" and error is None for _, _, reason, error, _, _ in specs),
+        sum(reason != "eligible" for _, _, reason, _, _, _ in specs),
+    )
+    lines = [
+        line for line in result.stderr.splitlines()
+        if line.startswith(RESOLVE_MARKER)
+    ]
+    expected = expected_lines if log_level == "2" else []
+    assert lines == expected, (
+        f"Expected resolver lines: {expected!r}\nGot: {lines!r}\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def test_clap_dnn_resolver_inputs(device: str = "paras:0") -> None:
+    cases = [
+        ("contiguous", "float32", "eligible", None),
+        ("contiguous", "bfloat16", "eligible", None),
+        ("scalar", "float32", "input_unsupported", None),
+        ("empty", "float32", "input_unsupported", None),
+        ("strided", "float32", "input_unsupported", None),
+        ("strided_out", "float32", "input_unsupported", None),
+        ("contiguous", "float64", "dtype_unsupported", None),
+        ("strided", "float64", "input_unsupported", None),
+    ]
+    _check_resolver(device, cases)
+    for level in ("0", "1"):
+        _check_resolver(device, [cases[0], cases[2]], log_level=level)
+
+
+def test_clap_dnn_resolver_overrides(device: str = "paras:0") -> None:
+    is_gpu = torch_paras.is_gpu_device(_device_index(device))
+    matching, mismatched = ("CUDA", "CPU") if is_gpu else ("CPU", "CUDA")
+    match_cli, mismatch_cli = "-" + matching.lower(), "-" + mismatched.lower()
+    for backend, cli, reason in (
+        (matching, (), "eligible"),
+        (mismatched, (), "override_mismatch"),
+        ("invalid", (), "override_mismatch"),
+        (matching.lower(), (), "override_mismatch"),
+        ("", (), "eligible"),
+        ("GPU", (), "eligible" if is_gpu else "override_mismatch"),
+        (None, (match_cli,), "eligible"),
+        (None, (mismatch_cli,), "override_mismatch"),
+        (None, ("--unknown-backend",), "eligible"),
+        (matching, (match_cli,), "eligible"),
+        (matching, (mismatch_cli,), "override_mismatch"),
+        (mismatched, (match_cli,), "override_mismatch"),
+        (None, (mismatch_cli, match_cli), "override_mismatch"),
+    ):
+        _check_resolver(device, [
+            ("contiguous", "float32", reason, None),
+            # Input/dtype checks precede overrides, even invalid ones.
+            ("scalar", "float64", "input_unsupported", None),
+            ("contiguous", "float64", "dtype_unsupported", None),
+        ], backend=backend, cli=cli)
+
+
+def test_clap_dnn_resolver_vendor_errors(device: str = "paras:0") -> None:
+    if not torch_paras._C.clap_dnn_enabled():
+        _skip("CLAP-DNN is not enabled")
+    is_gpu = torch_paras.is_gpu_device(_device_index(device))
+    case = (
+        ("rank9", "float32", "eligible", "CLAP_DNN cuDNN: tensors must have rank 1..8")
+        if is_gpu else
+        ("contiguous", "float16", "eligible",
+         "no native implementation for dnnl_eltwise_forward_primitive_desc_create")
+    )
+    _check_resolver(device, [case])
 
 
 def gpu_devices() -> list[str]:

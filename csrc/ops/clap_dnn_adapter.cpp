@@ -11,6 +11,7 @@
 #include "ops/clap_dnn_adapter.h"
 
 #include "core/kernels.h"
+#include "core/log.h"
 
 #include <atomic>
 #include <mutex>
@@ -37,6 +38,58 @@
 namespace ptsycl::clap_dnn {
 
 namespace {
+
+enum class ActivationRoute { paras, clap_cpu, clap_cuda, clap_rocm };
+enum class ActivationReason {
+    clap_disabled,
+    input_unsupported,
+    dtype_unsupported,
+    device_unsupported,
+    override_mismatch,
+    eligible,
+};
+
+struct ActivationDecision {
+    ActivationRoute route;
+    ActivationReason reason;
+#ifdef USE_CLAP_BACKEND
+    clap::DnnBackendType backend{};
+    clap::DataType dtype{};
+#endif
+};
+
+const char* route_name(ActivationRoute route) noexcept
+{
+    switch (route) {
+        case ActivationRoute::paras: return "paras";
+        case ActivationRoute::clap_cpu: return "clap_cpu";
+        case ActivationRoute::clap_cuda: return "clap_cuda";
+        case ActivationRoute::clap_rocm: return "clap_rocm";
+    }
+    return "unknown";
+}
+
+const char* reason_name(ActivationReason reason) noexcept
+{
+    switch (reason) {
+        case ActivationReason::clap_disabled: return "clap_disabled";
+        case ActivationReason::input_unsupported: return "input_unsupported";
+        case ActivationReason::dtype_unsupported: return "dtype_unsupported";
+        case ActivationReason::device_unsupported: return "device_unsupported";
+        case ActivationReason::override_mismatch: return "override_mismatch";
+        case ActivationReason::eligible: return "eligible";
+    }
+    return "unknown";
+}
+
+void trace_decision(const char* op, const ActivationDecision& decision)
+{
+    if (ptsycl::log::level() >= ptsycl::log::kTrace) {
+        std::fprintf(stderr,
+            "[ptsycl op] clap_dnn.resolve op=%s route=%s reason=%s\n",
+            op, route_name(decision.route), reason_name(decision.reason));
+    }
+}
 
 std::atomic<std::int64_t> g_total_calls{0};
 std::atomic<std::int64_t> g_cpu_calls{0};
@@ -394,10 +447,11 @@ bool map_dtype(
 }
 
 
-bool try_activation_forward(
+// Eligibility permits a vendor attempt; it does not guarantee vendor support.
+// Keep execution, including backend creation and tensor data access, separate.
+ActivationDecision resolve_activation(
     const at::Tensor& self,
-    at::Tensor& out,
-    clap::ActivationMode mode)
+    const at::Tensor& out)
 {
     if (self.numel() == 0 ||
         self.numel() != out.numel() ||
@@ -408,26 +462,41 @@ bool try_activation_forward(
         !out.is_contiguous() ||
         self.dim() == 0) {
 
-        record_fallback();
-        return false;
+        return {ActivationRoute::paras, ActivationReason::input_unsupported};
     }
 
     clap::DataType dtype;
 
     if (!map_dtype(self.scalar_type(), dtype)) {
-        record_fallback();
-        return false;
+        return {ActivationRoute::paras, ActivationReason::dtype_unsupported};
     }
 
     clap::DnnBackendType requested;
 
-    if (!select_backend(out, requested) ||
-        !backend_override_matches(requested)) {
-
-        record_fallback();
-        return false;
+    if (!select_backend(out, requested)) {
+        return {ActivationRoute::paras, ActivationReason::device_unsupported};
     }
 
+    if (!backend_override_matches(requested)) {
+        return {ActivationRoute::paras, ActivationReason::override_mismatch};
+    }
+
+    const auto route = requested == clap::DnnBackendType::CPU
+        ? ActivationRoute::clap_cpu
+        : requested == clap::DnnBackendType::CUDA
+            ? ActivationRoute::clap_cuda
+            : ActivationRoute::clap_rocm;
+    return {route, ActivationReason::eligible, requested, dtype};
+}
+
+
+bool execute_activation_forward(
+    const at::Tensor& self,
+    at::Tensor& out,
+    clap::ActivationMode mode,
+    clap::DnnBackendType requested,
+    clap::DataType dtype)
+{
     std::vector<std::int64_t> dims;
 
     dims.reserve(self.dim());
@@ -573,6 +642,17 @@ bool try_activation_forward(
 
 } // namespace
 
+#else
+
+namespace {
+
+ActivationDecision resolve_activation(const at::Tensor&, const at::Tensor&)
+{
+    return {ActivationRoute::paras, ActivationReason::clap_disabled};
+}
+
+} // namespace
+
 #endif // USE_CLAP_BACKEND
 
 
@@ -580,19 +660,24 @@ bool try_sigmoid_forward(
     const at::Tensor& self,
     at::Tensor& out)
 {
+    const auto decision = resolve_activation(self, out);
+    trace_decision("sigmoid", decision);
+    if (decision.route == ActivationRoute::paras) {
+        record_fallback();
+        return false;
+    }
+
 #ifdef USE_CLAP_BACKEND
 
-    return try_activation_forward(
+    return execute_activation_forward(
         self,
         out,
-        clap::ActivationMode::Sigmoid);
+        clap::ActivationMode::Sigmoid,
+        decision.backend,
+        decision.dtype);
 
 #else
 
-    (void)self;
-    (void)out;
-
-    record_fallback();
     return false;
 
 #endif
@@ -603,19 +688,24 @@ bool try_silu_forward(
     const at::Tensor& self,
     at::Tensor& out)
 {
+    const auto decision = resolve_activation(self, out);
+    trace_decision("silu", decision);
+    if (decision.route == ActivationRoute::paras) {
+        record_fallback();
+        return false;
+    }
+
 #ifdef USE_CLAP_BACKEND
 
-    return try_activation_forward(
+    return execute_activation_forward(
         self,
         out,
-        clap::ActivationMode::SiLU);
+        clap::ActivationMode::SiLU,
+        decision.backend,
+        decision.dtype);
 
 #else
 
-    (void)self;
-    (void)out;
-
-    record_fallback();
     return false;
 
 #endif
