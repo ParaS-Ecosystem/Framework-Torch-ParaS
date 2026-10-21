@@ -185,6 +185,11 @@ torch_paras.runtime_stats()
 counters include transfers made inside operator implementations. With
 `PTSYCL_STRICT=1` (or `torch_paras.set_strict(True)`) a CPU fallback raises.
 
+## Graph replay
+
+With `graphs=True` the backend replays its inference graphs from captures
+(one launch per graph instead of one per operator); see docs/GRAPHS.md.
+
 ## Limitations
 
 * Without code generation the optimizer cannot make a captured graph faster

@@ -111,3 +111,181 @@ def test_attention_mask_replay(device):
             g.replay()
             ref = F.scaled_dot_product_attention(q, k, v, attn_mask=m.to(device))
             assert_close(out.float(), ref.float(), "masked attention replay")
+
+
+class _Mlp(torch.nn.Module):
+    def __init__(self, d=64):
+        super().__init__()
+        self.norm = torch.nn.RMSNorm(d)
+        self.up = torch.nn.Linear(d, 4 * d)
+        self.down = torch.nn.Linear(4 * d, d)
+
+    def forward(self, x):
+        for _ in range(3):
+            x = x + self.down(F.silu(self.up(self.norm(x))))
+        return x
+
+
+def _replay_reports():
+    return [r.replay for r in torch_paras.optimizer.reports() if r.replay]
+
+
+def _reset():
+    torch._dynamo.reset()
+    torch_paras.optimizer.reset_reports()
+
+
+def test_compiled_replay_matches_eager(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    m = _Mlp().to(device).eval()
+    c = torch_paras.compile(m, graphs=True)
+    with torch.no_grad():
+        for _ in range(4):
+            x = torch.randn(2, 64, device=device)
+            assert torch.equal(c(x).cpu(), m(x).cpu())
+    assert _replay_reports() == ["replayed"], _replay_reports()
+
+
+def test_compiled_replay_copies_mutated_inputs_back(device):
+    _require_graphs(device)
+    _reset()
+
+    def f(x, acc):
+        acc.add_(x * 3)
+        return acc.sum(0) + x.mean()
+
+    c = torch_paras.compile(f, graphs=True)
+    acc, ref = torch.zeros(4, 8, device=device), torch.zeros(4, 8)
+    with torch.no_grad():
+        for _ in range(4):
+            x = torch.randn(4, 8)
+            out = c(x.to(device), acc)
+            want = f(x, ref)
+            assert_close(out, want, "output")
+            assert_close(acc, ref, "mutated input")
+    assert _replay_reports() == ["replayed"], _replay_reports()
+
+
+def test_compiled_replay_moved_parameter(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    m = _Mlp().to(device).eval()
+    c = torch_paras.compile(m, graphs=True)
+    x = torch.randn(2, 64, device=device)
+    with torch.no_grad():
+        for _ in range(3):
+            c(x)
+        m.up.weight.data = m.up.weight.data * 2
+        assert torch.equal(c(x).cpu(), m(x).cpu())
+
+
+def test_compiled_replay_fallbacks(device):
+    _require_graphs(device)
+    torch.manual_seed(0)
+    m = _Mlp().to(device)
+
+    def check(fn, inputs, expected, grad=False):
+        _reset()
+        c = torch_paras.compile(fn, graphs=True)
+        with torch.set_grad_enabled(grad):
+            for x in inputs:
+                torch.manual_seed(1)
+                out = c(x)
+                torch.manual_seed(1)
+                ref = fn(x)
+                assert_close(out, ref, expected)
+        reasons = _replay_reports()
+        assert reasons and all(expected in r for r in reasons), (expected, reasons)
+
+    xs = [torch.randn(2, 64, device=device) for _ in range(3)]
+    check(m, xs, "needs autograd", grad=True)
+    check(lambda x: F.dropout(m(x), 0.5, training=True), xs, "random operators")
+    check(lambda x: F.layer_norm(m(x), (64,)), xs, "capture failed")
+    _reset()
+    c = torch_paras.compile(m, graphs=True, dynamic=True)
+    with torch.no_grad():
+        for n in (3, 5, 7):
+            x = torch.randn(n, 64, device=device)
+            assert_close(c(x), m(x), "dynamic")
+    assert any("no piece without changing sizes" in r for r in _replay_reports()), _replay_reports()
+
+
+def test_compiled_replay_static_pieces(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    pre, post = _Mlp().to(device).eval(), _Mlp().to(device).eval()
+
+    def step(x, cache):
+        q = pre(x)
+        att = torch.softmax(q @ cache.transpose(0, 1) / 8, dim=-1) @ cache
+        return post(att + x)
+
+    c = torch_paras.compile(step, graphs=True)
+    with torch.no_grad():
+        for n in (3, 5, 7, 9, 11, 13, 15, 17):
+            x, cache = torch.randn(1, 64, device=device), torch.randn(n, 64, device=device)
+            assert torch.equal(c(x, cache).cpu(), step(x, cache).cpu()), n
+    assert any("in 2 pieces" in r for r in _replay_reports()), _replay_reports()
+
+
+def test_compiled_replay_attention_without_dropout(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    lin = torch.nn.Linear(64, 3 * 64).to(device)
+
+    def attend(x):
+        q, k, v = lin(x).view(1, 16, 3, 4, 16).permute(2, 0, 3, 1, 4)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True).sum(1)
+
+    c = torch_paras.compile(attend, graphs=True)
+    with torch.no_grad():
+        for _ in range(3):
+            x = torch.randn(1, 16, 64, device=device)
+            assert torch.equal(c(x).cpu(), attend(x).cpu())
+    assert _replay_reports() == ["replayed"], _replay_reports()
+
+
+def test_compiled_replay_piece_with_tuple_input(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    norm, post = torch.nn.RMSNorm(64).to(device), _Mlp().to(device).eval()
+
+    def step(x, cache):
+        h = norm(x)
+        att = torch.softmax(h @ cache.transpose(0, 1), dim=-1) @ cache
+        return post(att + h * 2 + torch.cat([h[..., :32] * 3, h[..., 32:]], dim=-1))
+
+    c = torch_paras.compile(step, graphs=True)
+    with torch.no_grad():
+        for n in (3, 5, 7, 9, 11, 13, 15, 17):
+            x, cache = torch.randn(1, 64, device=device), torch.randn(n, 64, device=device)
+            assert torch.equal(c(x, cache).cpu(), step(x, cache).cpu()), n
+
+
+def test_compiled_replay_pieces_with_steady_symbolic_size(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    pre, post = _Mlp().to(device).eval(), _Mlp().to(device).eval()
+
+    def step(x, cache):
+        q = pre(x)
+        att = torch.softmax(q @ cache.transpose(0, 1) / 8, dim=-1) @ cache
+        return post(att + x)
+
+    c = torch_paras.compile(step, graphs=True, dynamic=True)
+    from torch_paras.optimizer import replay
+    replays = replay.stats["replays"]
+    with torch.no_grad():
+        for b in (2, 3):
+            for n in range(3, 12):
+                x, cache = torch.randn(b, 64, device=device), torch.randn(n, 64, device=device)
+                assert torch.equal(c(x, cache).cpu(), step(x, cache).cpu()), (b, n)
+    assert any("in 2 pieces" in r for r in _replay_reports()), _replay_reports()
+    assert replay.stats["replays"] > replays, "no piece was replayed"
