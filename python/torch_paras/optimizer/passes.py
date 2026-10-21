@@ -273,7 +273,11 @@ def fuse_rms_norm(gm: fx.GraphModule) -> int:
         with gm.graph.inserting_before(node):
             fused = gm.graph.call_function(torch.ops.paras.rms_norm.default, (x, weight, eps))
             out = gm.graph.call_function(operator.getitem, (fused, 0))
-        out.meta["example_value"] = node.meta.get("example_value")
+        out_v = node.meta.get("example_value")
+        out.meta["example_value"] = out_v
+        if isinstance(out_v, torch.Tensor):
+            rows = out_v.numel() // out_v.shape[-1] if out_v.dim() else 1
+            fused.meta["example_value"] = (out_v, out_v.new_empty((rows,), dtype=torch.float32))
         node.replace_all_uses_with(out)
         _erase(gm, [node] + pattern)
         count += 1
@@ -459,12 +463,126 @@ def fuse_gqa_attention(gm: fx.GraphModule) -> int:
         count += 1
     return count
 
+def _mul_operands(node):
+    if _op(node) != "mul":
+        return None
+    return _operands(node)
+
+
+def _rope_parts(add):
+    """(x, cos, sin, mul_a, mul_b, rot) if `add` is x*cos + rotate_half(x)*sin."""
+    ops = _operands(add)
+    if ops is None:
+        return None
+    for left, right in (ops, ops[::-1]):
+        la, ra = _mul_operands(left), _mul_operands(right)
+        if la is None or ra is None:
+            continue
+        for rot, sin in (ra, ra[::-1]):
+            if not (isinstance(rot, fx.Node) and rot.op == "call_function" and
+                    rot.target is torch.ops.paras.rotate_half.default):
+                continue
+            x = rot.args[0]
+            for xa, cos in (la, la[::-1]):
+                if xa is x:
+                    return x, cos, sin, left, right, rot
+    return None
+
+
+def fuse_rope(gm: fx.GraphModule) -> int:
+    count = 0
+    for node in list(gm.graph.nodes):
+        if _op(node) != "add" or node.kwargs:
+            continue
+        parts = _rope_parts(node)
+        if parts is None:
+            continue
+        x, cos, sin, mul_a, mul_b, rot = parts
+        xv, cv, sv, ov = _value(x), _value(cos), _value(sin), _value(node)
+        if xv is None or cv is None or sv is None or ov is None:
+            continue
+        if not (xv.dtype == cv.dtype == sv.dtype == ov.dtype and xv.dtype.is_floating_point):
+            continue
+        if cv.requires_grad or sv.requires_grad:
+            continue
+        try:
+            if (tuple(torch.broadcast_shapes(xv.shape, cv.shape, sv.shape)) != tuple(xv.shape)
+                    or tuple(ov.shape) != tuple(xv.shape)):
+                continue
+        except RuntimeError:
+            continue
+        if not _on_paras(x, cos, sin):
+            continue
+        if not (_private(mul_a, {node}) and _private(mul_b, {node}) and _private(rot, {mul_b})):
+            continue
+        if not _no_mutation_within([node, mul_a, mul_b, rot]):
+            continue
+        with gm.graph.inserting_before(node):
+            fused = gm.graph.call_function(torch.ops.paras.rope.default, (x, cos, sin))
+        fused.meta["example_value"] = node.meta.get("example_value")
+        node.replace_all_uses_with(fused)
+        _erase(gm, [node, mul_a, mul_b, rot])
+        count += 1
+    return count
+
+
+def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
+    count = 0
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not torch.ops.paras.rms_norm.default:
+            continue
+        h, w, eps = node.args
+        if _op(h) != "add" or h.kwargs:
+            continue
+        ops = _operands(h)
+        if ops is None or not all(isinstance(t, fx.Node) for t in ops):
+            continue
+        a, b = ops
+        av, bv, hv = _value(a), _value(b), _value(h)
+        if av is None or bv is None or hv is None:
+            continue
+        if not (tuple(av.shape) == tuple(bv.shape) == tuple(hv.shape) and
+                av.dtype == bv.dtype == hv.dtype):
+            continue
+        if not _on_paras(a, b):
+            continue
+        if not all(u.op == "call_function" and u.target is operator.getitem for u in node.users):
+            continue
+        if isinstance(w, fx.Node) and order.get(w, 0) > order[h]:
+            continue
+        if not _no_mutation_within([h, node]):
+            continue
+        with gm.graph.inserting_after(h):
+            fused = gm.graph.call_function(torch.ops.paras.add_rms_norm.default, (a, b, w, eps))
+        with gm.graph.inserting_after(fused):
+            parts = [gm.graph.call_function(operator.getitem, (fused, i)) for i in range(3)]
+        norm_value = node.meta.get("example_value")
+        parts[0].meta["example_value"] = h.meta.get("example_value")
+        if isinstance(norm_value, (tuple, list)) and len(norm_value) == 2:
+            parts[1].meta["example_value"], parts[2].meta["example_value"] = norm_value
+            fused.meta["example_value"] = (h.meta.get("example_value"), *norm_value)
+        else:
+            for u in node.users:
+                parts[1 + u.args[1]].meta["example_value"] = u.meta.get("example_value")
+        for u in list(node.users):
+            u.replace_all_uses_with(parts[1] if u.args[1] == 0 else parts[2])
+            gm.graph.erase_node(u)
+        gm.graph.erase_node(node)
+        h.replace_all_uses_with(parts[0])
+        gm.graph.erase_node(h)
+        order = {n: i for i, n in enumerate(gm.graph.nodes)}
+        count += 1
+    return count
+
 
 PASSES = {
     "rms_norm": fuse_rms_norm,
     "swiglu": fuse_swiglu,
     "rotate_half": fuse_rotate_half,
     "gqa_attention": fuse_gqa_attention,
+    "rope": fuse_rope,
+    "add_rms_norm": fuse_add_rms_norm,
 }
 
 

@@ -44,15 +44,20 @@ template <typename T> class RmsNormRowsKernel;
 // -----------------------------------------------------------------------------
 // rms_norm: normalizes over the last dimension only.
 // -----------------------------------------------------------------------------
-std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
-                                    double eps) {
-    PTSYCL_TRACE_OP("paras::rms_norm");
+std::tuple<Tensor, Tensor> rms_norm_impl(const Tensor& input, const Tensor* addend,
+                                         const Tensor& weight, double eps, Tensor* sum) {
     TORCH_CHECK(spec_supported(input), "paras rms_norm: rank exceeds kernel limit");
     TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
                 "paras rms_norm: weight dtype ", weight.scalar_type(),
                 " must match input dtype ", input.scalar_type());
 
     Tensor in = input.contiguous();
+    Tensor add = addend != nullptr ? addend->contiguous() : Tensor();
+    if (addend != nullptr) {
+        TORCH_CHECK(add.sizes() == in.sizes() && add.scalar_type() == in.scalar_type(),
+                    "paras add_rms_norm: the addends must have one shape and dtype");
+        *sum = at::empty_like(in);
+    }
     Tensor w  = weight.contiguous();
     const int64_t H    = in.size(-1);
     const int64_t rows = H > 0 ? in.numel() / H : 0;
@@ -62,19 +67,35 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
     Tensor out  = at::empty_like(in);
     Tensor rstd = at::empty({rows}, in.options().dtype(c10::kFloat));
     if (rows == 0 || H == 0) return {out, rstd};
-
     auto& q = queue_for(in);
+#if defined(PTSYCL_BACKEND_SYCL)
+    const bool in_kernel_sum = addend != nullptr && reduce_in_groups(q, H);
+#else
+    const bool in_kernel_sum = false;
+#endif
+    if (addend != nullptr && !in_kernel_sum) {
+        at::add_out(*sum, in, add);
+        in = *sum;
+    }
+
     float* pr = data_ptr<float>(rstd);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, in.scalar_type(), "ptsycl_rms_norm", [&] {
             const scalar_t* pin  = data_ptr<scalar_t>(in);
+            const scalar_t* padd = in_kernel_sum ? data_ptr<scalar_t>(add) : nullptr;
+            scalar_t*       psum = in_kernel_sum ? data_ptr<scalar_t>(*sum) : nullptr;
             const scalar_t* pw   = data_ptr<scalar_t>(w);
             scalar_t*       pout = data_ptr<scalar_t>(out);
             const double inv_h = 1.0 / static_cast<double>(H);
+            const auto value = [=](int64_t i) {
+                return padd == nullptr
+                    ? static_cast<double>(pin[i])
+                    : static_cast<double>(static_cast<scalar_t>(
+                          static_cast<double>(pin[i]) + static_cast<double>(padd[i])));
+            };
             const double eps32 = static_cast<double>(static_cast<float>(eps));
             const auto square = [=](int64_t r, int64_t j) {
-                const double x = static_cast<double>(
-                    static_cast<float>(static_cast<double>(pin[r * H + j])));
+                const double x = static_cast<double>(static_cast<float>(value(r * H + j)));
                 return static_cast<double>(static_cast<float>(x * x));
             };
             const auto plus = [](double a, double b) { return a + b; };
@@ -85,7 +106,7 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
                 return static_cast<float>(1.0 / ::sqrt(static_cast<double>(var)));
             };
             const auto normalized = [=](int64_t i, float rs) {
-                const float x = static_cast<float>(static_cast<double>(pin[i]));
+                const float x = static_cast<float>(value(i));
                 const float n = static_cast<float>(
                     static_cast<double>(x) * static_cast<double>(rs));
                 const scalar_t nb = static_cast<scalar_t>(n);
@@ -105,8 +126,11 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
                             const float rs = rstd_of(
                                 reduce_row_in_group<double>(it, &lds[0], r, H, 0.0, square, plus));
                             if (l == 0) pr[r] = rs;
-                            for (int64_t j = l; j < H; j += kReduceWG)
+                            for (int64_t j = l; j < H; j += kReduceWG) {
                                 pout[r * H + j] = normalized(r * H + j, rs);
+                                if (psum != nullptr)
+                                    psum[r * H + j] = static_cast<scalar_t>(value(r * H + j));
+                            }
                         });
                 });
                 return;
@@ -124,6 +148,63 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
             });
         });
     return {out, rstd};
+}
+
+std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight, double eps) {
+    PTSYCL_TRACE_OP("paras::rms_norm");
+    return rms_norm_impl(input, nullptr, weight, eps, nullptr);
+}
+
+std::tuple<Tensor, Tensor, Tensor> add_rms_norm(const Tensor& a, const Tensor& b,
+                                                const Tensor& weight, double eps) {
+    PTSYCL_TRACE_OP("paras::add_rms_norm");
+    Tensor sum;
+    auto [out, rstd] = rms_norm_impl(a, &b, weight, eps, &sum);
+    return {sum, out, rstd};
+}
+
+template <typename scalar_t>
+void rope_kernel(compat::Queue& q, const Tensor& x, const Tensor& ce, const Tensor& se,
+                 Tensor& out) {
+    const int64_t n = out.numel();
+    const int64_t D = x.size(-1), half = D / 2;
+    const auto sx = make_flat_spec(x), sc = make_flat_spec(ce),
+               ss = make_flat_spec(se), so = make_flat_spec(out);
+    const scalar_t* px = data_ptr<scalar_t>(x);
+    const scalar_t* pc = data_ptr<scalar_t>(ce);
+    const scalar_t* ps = data_ptr<scalar_t>(se);
+    scalar_t*       po = data_ptr<scalar_t>(out);
+    launch_flat(q, n, [=](std::size_t flat_) {
+#pragma clang fp contract(off)
+        const int64_t flat = static_cast<int64_t>(flat_);
+        const int64_t col = flat % D;
+        const int64_t partner = flat - col + (col < half ? col + half : col - half);
+        const double xv = static_cast<double>(px[sx.index(flat)]);
+        const double pv = static_cast<double>(px[sx.index(partner)]);
+        const double rot = col < half ? -pv : pv;
+        const double a = static_cast<double>(static_cast<scalar_t>(
+            xv * static_cast<double>(pc[sc.index(flat)])));
+        const double b = static_cast<double>(static_cast<scalar_t>(
+            rot * static_cast<double>(ps[ss.index(flat)])));
+        po[so.index(flat)] = static_cast<scalar_t>(a + b);
+    });
+}
+
+Tensor rope(const Tensor& x, const Tensor& cos, const Tensor& sin) {
+    PTSYCL_TRACE_OP("paras::rope");
+    TORCH_CHECK(x.dim() >= 1 && x.size(-1) % 2 == 0,
+                "paras rope: the last dimension must be even");
+    TORCH_CHECK(cos.scalar_type() == x.scalar_type() && sin.scalar_type() == x.scalar_type(),
+                "paras rope: x, cos and sin must share a dtype");
+    TORCH_CHECK(spec_supported(x), "paras rope: rank exceeds kernel limit");
+    Tensor out = at::empty_like(x);
+    if (out.numel() == 0) return out;
+    const Tensor ce = cos.expand_as(x), se = sin.expand_as(x);
+    auto& q = queue_for(out);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        c10::kHalf, c10::kBFloat16, x.scalar_type(), "ptsycl_rope",
+        [&] { rope_kernel<scalar_t>(q, x, ce, se, out); });
+    return out;
 }
 
 std::tuple<Tensor, Tensor> rms_norm_backward(const Tensor& grad_out,
@@ -350,6 +431,8 @@ TORCH_LIBRARY(paras, m) {
           "(Tensor, Tensor)");
     m.def("rotate_half(Tensor x) -> Tensor");
     m.def("rotate_half_backward(Tensor grad_out) -> Tensor");
+    m.def("add_rms_norm(Tensor a, Tensor b, Tensor weight, float eps) -> (Tensor, Tensor, Tensor)");
+    m.def("rope(Tensor x, Tensor cos, Tensor sin) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
@@ -359,6 +442,8 @@ TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
     m.impl("swiglu_backward", &ptsycl::swiglu_backward);
     m.impl("rotate_half", &ptsycl::rotate_half);
     m.impl("rotate_half_backward", &ptsycl::rotate_half_backward);
+    m.impl("add_rms_norm", &ptsycl::add_rms_norm);
+    m.impl("rope", &ptsycl::rope);
 }
 
 namespace ptsycl {
@@ -424,6 +509,63 @@ struct RotateHalfFunction : public torch::autograd::Function<RotateHalfFunction>
     }
 };
 
+struct AddRmsNormFunction : public torch::autograd::Function<AddRmsNormFunction> {
+    static variable_list forward(AutogradContext* ctx, const Tensor& a, const Tensor& b,
+                                 const Tensor& weight, double eps) {
+        static const auto op = paras_op<std::tuple<Tensor, Tensor, Tensor>(
+            const Tensor&, const Tensor&, const Tensor&, double)>("paras::add_rms_norm");
+        at::AutoDispatchBelowADInplaceOrView guard;
+        auto [sum, out, rstd] = op.call(a, b, weight, eps);
+        ctx->save_for_backward({sum, weight, rstd});
+        ctx->mark_non_differentiable({rstd});
+        return {sum, out, rstd};
+    }
+    static variable_list backward(AutogradContext* ctx, variable_list grads) {
+        static const auto op = paras_op<std::tuple<Tensor, Tensor>(
+            const Tensor&, const Tensor&, const Tensor&, const Tensor&)>(
+            "paras::rms_norm_backward");
+        const auto saved = ctx->get_saved_variables();
+        Tensor grad_sum, grad_weight;
+        if (grads[1].defined()) {
+            auto [gi, gw] = op.call(grads[1].contiguous(), saved[0], saved[1], saved[2]);
+            grad_sum = gi;
+            grad_weight = gw;
+        }
+        if (grads[0].defined())
+            grad_sum = grad_sum.defined() ? grad_sum + grads[0] : grads[0];
+        return {grad_sum, grad_sum, grad_weight, Tensor()};
+    }
+};
+
+struct RopeFunction : public torch::autograd::Function<RopeFunction> {
+    static Tensor forward(AutogradContext* ctx, const Tensor& x, const Tensor& cos,
+                          const Tensor& sin) {
+        static const auto op =
+            paras_op<Tensor(const Tensor&, const Tensor&, const Tensor&)>("paras::rope");
+        at::AutoDispatchBelowADInplaceOrView guard;
+        ctx->save_for_backward({cos, sin});
+        return op.call(x, cos, sin);
+    }
+    static variable_list backward(AutogradContext* ctx, variable_list grads) {
+        static const auto rot_back =
+            paras_op<Tensor(const Tensor&)>("paras::rotate_half_backward");
+        const auto saved = ctx->get_saved_variables();
+        const Tensor& g = grads[0];
+        Tensor gx = g * saved[0] + rot_back.call((g * saved[1]).contiguous());
+        return {gx, Tensor(), Tensor()};
+    }
+};
+
+std::tuple<Tensor, Tensor, Tensor> add_rms_norm_autograd(const Tensor& a, const Tensor& b,
+                                                         const Tensor& weight, double eps) {
+    auto out = AddRmsNormFunction::apply(a, b, weight, eps);
+    return {out[0], out[1], out[2]};
+}
+
+Tensor rope_autograd(const Tensor& x, const Tensor& cos, const Tensor& sin) {
+    return RopeFunction::apply(x, cos, sin);
+}
+
 std::tuple<Tensor, Tensor> rms_norm_autograd(const Tensor& input, const Tensor& weight,
                                              double eps) {
     auto out = RmsNormFunction::apply(input, weight, eps);
@@ -445,4 +587,6 @@ TORCH_LIBRARY_IMPL(paras, AutogradPrivateUse1, m) {
     m.impl("rms_norm", &ptsycl::rms_norm_autograd);
     m.impl("swiglu", &ptsycl::swiglu_autograd);
     m.impl("rotate_half", &ptsycl::rotate_half_autograd);
+    m.impl("add_rms_norm", &ptsycl::add_rms_norm_autograd);
+    m.impl("rope", &ptsycl::rope_autograd);
 }

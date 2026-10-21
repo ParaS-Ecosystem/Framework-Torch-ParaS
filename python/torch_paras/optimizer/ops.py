@@ -66,4 +66,14 @@ def register() -> None:
     def _rotate_half_backward_fake(grad_out):
         return torch.empty_like(grad_out)
 
+    @torch.library.register_fake("paras::add_rms_norm")
+    def _add_rms_norm_fake(a, b, weight, eps):
+        rows = a.numel() // a.shape[-1] if a.shape[-1] != 0 else 0
+        sum_ = torch.empty_like(a, memory_format=torch.contiguous_format)
+        return sum_, torch.empty_like(sum_), a.new_empty((rows,), dtype=torch.float32)
+
+    @torch.library.register_fake("paras::rope")
+    def _rope_fake(x, cos, sin):
+        return torch.empty_like(x)
+
     _registered = True
