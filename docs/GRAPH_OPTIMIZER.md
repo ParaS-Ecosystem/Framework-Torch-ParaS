@@ -128,6 +128,7 @@ inference graph.
 | `rms_norm` | `w * (x32 * rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)` with `x32 = x.to(float32)` (or `x` already fp32; `x*x` accepted for `pow(2)`) | `paras::rms_norm(x, w, eps)` |
 | `swiglu` | `silu(gate) * up` (skipped where CLAP-DNN runs eager SiLU, see below) | `paras::swiglu(gate, up)` |
 | `rotate_half` | `cat((-x[..., h:], x[..., :h]), -1)` with `h = x.shape[-1] // 2` | `paras::rotate_half(x)` |
+| `gqa_attention` | `scaled_dot_product_attention(q, repeat_kv(k), repeat_kv(v))`, `repeat_kv(x) = x[:, :, None].expand(B, Hk, G, L, D).reshape(B, Hk*G, L, D)` (transformers' form) | the same call on `k`, `v` with `enable_gqa=True`: the fused attention kernels read key/value head `h // G` in place instead of a copy of the KV cache per call |
 
 Method, function and operator spellings are all recognised (`x.pow(2)`,
 `torch.pow(x, 2)`, `x ** 2`). A pattern is rewritten only when the fused

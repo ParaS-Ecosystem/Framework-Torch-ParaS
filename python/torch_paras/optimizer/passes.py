@@ -394,10 +394,77 @@ def fuse_rotate_half(gm: fx.GraphModule) -> int:
     return count
 
 
+def _full_slice(x) -> bool:
+    return isinstance(x, slice) and x.start is None and x.stop is None and x.step is None
+
+
+def _repeat_kv_source(node):
+    """(x, G) if `node` is repeat_kv(x, G) with private intermediates."""
+    if _op(node) != "reshape":
+        return None
+    expand = node.args[0]
+    if _op(expand) != "expand" or not _private(expand, {node}):
+        return None
+    unsq = expand.args[0]
+    name = _op(unsq)
+    if name == "getitem":
+        index = unsq.args[1] if len(unsq.args) == 2 else None
+        if not (isinstance(index, tuple) and len(index) >= 3 and index[2] is None and
+                all(_full_slice(i) for i in index[:2]) and
+                all(_full_slice(i) or i is Ellipsis for i in index[3:])):
+            return None
+    elif name == "unsqueeze":
+        if unsq.args[1:] != (2,) or unsq.kwargs:
+            return None
+    else:
+        return None
+    if not _private(unsq, {expand}):
+        return None
+    x = unsq.args[0]
+    xv, ev, rv = _value(x), _value(expand), _value(node)
+    if xv is None or ev is None or rv is None or xv.dim() != 4 or ev.dim() != 5 or rv.dim() != 4:
+        return None
+    B, Hk, L, D = xv.shape
+    G = ev.shape[2]
+    if not isinstance(G, int) or G < 2:
+        return None
+    if tuple(ev.shape) != (B, Hk, G, L, D) or tuple(rv.shape) != (B, Hk * G, L, D):
+        return None
+    return x, G
+
+
+def fuse_gqa_attention(gm: fx.GraphModule) -> int:
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not F.scaled_dot_product_attention:
+            continue
+        if len(node.args) != 3 or node.kwargs.get("enable_gqa", False):
+            continue
+        if node.kwargs.get("dropout_p", 0.0) != 0.0:
+            continue
+        q, k, v = node.args
+        ks, vs = _repeat_kv_source(k), _repeat_kv_source(v)
+        if ks is None or vs is None or ks[1] != vs[1]:
+            continue
+        if not (_private(k, {node}) and _private(v, {node}) and _on_paras(q, ks[0], vs[0])):
+            continue
+        if not _no_mutation_within([node, k, v, k.args[0], v.args[0], k.args[0].args[0], v.args[0].args[0]]):
+            continue
+        node.args = (q, ks[0], vs[0])
+        node.kwargs = {**node.kwargs, "enable_gqa": True}
+        for rk in (k, v):
+            expand = rk.args[0]
+            unsq = expand.args[0]
+            _erase(gm, [rk, expand, unsq])
+        count += 1
+    return count
+
+
 PASSES = {
     "rms_norm": fuse_rms_norm,
     "swiglu": fuse_swiglu,
     "rotate_half": fuse_rotate_half,
+    "gqa_attention": fuse_gqa_attention,
 }
 
 

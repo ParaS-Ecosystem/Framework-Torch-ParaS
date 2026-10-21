@@ -528,3 +528,28 @@ def test_no_fusion_across_inplace_update(device):
     out = torch.compile(f, backend="paras")(x.clone(), w)
     assert _fusions() == {}, _fusions()
     assert_close(out, ref, "rms_norm across x.add_")
+
+
+def _repeat_kv(x, n_rep):
+    b, h, s, d = x.shape
+    return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
+
+
+def test_gqa_attention_fused_and_exact(device):
+    torch.manual_seed(0)
+
+    def attend(q, k, v, mask):
+        return F.scaled_dot_product_attention(q, _repeat_kv(k, 4), _repeat_kv(v, 4), attn_mask=mask)
+
+    with torch.no_grad():
+        for Lq, Lk in ((1, 77), (64, 64)):
+            _reset()
+            q = torch.randn(1, 8, Lq, 64, device=device, dtype=torch.bfloat16)
+            k = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+            v = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+            mask = torch.zeros(1, 1, Lq, Lk, device=device, dtype=torch.bfloat16)
+            mask[..., Lk // 2:] = torch.finfo(torch.bfloat16).min
+            ref = attend(q, k, v, mask)
+            out = torch_paras.compile(attend)(q, k, v, mask)
+            assert _fusions().get("gqa_attention") == 1, _fusions()
+            assert torch.equal(out.cpu(), ref.cpu()), (Lq, Lk)
