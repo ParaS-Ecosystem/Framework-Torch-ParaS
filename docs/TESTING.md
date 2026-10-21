@@ -55,6 +55,54 @@ Current limits remain:
   `CLAP_BACKEND` and command-line flags can select the fallback even when
   the environment setting matches; option precedence is unchanged.
 
+### Activation availability traces
+
+Sigmoid and SiLU share an internal resolver in `clap_dnn_adapter.cpp`.
+It runs once for each call reaching the existing activation implementation,
+including functional, `out=`, and in-place forms. Set `PTSYCL_LOG=2` before
+starting Python to see its decision on stderr:
+
+```text
+[ptsycl op] clap_dnn.resolve op=sigmoid route=clap_cuda reason=eligible
+[ptsycl op] clap_dnn.resolve op=silu route=paras reason=dtype_unsupported
+```
+
+The routes are `paras`, `clap_cpu`, `clap_cuda`, and `clap_rocm`. The first
+rejected check determines the reason, in this order:
+
+| Reason | Meaning |
+|---|---|
+| `clap_disabled` | This build disables CLAP-DNN. |
+| `input_unsupported` | Scalar, empty, non-contiguous input/output, or incompatible input/output shape, device, or dtype. |
+| `dtype_unsupported` | The matching input/output dtype is not Float32, Float16, or BFloat16. |
+| `device_unsupported` | No compiled CLAP-DNN backend matches the GPU queue. |
+| `override_mismatch` | Environment or command-line settings reject the tensor backend, including invalid nonempty `CLAP_BACKEND`. |
+| `eligible` | Existing checks permit an attempt on the selected CLAP backend. |
+
+An eligible decision precedes backend creation and execution; it does not
+guarantee vendor support. CPU Float16 and CUDA rank errors still reach the
+caller after an `eligible` trace. They do not trigger a ParaS retry. Rejected
+decisions increment the CLAP fallback counter once; completed vendor calls
+increment the vendor counters. These counters do not describe PyTorch's
+general CPU fallback. The resolver covers only these two activations and
+does not change dispatcher registrations, other operators, or CLAP-BLAS.
+Resolver traces are absent with `PTSYCL_LOG` unset, `0`, or `1`.
+
+The resolver checks run in fresh subprocesses and compare marked stderr
+lines independently of surrounding vendor logs. They also check numerical
+results, output storage, vendor/fallback counters, input-check precedence,
+backend settings, and error propagation. Failures include captured output.
+Run them with a normal build (fast builds omit activation registrations):
+
+```bash
+"$PTSYCL_PYTHON" -m pytest -q tests/test_clap_dnn_multigpu.py -k resolver
+```
+
+The input and override resolver checks also work with CLAP OFF and require
+`route=paras reason=clap_disabled`. The vendor-error check skips in that build.
+`tests/run_all.py --all-devices` runs these checks on every enumerated device.
+The GPU tests in this module target NVIDIA/cuDNN; they do not validate AMD.
+
 ## Build smoke check
 
 `tests/smoke_build.py` checks package import, the CLAP enable status and
@@ -102,7 +150,8 @@ waiting for each build to finish before starting another.
 - `test_param2_17b.py` — model-level check for the Param2 profiling
   workload.
 - `test_clap_dnn_multigpu.py` — vendor call counts, interleaved GPU calls,
-  CPU dtype limits, input fallbacks, and backend overrides.
+  CPU dtype limits, input fallbacks, backend overrides, and activation resolver
+  traces (including quiet logging and vendor errors).
 
 See `docs/OPERATOR_COVERAGE.md` for which native kernels still lack a
 parity test.
