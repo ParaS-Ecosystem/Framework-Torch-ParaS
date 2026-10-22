@@ -433,6 +433,40 @@ def test_topk_values_only_with_ties(device):
 
 # --- structure ----------------------------------------------------------------
 
+def test_cat_one_launch_cases(device):
+    torch.manual_seed(0)
+    cases = [
+        (torch.float32, [(5, 3), (2, 3), (0, 3), (7, 3)], 0),
+        (torch.bfloat16, [(4, 6, 5), (4, 1, 5), (4, 3, 5)], 1),
+        (torch.float64, [(3, 2), (3, 7)], -1),
+        (torch.int64, [(2, 3, 1), (2, 3, 4)], -1),
+        (torch.bool, [(3, 5), (3, 2), (3, 1)], 1),
+        (torch.float32, [(int(n), 2048) for n in torch.randint(1, 13, (64,))], 0),
+        (torch.float16, [(1, 3)] * 70, 0),
+    ]
+    for dtype, shapes, dim in cases:
+        if dtype == torch.bool:
+            ts = [torch.rand(s) > 0.5 for s in shapes]
+        elif dtype.is_floating_point:
+            ts = [torch.randn(s).to(dtype) for s in shapes]
+        else:
+            ts = [torch.randint(-9, 9, s) for s in shapes]
+        got = torch.cat([t.to(device) for t in ts], dim=dim)
+        assert torch.equal(got.cpu(), torch.cat(ts, dim=dim)), (dtype, dim)
+    a = torch.randn(4, 6)
+    b = torch.randn(3, 4).t()
+    assert torch.equal(torch.cat([a.to(device), b.to(device)], dim=1).cpu(), torch.cat([a, b], dim=1))
+
+
+def test_pow_short_exponents_exact(device):
+    x = torch.randn(10007)
+    d = x.to(device)
+    assert torch.equal(d.pow(2).cpu(), (x.double() * x.double()).float())
+    assert torch.equal(d.pow(1).cpu(), x)
+    assert torch.equal(d.pow(-1).cpu(), (1.0 / x.double()).float())
+    torch.testing.assert_close(d.pow(3).cpu(), x.double().pow(3).float(), atol=0, rtol=1e-6)
+
+
 def test_cat(device):
     a, b, da, db = _pair(device)
     check_op("cat", lambda: torch.cat([a, b], dim=0),
