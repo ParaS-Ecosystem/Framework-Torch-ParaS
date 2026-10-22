@@ -502,6 +502,75 @@ def test_foreach_norm_and_clip_grad_norm(device):
         torch.testing.assert_close(d.grad.cpu(), q.grad, atol=1e-6, rtol=1e-4)
 
 
+def _foreach_lists(device, dtype, seed):
+    g = torch.Generator().manual_seed(seed)
+    sizes = [3 * 65536 + 5, 1_000_003, 7, 0, 1, 131072]
+    base = torch.randn(1001, generator=g).to(dtype).to(device)
+    out = [torch.randn(n, generator=g).to(dtype).to(device) for n in sizes]
+    return out + [base[1:]]
+
+
+def test_foreach_optimizer_ops_bit_exact(device):
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        xs = _foreach_lists(device, dtype, 0)
+        ys = _foreach_lists(device, dtype, 1)
+        zs = [t.abs() + 0.5 for t in _foreach_lists(device, dtype, 2)]
+        coef = torch.tensor(0.37, device=device)
+        sl = [0.5 + 0.25 * i for i in range(len(xs))]
+        cases = {
+            "mul_.Scalar": (lambda a: torch._foreach_mul_(a, 0.9), lambda t, i: t.mul_(0.9)),
+            "mul_.Tensor": (lambda a: torch._foreach_mul_(a, coef), lambda t, i: t.mul_(coef)),
+            "add_.List": (lambda a: torch._foreach_add_(a, ys, alpha=-1e-2), lambda t, i: t.add_(ys[i], alpha=-1e-2)),
+            "add_.Scalar": (lambda a: torch._foreach_add_(a, 1e-3), lambda t, i: t.add_(1e-3)),
+            "lerp_.Scalar": (lambda a: torch._foreach_lerp_(a, ys, 0.1), lambda t, i: t.lerp_(ys[i], 0.1)),
+            "addcmul_.Scalar": (lambda a: torch._foreach_addcmul_(a, ys, zs, value=0.05),
+                                lambda t, i: t.addcmul_(ys[i], zs[i], value=0.05)),
+            "addcdiv_.ScalarList": (lambda a: torch._foreach_addcdiv_(a, ys, zs, sl),
+                                    lambda t, i: t.addcdiv_(ys[i], zs[i], value=sl[i])),
+            "div_.ScalarList": (lambda a: torch._foreach_div_(a, sl), lambda t, i: t.div_(sl[i])),
+        }
+        for name, (fused, single) in cases.items():
+            got = [t.clone() for t in xs]
+            ref = [t.clone() for t in xs]
+            fused(got)
+            for i, t in enumerate(ref):
+                single(t, i)
+            for i, (g_, r_) in enumerate(zip(got, ref)):
+                assert torch.equal(g_.cpu(), r_.cpu()), (name, dtype, i)
+        roots = torch._foreach_sqrt(zs)
+        for r_, z in zip(roots, zs):
+            assert torch.equal(r_.cpu(), z.sqrt().cpu()), ("sqrt", dtype)
+    a = [torch.randn(70001), torch.randn(9)]
+    d = [t.to(device) for t in a]
+    torch._foreach_mul_(d, 0.9)
+    torch._foreach_add_(d, d, alpha=0.5)
+    for x, t in zip(d, a):
+        torch.testing.assert_close(x.cpu(), t * 0.9 * 1.5, atol=1e-6, rtol=1e-6)
+    mixed = [torch.ones(5, device=device), torch.ones(5, dtype=torch.float64, device=device)]
+    torch._foreach_mul_(mixed, 3.0)
+    assert all(torch.equal(m.cpu(), torch.full((5,), 3.0, dtype=m.dtype)) for m in mixed)
+
+
+def test_foreach_optimizers_match_single_tensor(device):
+    for make in (lambda p, fe: torch.optim.SGD(p, lr=1e-2, momentum=0.9, foreach=fe),
+                 lambda p, fe: torch.optim.AdamW(p, lr=1e-2, weight_decay=0.1, foreach=fe)):
+        for dtype in (torch.bfloat16, torch.float32):
+            torch.manual_seed(0)
+            init = [torch.randn(s).to(dtype) for s in ((257, 129), (65536 * 2 + 3,), (3,))]
+            grads = [[torch.randn(t.shape).to(dtype) for t in init] for _ in range(3)]
+            runs = []
+            for fe in (True, False):
+                ps = [t.clone().to(device).requires_grad_() for t in init]
+                opt = make(ps, fe)
+                for step in grads:
+                    for p, g in zip(ps, step):
+                        p.grad = g.to(device)
+                    opt.step()
+                runs.append([p.detach().cpu() for p in ps])
+            for a, b in zip(*runs):
+                assert torch.equal(a, b), (type(opt).__name__, dtype)
+
+
 def test_argsort_bitonic_sizes_exact(device):
     torch.manual_seed(0)
     cases = [torch.randint(0, 64, (12288,)), torch.randint(0, 5, (4097,)), torch.randn(70001),
