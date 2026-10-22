@@ -38,7 +38,62 @@ namespace {
 using at::Tensor;
 
 #if defined(PTSYCL_BACKEND_SYCL)
-template <typename T> class RmsNormRowsKernel;
+template <typename T, int K> class RmsNormRowsKernel;
+
+template <typename T, int K>
+void rms_norm_rows(compat::Queue& q, const T* pin, const T* padd, T* psum, const T* pw, T* pout,
+                   float* pr, int64_t rows, int64_t H, double inv_h, double eps32) {
+    q.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<double, 1> lds(sycl::range<1>(kReduceWG), cgh);
+        cgh.template parallel_for<RmsNormRowsKernel<T, K>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
+                              sycl::range<1>(kReduceWG)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t r = static_cast<int64_t>(it.get_group(0));
+                const int64_t l = static_cast<int64_t>(it.get_local_id(0));
+                const T* in = pin + r * H;
+                float x[K];
+                T w[K];
+#pragma unroll
+                for (int t = 0; t < K; ++t) {
+                    const int64_t j = l + t * kReduceWG;
+                    if (j < H) {
+                        x[t] = padd == nullptr
+                            ? static_cast<float>(in[j])
+                            : static_cast<float>(static_cast<T>(
+                                  static_cast<double>(in[j]) +
+                                  static_cast<double>(padd[r * H + j])));
+                        w[t] = pw[j];
+                    }
+                }
+                double acc = 0.0;
+#pragma unroll
+                for (int t = 0; t < K; ++t) {
+                    if (l + t * kReduceWG < H) {
+                        const double xd = static_cast<double>(x[t]);
+                        acc = acc + static_cast<double>(static_cast<float>(xd * xd));
+                    }
+                }
+                const double sum = combine_in_group(it, &lds[0], acc,
+                                                    [](double a, double b) { return a + b; });
+                const float mean = static_cast<float>(static_cast<double>(static_cast<float>(sum)) * inv_h);
+                const float var = static_cast<float>(static_cast<double>(mean) + eps32);
+                const float rs = static_cast<float>(1.0 / ::sqrt(static_cast<double>(var)));
+                if (l == 0) pr[r] = rs;
+#pragma unroll
+                for (int t = 0; t < K; ++t) {
+                    const int64_t j = l + t * kReduceWG;
+                    if (j < H) {
+                        const T nb = static_cast<T>(static_cast<float>(
+                            static_cast<double>(x[t]) * static_cast<double>(rs)));
+                        pout[r * H + j] = static_cast<T>(static_cast<double>(w[t]) *
+                                                         static_cast<double>(nb));
+                        if (psum != nullptr) psum[r * H + j] = static_cast<T>(x[t]);
+                    }
+                }
+            });
+    });
+}
 #endif
 
 // -----------------------------------------------------------------------------
@@ -115,24 +170,14 @@ std::tuple<Tensor, Tensor> rms_norm_impl(const Tensor& input, const Tensor* adde
             };
 #if defined(PTSYCL_BACKEND_SYCL)
             if (reduce_in_groups(q, H)) {
-                q.sycl_queue().submit([&](sycl::handler& cgh) {
-                    sycl::local_accessor<double, 1> lds(sycl::range<1>(kReduceWG), cgh);
-                    cgh.template parallel_for<RmsNormRowsKernel<scalar_t>>(
-                        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
-                                          sycl::range<1>(kReduceWG)),
-                        [=](sycl::nd_item<1> it) {
-                            const int64_t r = static_cast<int64_t>(it.get_group(0));
-                            const int l = static_cast<int>(it.get_local_id(0));
-                            const float rs = rstd_of(
-                                reduce_row_in_group<double>(it, &lds[0], r, H, 0.0, square, plus));
-                            if (l == 0) pr[r] = rs;
-                            for (int64_t j = l; j < H; j += kReduceWG) {
-                                pout[r * H + j] = normalized(r * H + j, rs);
-                                if (psum != nullptr)
-                                    psum[r * H + j] = static_cast<scalar_t>(value(r * H + j));
-                            }
-                        });
-                });
+                const int64_t per = (H + kReduceWG - 1) / kReduceWG;
+                if (per <= 1)       rms_norm_rows<scalar_t, 1>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else if (per <= 2)  rms_norm_rows<scalar_t, 2>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else if (per <= 4)  rms_norm_rows<scalar_t, 4>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else if (per <= 8)  rms_norm_rows<scalar_t, 8>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else if (per <= 16) rms_norm_rows<scalar_t, 16>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else if (per <= 32) rms_norm_rows<scalar_t, 32>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else                rms_norm_rows<scalar_t, 64>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
                 return;
             }
 #endif

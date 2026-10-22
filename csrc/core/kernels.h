@@ -200,13 +200,10 @@ inline bool reduce_in_groups(compat::Queue& q, int64_t red_n) {
     return q.is_gpu() && red_n >= kReduceWG && red_n <= kReduceWGMax;
 }
 
-template <typename acc_t, typename Map, typename Combine>
-PTSYCL_HOST_DEVICE inline acc_t reduce_row_in_group(const sycl::nd_item<1>& it, acc_t* lds,
-                                                    int64_t o, int64_t red_n, acc_t init,
-                                                    const Map& map, const Combine& combine) {
+template <typename acc_t, typename Combine>
+PTSYCL_HOST_DEVICE inline acc_t combine_in_group(const sycl::nd_item<1>& it, acc_t* lds,
+                                                 acc_t acc, const Combine& combine) {
     const int l = static_cast<int>(it.get_local_id(0));
-    acc_t acc = init;
-    for (int64_t j = l; j < red_n; j += kReduceWG) acc = combine(acc, map(o, j));
     if constexpr (std::is_arithmetic_v<acc_t>) {
         const auto sg = it.get_sub_group();
         acc = sycl::reduce_over_group(sg, acc, combine);
@@ -225,6 +222,16 @@ PTSYCL_HOST_DEVICE inline acc_t reduce_row_in_group(const sycl::nd_item<1>& it, 
         sycl::group_barrier(it.get_group());
         return lds[0];
     }
+}
+
+template <typename acc_t, typename Map, typename Combine>
+PTSYCL_HOST_DEVICE inline acc_t reduce_row_in_group(const sycl::nd_item<1>& it, acc_t* lds,
+                                                    int64_t o, int64_t red_n, acc_t init,
+                                                    const Map& map, const Combine& combine) {
+    const int l = static_cast<int>(it.get_local_id(0));
+    acc_t acc = init;
+    for (int64_t j = l; j < red_n; j += kReduceWG) acc = combine(acc, map(o, j));
+    return combine_in_group(it, lds, acc, combine);
 }
 
 template <typename acc_t, typename Map, typename Combine, typename Store>
