@@ -428,6 +428,72 @@ void small_m_gemm(compat::Queue& queue, const T* A, int64_t lda, const T* W, int
     });
 }
 
+#if PARAS_HIP_BACKEND
+constexpr int kGemvWaveCols = 4;
+constexpr int kGemvWaveLanes = 64;
+constexpr int kGemvWaves = kGemvThreads / kGemvWaveLanes;
+template <typename T, int M> class GemvWaveKernel;
+
+template <typename T, int M>
+void small_m_gemm_wave(compat::Queue& queue, const T* A, int64_t lda, const T* W, int64_t ldw,
+                       T* C, int64_t ldc, int64_t n, int64_t k, float alpha, float beta) {
+    static_assert(M * kGemvWaveCols <= kGemvWaveLanes, "one output per lane");
+    constexpr int V = 16 / sizeof(T);
+    using Ch = GemvChunk<T, V>;
+    const int64_t chunks = k / V;
+    const int64_t groups = (n + kGemvWaves * kGemvWaveCols - 1) / (kGemvWaves * kGemvWaveCols);
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+      cgh.template parallel_for<GemvWaveKernel<T, M>>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kGemvThreads)),
+                          sycl::range<1>(kGemvThreads)),
+        [=](sycl::nd_item<1> it) {
+            const auto sg = it.get_sub_group();
+            const int tid = static_cast<int>(it.get_local_id(0));
+            const int lane = tid % kGemvWaveLanes, wave = tid / kGemvWaveLanes;
+            const int64_t n0 = (static_cast<int64_t>(it.get_group(0)) * kGemvWaves + wave) * kGemvWaveCols;
+            const T* rows[kGemvWaveCols];
+#pragma unroll
+            for (int c = 0; c < kGemvWaveCols; ++c)
+                rows[c] = W + (n0 + c < n ? n0 + c : n - 1) * ldw;
+            float acc[M][kGemvWaveCols] = {};
+            for (int64_t ch = lane; ch < chunks; ch += kGemvWaveLanes) {
+                Ch w[kGemvWaveCols];
+#pragma unroll
+                for (int c = 0; c < kGemvWaveCols; ++c)
+                    w[c] = *reinterpret_cast<const Ch*>(rows[c] + ch * V);
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    const Ch x = *reinterpret_cast<const Ch*>(A + m * lda + ch * V);
+#pragma unroll
+                    for (int e = 0; e < V; ++e) {
+                        const float xv = static_cast<float>(x.v[e]);
+#pragma unroll
+                        for (int c = 0; c < kGemvWaveCols; ++c)
+                            acc[m][c] += xv * static_cast<float>(w[c].v[e]);
+                    }
+                }
+            }
+            float mine = 0.f;
+#pragma unroll
+            for (int m = 0; m < M; ++m)
+#pragma unroll
+                for (int c = 0; c < kGemvWaveCols; ++c) {
+                    const float v = sycl::reduce_over_group(sg, acc[m][c], sycl::plus<float>());
+                    if (lane == m * kGemvWaveCols + c) mine = v;
+                }
+            if (lane < M * kGemvWaveCols) {
+                const int m = lane / kGemvWaveCols, c = lane % kGemvWaveCols;
+                if (n0 + c < n) {
+                    T* o = C + m * ldc + n0 + c;
+                    const float prev = beta != 0.f ? static_cast<float>(*o) : 0.f;
+                    *o = static_cast<T>(alpha * mine + beta * prev);
+                }
+            }
+        });
+    });
+}
+#endif
+
 bool try_small_m_gemm(const Tensor& a, const Tensor& b, Tensor& out, double alpha, double beta) {
     if (out.dim() != 2 || a.dim() != 2 || b.dim() != 2) return false;
     const int64_t m = out.size(0), n = out.size(1), k = a.size(1);
@@ -445,6 +511,9 @@ bool try_small_m_gemm(const Tensor& a, const Tensor& b, Tensor& out, double alph
         return false;
     auto& q = queue_for(out);
     if (!q.is_gpu()) return false;
+#define GEMV_ROWS(MM) (std::is_same_v<scalar_t, float> \
+                           ? small_m_gemm<scalar_t, MM>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be) \
+                           : small_m_gemm_wave<scalar_t, MM>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be))
     AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, st, "ptsycl_small_m_gemm", [&] {
         if constexpr (!std::is_same_v<scalar_t, double>) {
             const scalar_t* pa = data_ptr<scalar_t>(a);
@@ -454,12 +523,21 @@ bool try_small_m_gemm(const Tensor& a, const Tensor& b, Tensor& out, double alph
             switch (m) {
                 case 1: small_m_gemm<scalar_t, 1>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
                 case 2: small_m_gemm<scalar_t, 2>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+#if PARAS_HIP_BACKEND
+                case 3: GEMV_ROWS(3); break;
+                case 4: GEMV_ROWS(4); break;
+                case 5: GEMV_ROWS(5); break;
+                case 6: GEMV_ROWS(6); break;
+                case 7: GEMV_ROWS(7); break;
+                case 8: GEMV_ROWS(8); break;
+#else
                 case 3: small_m_gemm<scalar_t, 3>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
                 case 4: small_m_gemm<scalar_t, 4>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
                 case 5: small_m_gemm<scalar_t, 5>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
                 case 6: small_m_gemm<scalar_t, 6>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
                 case 7: small_m_gemm<scalar_t, 7>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
                 case 8: small_m_gemm<scalar_t, 8>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+#endif
             }
         }
     });

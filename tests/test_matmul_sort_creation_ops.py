@@ -208,7 +208,8 @@ def test_linear_few_rows(device):
     import torch.nn.functional as F
     torch.manual_seed(0)
     for dt, tol in ((torch.bfloat16, 3e-2), (torch.float16, 3e-3), (torch.float32, 1e-4)):
-        for m, n, k in ((1, 1, 8), (1, 4099, 2048), (3, 5, 24), (4, 64, 512), (8, 33, 1024), (9, 16, 64)):
+        for m, n, k in ((1, 1, 8), (1, 4099, 2048), (3, 5, 24), (4, 64, 512), (5, 4099, 2048),
+                        (6, 17, 64), (7, 130, 256), (8, 33, 1024), (9, 16, 64)):
             x = torch.randn(m, k, dtype=dt)
             w = torch.randn(n, k, dtype=dt) / k ** 0.5
             b = torch.randn(n, dtype=dt)
