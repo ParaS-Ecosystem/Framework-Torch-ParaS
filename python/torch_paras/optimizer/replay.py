@@ -32,6 +32,10 @@ shape comes again; up to ``MAX_SHAPES`` shapes are kept, beyond that the
 graph runs normally for new shapes. A replay copies the inputs into the
 capture's input buffers, replays, copies mutated inputs back and returns
 copies of the capture's outputs (the next replay overwrites them).
+Captures that take the same tensor share its input buffer, and a replay
+skips the copy when the buffer already holds that tensor (same object, same
+version): the RoPE tables, mask and cache position a model computes once per
+step are copied once, not once per layer.
 Parameters and buffers Dynamo treats as static (``static_input_indices``:
 module parameters, tensors passed to ``torch._dynamo.mark_static_address``)
 are used in place; a call with such an input at another address runs the
@@ -61,6 +65,7 @@ next replay.
 import collections
 import operator
 import os
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -174,6 +179,39 @@ def _buffer_like(t: torch.Tensor) -> torch.Tensor:
     return torch.empty(t.shape, dtype=t.dtype, device=t.device)
 
 
+_staged: dict = {}
+_held: dict = {}
+
+
+def _holds(buf, src) -> bool:
+    held = _held.get(id(buf))
+    return held is not None and held[0]() is src and held[1] == src._version
+
+
+def _load(buf, src):
+    if _holds(buf, src):
+        stats["inputs already loaded"] += 1
+        return
+    buf.copy_(src)
+    _held[id(buf)] = (weakref.ref(src), src._version)
+
+
+def _input_buffer(t: torch.Tensor) -> torch.Tensor:
+    """The input buffer for `t` at capture: the one another capture made for
+    this very tensor, or a new one."""
+    entry = _staged.get(id(t))
+    if entry is not None:
+        ref, version, buf = entry
+        if (ref() is t and version == t._version and buf.shape == t.shape
+                and buf.stride() == t.stride() and buf.dtype == t.dtype and buf.device == t.device):
+            return buf
+    for k in [k for k, (r, _, _) in _staged.items() if r() is None]:
+        del _staged[k]
+    buf = _buffer_like(t)
+    _staged[id(t)] = (weakref.ref(t), t._version, buf)
+    return buf
+
+
 def _shape_key(args):
     """What a capture depends on besides tensor contents: tensor layouts and
     the values of other arguments."""
@@ -219,7 +257,7 @@ class _Capture:
     def run(self, args):
         stats["replays"] += 1
         for i, j, buf in self.buffers:
-            buf.copy_(args[i] if j is None else args[i][j])
+            _load(buf, args[i] if j is None else args[i][j])
         self.graph.replay()
         return self.results(args)
 
@@ -296,8 +334,8 @@ class Replayed:
             if j is None and t.data_ptr() in _output_ptrs:
                 in_place.add(i)
                 continue
-            buf = _buffer_like(t)
-            buf.copy_(t)
+            buf = _input_buffer(t)
+            _load(buf, t)
             buffers.append((i, j, buf))
             if j is None:
                 captured[i] = buf
