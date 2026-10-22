@@ -49,6 +49,14 @@ __all__ = [
     "synchronize",
     "manual_seed",
     "empty_cache",
+    "memory_allocated",
+    "max_memory_allocated",
+    "memory_reserved",
+    "max_memory_reserved",
+    "memory_cached",
+    "memory_stats",
+    "reset_peak_memory_stats",
+    "reset_accumulated_memory_stats",
     "device_name",
     "backend_name",
     "get_amp_supported_dtype",
@@ -111,12 +119,53 @@ def empty_cache() -> None:
     _C.empty_cache()
 
 
-def memory_allocated(device: int = 0) -> int:
-    return _C.allocated_bytes(device)
+def _index(device) -> int:
+    if device is None:
+        return 0
+    if isinstance(device, (str, torch.device)):
+        return torch.device(device).index or 0
+    return int(device)
 
 
-def memory_cached(device: int = 0) -> int:
-    return _C.cached_bytes(device)
+def memory_allocated(device=None) -> int:
+    """Bytes in live tensors' blocks (torch.cuda.memory_allocated's meaning)."""
+    return _C.memory_stats(_index(device))["allocated_bytes"][0]
+
+
+def max_memory_allocated(device=None) -> int:
+    """Peak of memory_allocated() since start-up or reset_peak_memory_stats()."""
+    return _C.memory_stats(_index(device))["allocated_bytes"][1]
+
+
+def memory_reserved(device=None) -> int:
+    """Bytes the pool holds from the device: live blocks plus cached ones."""
+    return _C.memory_stats(_index(device))["reserved_bytes"][0]
+
+
+def max_memory_reserved(device=None) -> int:
+    return _C.memory_stats(_index(device))["reserved_bytes"][1]
+
+
+def memory_cached(device=None) -> int:
+    """Cached free bytes of the shared pool (released by empty_cache())."""
+    return _C.cached_bytes(_index(device))
+
+
+def reset_peak_memory_stats(device=None) -> None:
+    _C.reset_peak_stats(_index(device))
+
+
+def reset_accumulated_memory_stats(device=None) -> None:
+    _C.reset_accumulated_stats(_index(device))
+
+
+def memory_stats(device=None) -> dict:
+    """torch.cuda.memory_stats-style keys, e.g. "allocated_bytes.all.peak"."""
+    out = {}
+    for name, (cur, peak, alloc, freed) in _C.memory_stats(_index(device)).items():
+        for k, v in (("current", cur), ("peak", peak), ("allocated", alloc), ("freed", freed)):
+            out[f"{name}.all.{k}"] = v
+    return dict(sorted(out.items()))
 
 
 def get_amp_supported_dtype() -> list[torch.dtype]:
@@ -159,6 +208,9 @@ def _register() -> None:
     mod.manual_seed = manual_seed
     mod.manual_seed_all = manual_seed_all
     mod.empty_cache = empty_cache
+    for fn in (memory_allocated, max_memory_allocated, memory_reserved, max_memory_reserved,
+               memory_stats, reset_peak_memory_stats, reset_accumulated_memory_stats):
+        setattr(mod, fn.__name__, fn)
     mod.device_name = device_name
     mod.is_bad_fork = _C.is_bad_fork
     mod._is_in_bad_fork = _C.is_bad_fork

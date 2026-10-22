@@ -502,6 +502,35 @@ def test_foreach_norm_and_clip_grad_norm(device):
         torch.testing.assert_close(d.grad.cpu(), q.grad, atol=1e-6, rtol=1e-4)
 
 
+def test_memory_statistics(device):
+    import torch_paras
+    idx = torch.device(device).index or 0
+    torch_paras.synchronize()
+    torch_paras.empty_cache()
+    torch_paras.reset_peak_memory_stats(idx)
+    a0, r0 = torch_paras.memory_allocated(idx), torch_paras.memory_reserved(idx)
+    x = torch.empty(3 << 20, device=device)
+    a1 = torch_paras.memory_allocated(idx)
+    assert a1 - a0 >= x.numel() * 4, (a0, a1)
+    assert torch_paras.max_memory_allocated(idx) >= a1
+    assert torch_paras.memory_reserved(idx) >= r0 + (a1 - a0)
+    del x
+    assert torch_paras.memory_allocated(idx) == a0
+    assert torch_paras.memory_reserved(idx) >= r0 + (a1 - a0)
+    assert torch_paras.max_memory_allocated(idx) == a1
+    torch_paras.empty_cache()
+    assert torch_paras.memory_reserved(idx) == r0
+    torch_paras.reset_peak_memory_stats(idx)
+    assert torch_paras.max_memory_allocated(idx) == a0
+    st = torch_paras.memory_stats(idx)
+    assert st["allocated_bytes.all.current"] == a0 and "reserved_bytes.all.peak" in st
+    assert torch.paras.memory_allocated(idx) == a0
+    acc = torch.accelerator.current_accelerator()
+    if acc is not None and acc.type == "paras":
+        assert torch.accelerator.memory_allocated(idx) == a0
+        assert torch.accelerator.max_memory_reserved(idx) >= r0
+
+
 def _foreach_lists(device, dtype, seed):
     g = torch.Generator().manual_seed(seed)
     sizes = [3 * 65536 + 5, 1_000_003, 7, 0, 1, 131072]
