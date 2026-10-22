@@ -32,6 +32,7 @@ registered ParaS backward kernel (see ops.py) rather than the backward of the
 original decomposition.
 """
 
+import math
 import operator
 from collections import Counter
 from typing import Optional
@@ -576,11 +577,55 @@ def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
     return count
 
 
+_SDPA_KWARGS = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
+
+
+def fuse_sdpa_bool_mask(gm: fx.GraphModule) -> int:
+    if torch.is_grad_enabled():
+        return 0
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not F.scaled_dot_product_attention:
+            continue
+        if len(node.args) != 3 or not set(node.kwargs) <= _SDPA_KWARGS:
+            continue
+        mask = node.kwargs.get("attn_mask")
+        if not isinstance(mask, fx.Node) or node.kwargs.get("dropout_p", 0.0) != 0.0:
+            continue
+        q, k, v = node.args
+        qv, kv, vv, mv = _value(q), _value(k), _value(v), _value(mask)
+        if qv is None or kv is None or vv is None or mv is None or mv.dtype != torch.bool:
+            continue
+        if qv.dim() != 4 or any(t.requires_grad for t in (qv, kv, vv)):
+            continue
+        if kv.shape[1] != qv.shape[1] and not node.kwargs.get("enable_gqa", False):
+            continue
+        if not _on_paras(q, k, v, mask):
+            continue
+        scale = node.kwargs.get("scale")
+        if scale is None:
+            scale = 1.0 / math.sqrt(qv.shape[-1])
+        if not isinstance(scale, (int, float)):
+            continue
+        is_causal = node.kwargs.get("is_causal", False)
+        if not isinstance(is_causal, bool):
+            continue
+        with gm.graph.inserting_before(node):
+            fused = gm.graph.call_function(torch.ops.paras.sdpa.default,
+                                           (q, k, v, mask, float(scale), is_causal))
+        fused.meta["example_value"] = node.meta.get("example_value")
+        node.replace_all_uses_with(fused)
+        gm.graph.erase_node(node)
+        count += 1
+    return count
+
+
 PASSES = {
     "rms_norm": fuse_rms_norm,
     "swiglu": fuse_swiglu,
     "rotate_half": fuse_rotate_half,
     "gqa_attention": fuse_gqa_attention,
+    "sdpa_bool_mask": fuse_sdpa_bool_mask,
     "rope": fuse_rope,
     "add_rms_norm": fuse_add_rms_norm,
 }

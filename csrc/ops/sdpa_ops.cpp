@@ -951,6 +951,19 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             at::empty({}, lopts), at::empty({}, lopts), none};
 }
 
+Tensor paras_sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
+                  const std::optional<Tensor>& mask, double scale, bool is_causal) {
+    PTSYCL_TRACE_OP("paras::sdpa");
+    const bool gqa = q.dim() == 4 && k.dim() == 4 && q.size(1) != k.size(1);
+    if (fused_supported(q, k, v, mask, 0.0, gqa))
+        return std::get<0>(fused_attention(q, k, v, mask, 0.0, is_causal, false, scale));
+    return at::scaled_dot_product_attention(q, k, v, mask, 0.0, is_causal, scale, gqa);
+}
+
+}
+
+TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
+    m.impl("sdpa", &paras_sdpa);
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

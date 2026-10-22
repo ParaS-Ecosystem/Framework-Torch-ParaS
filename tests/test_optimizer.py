@@ -555,6 +555,31 @@ def test_gqa_attention_fused_and_exact(device):
             assert torch.equal(out.cpu(), ref.cpu()), (Lq, Lk)
 
 
+def test_sdpa_bool_mask_fused_and_exact(device):
+    torch.manual_seed(0)
+
+    def attend(q, k, v, mask):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+
+    for Lq, Lk in ((1, 77), (64, 64)):
+        q = torch.randn(1, 8, Lq, 64, device=device, dtype=torch.bfloat16)
+        k = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+        v = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+        mask = torch.ones(1, 1, Lq, Lk, device=device, dtype=torch.bool).tril(Lk - Lq)
+        mask[..., :3] = False
+        with torch.no_grad():
+            _reset()
+            ref = attend(q, k, v, mask)
+            out = torch_paras.compile(attend)(q, k, v, mask)
+            assert _fusions().get("sdpa_bool_mask") == 1, _fusions()
+            assert torch.equal(out.cpu(), ref.cpu()), (Lq, Lk)
+    _reset()
+    qg = q.clone().requires_grad_()
+    out = torch_paras.compile(attend)(qg, k, v, mask)
+    assert "sdpa_bool_mask" not in _fusions(), _fusions()
+    assert torch.equal(out.detach().cpu(), attend(qg, k, v, mask).detach().cpu())
+
+
 
 def _rotate(x):
     h = x.shape[-1] // 2

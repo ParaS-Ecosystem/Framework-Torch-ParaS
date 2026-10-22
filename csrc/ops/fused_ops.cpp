@@ -478,6 +478,7 @@ TORCH_LIBRARY(paras, m) {
     m.def("rotate_half_backward(Tensor grad_out) -> Tensor");
     m.def("add_rms_norm(Tensor a, Tensor b, Tensor weight, float eps) -> (Tensor, Tensor, Tensor)");
     m.def("rope(Tensor x, Tensor cos, Tensor sin) -> Tensor");
+    m.def("sdpa(Tensor q, Tensor k, Tensor v, Tensor? mask, float scale, bool is_causal) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
