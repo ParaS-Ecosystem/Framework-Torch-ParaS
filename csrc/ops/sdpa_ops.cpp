@@ -66,8 +66,10 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
     if (q.sym_size(2) > kFusedMaxQuery) {
 #if PTSYCL_SDPA_GEMM_PATH
         if (!queue_for(q).is_gpu()) return false;
-        const bool flash = (dt == c10::kBFloat16 || dt == c10::kHalf) && v.sym_size(3) == q.sym_size(3) &&
-                           (q.sym_size(3) == 64 || q.sym_size(3) == 128);
+        const bool flash = v.sym_size(3) == q.sym_size(3) &&
+                           ((dt == c10::kBFloat16 || dt == c10::kHalf)
+                                ? (q.sym_size(3) == 64 || q.sym_size(3) == 128)
+                                : (dt == c10::kFloat && q.sym_size(3) == 64));
         if (!flash && k.sym_size(2) > kRowLanes * kRowPerLane) return false;
 #else
         return false;
@@ -494,6 +496,195 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
 #endif
 }
 
+constexpr int kFlash32BlockK = 32;
+constexpr int kFlash32KLD = 64 + 2;
+constexpr int kFlash32VLD = 64 + 4;
+constexpr int kFlash32LdsElems = kFlash32BlockK * (kFlash32KLD + kFlash32VLD);
+
+template <int D> class Flash32Kernel;
+
+template <int D, typename Item>
+PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const Item& it, float* lds) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    static_assert(D == 64, "fp32 flash kernel: head size 64");
+    typedef float v4f __attribute__((ext_vector_type(4)));
+    constexpr int BK = kFlash32BlockK;
+    constexpr int KS = D / 4;
+    constexpr int NT = BK / 16;
+    constexpr int ND = D / 16;
+    constexpr int MT = kFlashTiles;
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+    constexpr int KLD = kFlash32KLD, VLD = kFlash32VLD;
+    constexpr int kPer = BK * D / 4 / kFlashThreads;
+
+    const auto sg = it.get_sub_group();
+    const int tid = static_cast<int>(it.get_local_id(0));
+    const int lane = tid % kFlashLanes, wave = tid / kFlashLanes;
+    const int lr = lane % 16, lg = lane / 16;
+    const int64_t g = static_cast<int64_t>(it.get_group(0));
+    const int64_t bh = g / a.q_blocks, qb = g % a.q_blocks;
+    const int64_t b = bh / a.H, h = bh % a.H;
+    const int64_t q0 = qb * kFlashBlockQ;
+    const int64_t row0 = q0 + wave * kFlashRowsPerWave;
+    const float* qp = a.q + b * a.qs.s[0] + h * a.qs.s[1];
+    const float* kp = a.k + b * a.ks.s[0] + (h / a.kv_group) * a.ks.s[1];
+    const float* vp = a.v + b * a.vs.s[0] + (h / a.kv_group) * a.vs.s[1];
+    float* klds = lds;
+    float* vlds = lds + BK * KLD;
+    const bool kvec = a.ks.s[3] == 1 && a.ks.s[2] % 4 == 0 &&
+                      reinterpret_cast<std::uintptr_t>(kp) % 16 == 0;
+    const bool vvec = a.vs.s[3] == 1 && a.vs.s[2] % 4 == 0 &&
+                      reinterpret_cast<std::uintptr_t>(vp) % 16 == 0;
+
+    float qb_[MT][KS];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        const int64_t r = row0 + 16 * mt + lr;
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks)
+            qb_[mt][ks] = r < a.Lq ? qp[r * a.qs.s[2] + (4 * ks + lg) * a.qs.s[3]] : 0.f;
+    }
+    v4f oacc[MT][ND];
+    float m_i[MT], l_i[MT];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int n = 0; n < ND; ++n) oacc[mt][n] = v4f{0.f, 0.f, 0.f, 0.f};
+        m_i[mt] = kNegInf; l_i[mt] = 0.f;
+    }
+
+    const int64_t k_end = a.causal ? (q0 + kFlashBlockQ < a.Lk ? q0 + kFlashBlockQ : a.Lk) : a.Lk;
+    const bool has_mask = a.mf != nullptr || a.mb != nullptr;
+    const int64_t msum = a.mcls == nullptr ? 0
+        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
+    const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
+    for (int64_t j0 = 0; j0 < k_end; j0 += BK) {
+        const signed char tile = a.mcls == nullptr
+                                     ? (has_mask ? kMaskMixed : kMaskZero)
+                                     : a.mcls[msum * a.k_blocks + j0 / kFlashBlockK];
+        if (tile == kMaskDead && may_skip) continue;
+        const bool masked = tile != kMaskZero;
+#pragma unroll
+        for (int t = 0; t < kPer; ++t) {
+            const int c = tid + t * kFlashThreads;
+            const int r = c / (D / 4), c4 = (c % (D / 4)) * 4;
+            const int64_t key = j0 + r;
+            v4f kv, vv;
+            if (key < a.Lk && kvec) {
+                kv = *reinterpret_cast<const v4f*>(kp + key * a.ks.s[2] + c4);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) kv[e] = key < a.Lk ? kp[key * a.ks.s[2] + (c4 + e) * a.ks.s[3]] : 0.f;
+            }
+            if (key < a.Lk && vvec) {
+                vv = *reinterpret_cast<const v4f*>(vp + key * a.vs.s[2] + c4);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) vv[e] = key < a.Lk ? vp[key * a.vs.s[2] + (c4 + e) * a.vs.s[3]] : 0.f;
+            }
+            typedef float v2f __attribute__((ext_vector_type(2)));
+            *reinterpret_cast<v2f*>(klds + r * KLD + c4) = kv.lo;
+            *reinterpret_cast<v2f*>(klds + r * KLD + c4 + 2) = kv.hi;
+            *reinterpret_cast<v4f*>(vlds + r * VLD + c4) = vv;
+        }
+        sycl::group_barrier(it.get_group());
+
+        v4f sacc[MT][NT];
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int n = 0; n < NT; ++n) sacc[mt][n] = v4f{0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+#pragma unroll
+            for (int ks = 0; ks < KS; ++ks) {
+                const float ka = klds[(n * 16 + lr) * KLD + 4 * ks + lg];
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt)
+                    sacc[mt][n] = __builtin_amdgcn_mfma_f32_16x16x4f32(ka, qb_[mt][ks], sacc[mt][n], 0, 0, 0);
+            }
+
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            const int64_t row = row0 + 16 * mt + lr;
+            const int64_t tile_row0 = row0 + 16 * mt;
+            const bool edge = j0 + BK > a.Lk || tile_row0 + 16 > a.Lq ||
+                              (a.causal && j0 + BK - 1 > tile_row0);
+            float mx = kNegInf;
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float sv = sacc[mt][n][i] * a.scale;
+                    if (edge || masked) {
+                        const int64_t key = j0 + n * 16 + 4 * lg + i;
+                        if (key >= a.Lk || row >= a.Lq || (a.causal && key > row)) {
+                            sv = kNegInf;
+                        } else if (masked) {
+                            const int64_t mo = b * a.ms.s[0] + h * a.ms.s[1] + row * a.ms.s[2] + key * a.ms.s[3];
+                            if (a.mf != nullptr) sv += a.mf[mo];
+                            if (a.mb != nullptr && !a.mb[mo]) sv = kNegInf;
+                        }
+                    }
+                    sacc[mt][n][i] = sv;
+                    mx = sv > mx ? sv : mx;
+                }
+#pragma unroll
+            for (int off = 16; off < 64; off <<= 1) {
+                const float o = sycl::permute_group_by_xor(sg, mx, off);
+                mx = o > mx ? o : mx;
+            }
+            const float m_new = mx > m_i[mt] ? mx : m_i[mt];
+            const float alpha = m_new == kNegInf ? 1.f : __expf(m_i[mt] - m_new);
+            float rs = 0.f;
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float x = sacc[mt][n][i];
+                    const float pv = x == kNegInf ? 0.f : __expf(x - m_new);
+                    sacc[mt][n][i] = pv;
+                    rs += pv;
+                }
+#pragma unroll
+            for (int off = 16; off < 64; off <<= 1) rs += sycl::permute_group_by_xor(sg, rs, off);
+            l_i[mt] = l_i[mt] * alpha + rs;
+            m_i[mt] = m_new;
+#pragma unroll
+            for (int nd = 0; nd < ND; ++nd) oacc[mt][nd] *= alpha;
+        }
+
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int nd = 0; nd < ND; ++nd) {
+                    const float va = vlds[(n * 16 + 4 * lg + i) * VLD + nd * 16 + lr];
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt)
+                        oacc[mt][nd] = __builtin_amdgcn_mfma_f32_16x16x4f32(va, sacc[mt][n][i], oacc[mt][nd], 0, 0, 0);
+                }
+        sycl::group_barrier(it.get_group());
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        const int64_t row = row0 + 16 * mt + lr;
+        if (row >= a.Lq) continue;
+        const float inv = l_i[mt] > 0.f ? 1.f / l_i[mt] : 0.f;
+        float* orow = a.o + b * a.os.s[0] + h * a.os.s[1] + row * a.os.s[2];
+#pragma unroll
+        for (int nd = 0; nd < ND; ++nd)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) orow[(nd * 16 + 4 * lg + i) * a.os.s[3]] = oacc[mt][nd][i] * inv;
+        if (lg == 0)
+            a.lse[(b * a.H + h) * a.Lq + row] = l_i[mt] > 0.f ? m_i[mt] + ::logf(l_i[mt]) : kNegInf;
+    }
+#else
+    (void)a; (void)it; (void)lds;
+#endif
+}
+
 template <typename T> class MaskSummaryKernel;
 
 template <typename T, typename Item>
@@ -746,6 +937,18 @@ void flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t gro
             [=](sycl::nd_item<1> it) { flash_block<T, D>(a, it, &lds[0]); });
     });
 }
+
+template <int D>
+void flash_attention_f32(compat::Queue& queue, const FlashArgs<float>& args, int64_t groups) {
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> lds(sycl::range<1>(kFlash32LdsElems), cgh);
+        const FlashArgs<float> a = args;
+        cgh.template parallel_for<Flash32Kernel<D>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kFlashThreads)),
+                              sycl::range<1>(static_cast<std::size_t>(kFlashThreads))),
+            [=](sycl::nd_item<1> it) { flash_block_f32<D>(a, it, &lds[0]); });
+    });
+}
 #endif
 
 std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor,
@@ -780,6 +983,30 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto lopts = q.options().dtype(c10::kLong);
 
 #if PTSYCL_SDPA_GEMM_PATH
+    if (Lq > kFusedMaxQuery && Dv == D && D == 64 && q.scalar_type() == c10::kFloat) {
+        FlashArgs<float> fa{};
+        fa.q = q.data_ptr<float>(); fa.k = k.data_ptr<float>(); fa.v = v.data_ptr<float>();
+        fa.o = out.data_ptr<float>(); fa.lse = lse.data_ptr<float>();
+        fa.mf = has_mask && !bool_mask ? mask.data_ptr<float>() : nullptr;
+        fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
+        fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
+        fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
+        fa.q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
+        fa.scale = sc; fa.causal = is_causal;
+        MaskSummary summary;
+        if (has_mask) {
+            summary = mask_block_summary<float>(queue, *attn_bias, mask, B, H, Lq, Lk);
+            fa.mcls = summary.cls.data_ptr<signed char>();
+            fa.mqok = summary.qok.data_ptr<unsigned char>();
+            fa.k_blocks = summary.k_blocks;
+            fa.mb_stride = summary.mb_stride;
+            fa.mh_stride = summary.mh_stride;
+        }
+        flash_attention_f32<64>(queue, fa, B * H * fa.q_blocks);
+        const Tensor none = Tensor();
+        return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
+                at::empty({}, lopts), at::empty({}, lopts), none};
+    }
     if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) &&
         (q.scalar_type() == c10::kBFloat16 || q.scalar_type() == c10::kHalf)) {
         AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "ptsycl_flash_attention", [&] {
