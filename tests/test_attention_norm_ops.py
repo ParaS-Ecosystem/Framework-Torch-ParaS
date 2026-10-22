@@ -312,6 +312,23 @@ def test_sdpa_fused_precision_matches_math(device):
         assert fused <= 1.1 * math_err, (L, fused, math_err)
 
 
+def test_sdpa_long_keys(device):
+    import torch_paras
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    B, H, L, D = 1, 2, 5000, 64
+    q = torch.randn(B, L, H, D).transpose(1, 2)
+    k = torch.randn(B, H, L, D)
+    v = torch.randn(B, H, L, D)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    for dtype, tol, want in ((torch.bfloat16, 2.5e-2, gpu), (torch.float16, 4e-3, gpu), (torch.float32, 1e-4, False)):
+        out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+            q.to(dtype).to(device), k.to(dtype).to(device), v.to(dtype).to(device), is_causal=True))
+        fused = "_scaled_dot_product_fused_attention_overrideable" in ops
+        assert fused == want, (dtype, fused, ops[:6])
+        torch.testing.assert_close(out.cpu().float(), ref, atol=tol, rtol=tol)
+
+
 def test_sdpa_flash_kernel_cases(device):
     torch.manual_seed(0)
     cases = [(2, 3, 130, 130, 64), (1, 2, 70, 200, 128), (1, 4, 257, 257, 64)]

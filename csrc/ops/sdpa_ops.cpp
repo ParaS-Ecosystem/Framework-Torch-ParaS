@@ -62,7 +62,10 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
     if (k.sym_size(2) == 0) return false;
     if (q.sym_size(2) > kFusedMaxQuery) {
 #if PTSYCL_SDPA_GEMM_PATH
-        if (!queue_for(q).is_gpu() || k.sym_size(2) > kRowLanes * kRowPerLane) return false;
+        if (!queue_for(q).is_gpu()) return false;
+        const bool flash = (dt == c10::kBFloat16 || dt == c10::kHalf) && v.sym_size(3) == q.sym_size(3) &&
+                           (q.sym_size(3) == 64 || q.sym_size(3) == 128);
+        if (!flash && k.sym_size(2) > kRowLanes * kRowPerLane) return false;
 #else
         return false;
 #endif
