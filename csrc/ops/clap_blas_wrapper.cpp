@@ -134,6 +134,14 @@ bool run_device_gemm(DeviceBackend& entry,
         auto* pc = static_cast<std::uint16_t*>(c);
         if (entry.bf16_unsupported)
             return false;
+        int done = 0;
+        auto fail = [&](bool unsupported) {
+            if (done > 0 && beta != 0.0)
+                throw std::runtime_error("bf16 device GEMM failed after " + std::to_string(done) + " of " +
+                                         std::to_string(batch) + " batch entries");
+            if (unsupported) entry.bf16_unsupported = true;
+            return false;
+        };
         try {
 #if defined(PTSYCL_CLAP_HAS_BF16_BATCHED)
             if (batch > 1)
@@ -143,16 +151,15 @@ bool run_device_gemm(DeviceBackend& entry,
                     batch, stream);
             else
 #endif
-            for (int i = 0; i < batch; ++i)
+            for (int i = 0; i < batch; ++i, ++done)
                 backend->gemm_bf16_device(kRow, ta, tb, m, n, k, static_cast<float>(alpha),
                                           pa + i * stride_a, lda, pb + i * stride_b, ldb,
                                           static_cast<float>(beta), pc + i * stride_c,
                                           ldc, stream);
         } catch (const std::invalid_argument&) {
-            return false;
+            return fail(false);
         } catch (const std::exception&) {
-            entry.bf16_unsupported = true;
-            return false;
+            return fail(true);
         }
         return true;
     }

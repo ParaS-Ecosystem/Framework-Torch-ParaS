@@ -52,6 +52,10 @@ if(PTSYCL_DEVICE STREQUAL "cpu")
 elseif(PTSYCL_DEVICE MATCHES "^sycl:(cuda:sm_[0-9]+|hip:gfx[0-9a-zA-Z]+)$")
     set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_SYCL)
     set(PTSYCL_PARASDEVICE_TARGET "${CMAKE_MATCH_1}")
+    if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:gfx1[0-9]")
+        message(FATAL_ERROR "PTSYCL_DEVICE=${PTSYCL_DEVICE}: RDNA GPUs are not supported (the HIP kernels "
+                            "need 64-lane wavefronts and MFMA: AMD CDNA, e.g. sycl:hip:gfx942)")
+    endif()
     set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_PARASDEVICE_TARGET}")
 else()
     message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu', 'sycl:cuda:sm_XX', or "

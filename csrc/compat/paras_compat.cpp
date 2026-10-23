@@ -110,10 +110,12 @@ int vendor_visible_gpu_count() {
     const char* libs[] = {"libcudart.so", "libcudart.so.12", "libcudart.so.11.0"};
     const char* symbol = "cudaGetDeviceCount";
 #endif
-    for (const char* lib : libs) {
-        void* handle = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+    void* handle = nullptr;
+    for (const char* lib : libs)
+        if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+    for (const char* lib : libs)
         if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
-        if (handle == nullptr) continue;
+    if (handle != nullptr) {
         using CountFn = int (*)(int*);
         auto count_fn = reinterpret_cast<CountFn>(dlsym(handle, symbol));
         int count = 0;

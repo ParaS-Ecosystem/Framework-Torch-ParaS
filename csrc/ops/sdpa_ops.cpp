@@ -690,7 +690,8 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         }
         const bool vec4 = Lk % 4 == 0 && (!has_mask || (ms.s[3] == 1 &&
                           ms.s[0] % 4 == 0 && ms.s[1] % 4 == 0 && ms.s[2] % 4 == 0 &&
-                          reinterpret_cast<std::uintptr_t>(mask.data_ptr()) % 8 == 0));
+                          reinterpret_cast<std::uintptr_t>(mask.data_ptr()) %
+                                  (4 * mask.element_size()) == 0));
         AT_DISPATCH_FLOATING_TYPES_AND2(
             c10::kHalf, c10::kBFloat16, q.scalar_type(), "ptsycl_attention_rows", [&] {
                 const bool* pmb = bool_mask ? mask.data_ptr<bool>() : nullptr;
