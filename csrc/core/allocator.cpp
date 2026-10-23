@@ -98,6 +98,15 @@ void* MemoryPool::acquire(std::size_t nbytes) {
     return p;
 }
 
+void MemoryPool::sync_before_free() noexcept {
+    if (queue_.capturing()) return;
+    try {
+        queue_.synchronize();
+    } catch (const std::exception& e) {
+        PTSYCL_WARN("pool[%d] synchronize before free failed: %s", device_index_, e.what());
+    }
+}
+
 void MemoryPool::release(void* ptr) {
     if (ptr == nullptr) return;
     std::size_t rounded = 0;
@@ -137,11 +146,13 @@ void MemoryPool::release(void* ptr) {
     }
     if (debug_)
         PTSYCL_WARN("pool[%d] free %zu bytes @%p", device_index_, rounded, ptr);
+    sync_before_free();
     queue_.dealloc(ptr);
 }
 
 void MemoryPool::clear() {
     std::lock_guard<std::mutex> g(mutex_);
+    if (!free_lists_.empty()) sync_before_free();
     for (auto& [size, list] : free_lists_) {
         for (void* p : list) {
             queue_.dealloc(p);
@@ -199,6 +210,7 @@ void MemoryPool::release_private(std::uint64_t pool) {
     auto it = private_.find(pool);
     if (it == private_.end()) return;
     TORCH_CHECK(active_private_ != pool, "paras allocator: release of the active graph pool");
+    if (!it->second.free_lists.empty()) sync_before_free();
     for (auto& [size, list] : it->second.free_lists) {
         for (void* p : list) {
             queue_.dealloc(p);

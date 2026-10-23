@@ -65,6 +65,7 @@ private:
     };
 
     static std::size_t round_size(std::size_t v);
+    void sync_before_free() noexcept;
 
     compat::Queue& queue_;
     int            device_index_;
