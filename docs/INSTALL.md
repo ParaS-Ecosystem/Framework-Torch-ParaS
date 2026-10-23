@@ -6,7 +6,7 @@ work but I have not tried them.
 
 ## 1. Hardware and OS
 
-- Linux x86_64 (built on RHEL 8, kernel 4.18)
+- Linux x86_64 (tested on AlmaLinux 10.2, kernel 6.12; also built on RHEL 8)
 - Intel CPU (any reasonably modern Xeon/Core works)
 - Optional: NVIDIA GPU for the CUDA flavor. I test on Tesla V100 (sm_70).
   Set `PTSYCL_CUDA_ARCH` if your GPU has a different compute capability,
@@ -17,28 +17,32 @@ work but I have not tried them.
   `gfx942` for MI300-class, `gfx90a` for MI200-class). Set
   `PTSYCL_HIP_ARCH=hip:gfxXXX` explicitly to override auto-detection, or
   if you have multiple GPU architectures visible and need to pick one.
+  The HIP kernels need AMD CDNA GPUs (64-lane wavefronts and MFMA
+  instructions: MI200 gfx90a, MI300 gfx94x, MI350 gfx950); RDNA GPUs
+  (gfx10xx-gfx12xx) are not supported and the build stops for them.
   A single build targets CUDA or HIP, not both.
 
 ## 2. Toolchain
 
 The ParaS compiler driver (`parascc`) is clang-based and needs:
 
-| component | version used | why |
+| component | version tested | why |
 |---|---|---|
-| LLVM/clang | 21.1 | parascc execs clang++ for its sub-steps |
-| GCC | 13.4 | C++ standard headers and libstdc++ (GLIBCXX_3.4.30) |
-| CUDA toolkit | 12.2 | CUDA flavor only |
-| ROCm | 6.x | HIP flavor only |
-| CMake | >= 3.18 | build system |
-| Python | 3.10 | matches the PyTorch build below |
-| PyTorch | 2.5.1 | the backend links against libtorch from this install |
+| LLVM/clang | 20.1 (21.1 also builds) | parascc execs clang++ for its sub-steps |
+| GCC | 14.3 | C++ standard headers and libstdc++ |
+| CUDA toolkit | 12.2 or newer | CUDA flavor only |
+| ROCm | 7.2 | HIP flavor only (AMD CDNA GPUs: gfx90a, gfx94x, gfx950) |
+| CMake | >= 3.28 | build system |
+| Python | 3.12 | matches the PyTorch build below |
+| PyTorch | 2.10 | the backend links against libtorch from this install |
 
-PyTorch comes from a normal conda env:
+PyTorch comes from a normal virtual environment (the ROCm wheel shown; use
+the CUDA or CPU wheel for other builds):
 
 ```bash
-conda create -n pytorch_build python=3.10
-conda activate pytorch_build
-pip install torch==2.5.1 numpy matplotlib
+python3.12 -m venv ~/paras-venv && source ~/paras-venv/bin/activate
+pip install --index-url https://download.pytorch.org/whl/rocm7.0 torch==2.10.0
+pip install numpy
 ```
 
 ## 3. The ParaS compiler
@@ -137,7 +141,7 @@ In a GPU-enabled build with `N` visible GPUs, `paras:0` through
 the host CPU is `paras:0`.
 
 You should see `RESULTS: N passed, 0 failed`. If `import torch_paras`
-fails with a GLIBCXX error, your LD_LIBRARY_PATH is missing the GCC 13.4
+fails with a GLIBCXX error, your LD_LIBRARY_PATH is missing the GCC
 lib64 directory; re-source `scripts/env.sh`.
 
 A common pitfall: if you ever installed an older copy of the package with
