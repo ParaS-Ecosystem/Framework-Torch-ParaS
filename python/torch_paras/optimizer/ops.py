@@ -82,4 +82,8 @@ def register() -> None:
             return torch.empty_like(q)
         return q.new_empty(q.shape[:-1] + (v.shape[-1],))
 
+    @torch.library.register_fake("paras::moe_experts")
+    def _moe_experts_fake(x, topk_ids, topk_weight, w_gate, w_up, w_down):
+        return x.new_empty(x.shape)
+
     _registered = True

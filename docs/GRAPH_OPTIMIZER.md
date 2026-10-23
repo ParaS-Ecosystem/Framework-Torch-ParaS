@@ -121,6 +121,28 @@ graph: the Python function it came from (`frame`, "name (file:line)"), the
 fusions applied and the residency counts of its forward, backward or
 inference graph.
 
+## MoE expert dispatch without a host read
+
+The inference path of DeepSeek-style MoE layers (DeepSeek-V2/V3, Param2) is a
+method `moe_infer(x, topk_ids, topk_weight)` that copies the tokens per expert
+to the host and loops over the used experts: one host synchronisation per
+layer, and a graph break (the loop depends on the counts). Like
+`specialize_repeated_blocks`, this is a change to the module, which a Dynamo
+backend cannot make: `torch_paras.compile` (`fuse_moe=True`, the default) and
+`torch_paras.optimizer.fuse_moe_experts(model)` replace `moe_infer` with
+`paras::moe_experts`, one operator with a static output shape
+(`csrc/ops/moe_ops.cpp`). A layer qualifies when its experts are SwiGLU MLPs
+(`gate_proj`, `up_proj`, `down_proj` without bias, SiLU) on a paras device,
+there is no expert parallelism, and its own `moe_infer` and the operator agree
+on a random routing. The experts' weights are stacked per layer and each
+expert's weight becomes a view of the stack, so no memory is added; apply it
+after the model has its device and dtype. With plain `torch.compile`, call
+`fuse_moe_experts(model)` first.
+
+Param2-17B bf16 decode on MI300X: host reads per step 21 -> 1, graph breaks
+per decode step 14 -> 0, batch 1 26.1 -> 17.1 ms per step, batch 16
+63.3 -> 23.0 ms (native PyTorch 39.8 / 118.6).
+
 ## Fusions
 
 | Pass | Matches | Becomes |

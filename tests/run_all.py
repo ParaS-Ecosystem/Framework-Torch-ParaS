@@ -36,6 +36,7 @@ MODULES = [
     "test_device_blas_and_runtime",
     "test_optimizer",
     "test_graphs",
+    "test_moe_ops",
 ]
 
 

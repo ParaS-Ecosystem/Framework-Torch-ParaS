@@ -18,7 +18,8 @@ Counted from the `TORCH_LIBRARY_IMPL` blocks in `csrc/ops/*.cpp`
 | Distinct aten operators (overloads collapsed, e.g. `sort` / `sort.stable`) | 184 |
 | Custom ops, `paras::` namespace (`fused_ops.cpp`) | 8 |
 | Custom ops, `torch_paras::` namespace (`rms_swiglu_ops.cpp`, also registered for CPU) | 1 |
-| **Total native ops** | **246** |
+| Custom op `paras::moe_experts` (`moe_ops.cpp`, also registered for CPU) | 1 |
+| **Total native ops** | **247** |
 
 CompositeImplicitAutograd operators (`linear`, `matmul`, `reshape`,
 `contiguous`, `repeat_interleave`, `rms_norm`) are deliberately **not**
@@ -93,6 +94,7 @@ Everything else goes through the boxed CPU fallback registered in
 | Multi-head attention (`_native_multi_head_attention` ± out, `_transform_bias_rescale_qkv`) | 3 | Native | **No** | — | No parity test yet |
 | Custom fused: `paras::rms_norm`, `swiglu`, `rotate_half` + backward, `add_rms_norm`, `rope` | 8 | Native | Yes | `test_fused_ops.py`, `test_optimizer.py` | Call via `torch.ops.paras.*`; the `paras` compile backend inserts them (`docs/GRAPH_OPTIMIZER.md`). `add_rms_norm` and `rope` differentiate through the existing backward kernels |
 | Custom fused: `torch_paras::swiglu` | 1 | Native (+CPU) | Yes | `test_attention_norm_ops.py` | Call via `torch.ops.torch_paras.swiglu` |
+| MoE routed experts: `paras::moe_experts` | 1 | Native (+CPU) | Inference | `test_moe_ops.py` | DeepSeek-style `moe_infer` (SwiGLU experts, stacked weights) without a host read: on the device for up to 768 routes (graph capture: up to 4096), per-expert vendor GEMMs above, with eager's result. `torch_paras.optimizer.fuse_moe_experts(model)` substitutes it; `torch_paras.compile` does so by default |
 | Anything not listed above | — | Fallback | N/A | — | Runs via boxed CPU fallback automatically |
 
 ## Known Gaps

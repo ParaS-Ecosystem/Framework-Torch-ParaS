@@ -30,7 +30,9 @@ Works for inference and training: fused subgraphs carry ParaS backward
 kernels, and every other operator runs on its ParaS kernel exactly as in
 eager mode. ``torch_paras.compile`` also gives each layer of a transformer its
 own Dynamo cache (``specialize_repeated_blocks``), which plain
-``torch.compile(backend="paras")`` cannot do. ``reports()`` describes what was fused and where each operator of
+``torch.compile(backend="paras")`` cannot do, and runs the expert dispatch of
+DeepSeek-style MoE layers as one device operator (``fuse_moe_experts``, also
+usable in eager mode). ``reports()`` describes what was fused and where each operator of
 the compiled graphs executes.
 """
 
@@ -39,6 +41,7 @@ from typing import Iterable
 import torch
 
 from .blocks import specialize_repeated_blocks, unspecialize
+from .moe import fuse_moe_experts
 from .backend import (
     ALL_FUSIONS,
     GraphReport,
@@ -58,6 +61,7 @@ __all__ = [
     "ParasCompileError",
     "backend",
     "compile",
+    "fuse_moe_experts",
     "make_backend",
     "register",
     "reports",
@@ -70,7 +74,7 @@ __all__ = [
 def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False,
             min_dynamic_graph_ops: int | None = None,
             eager_at_recompile_limit: bool | None = None,
-            specialize_blocks: bool = True, graphs: bool = False,
+            specialize_blocks: bool = True, fuse_moe: bool = True, graphs: bool = False,
             fullgraph: bool = False, dynamic: bool | None = None):
     """``torch.compile`` with the paras backend.
 
@@ -85,6 +89,9 @@ def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False
                (a transformer's layers) its own forward code object, so each
                keeps its own Dynamo cache (``specialize_repeated_blocks``;
                ``unspecialize`` undoes it). Modules only; default True.
+    fuse_moe:  run DeepSeek-style MoE layers' expert dispatch as one device
+               operator (``fuse_moe_experts``): no host synchronisation or
+               graph break per layer. Modules only; default True.
     graphs:    replay static-shape inference graphs from a capture: one
                launch per graph instead of one per operator (replay.py;
                needs a ParaS build with command graphs). Default False.
@@ -96,5 +103,7 @@ def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False
                            graphs=graphs)
     if specialize_blocks and isinstance(model, torch.nn.Module):
         specialize_repeated_blocks(model)
+    if fuse_moe and isinstance(model, torch.nn.Module):
+        fuse_moe_experts(model)
     return torch.compile(model, backend=make_backend(options),
                          fullgraph=fullgraph, dynamic=dynamic)
