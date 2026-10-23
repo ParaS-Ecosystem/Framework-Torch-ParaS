@@ -256,81 +256,28 @@ Tensor& avg_pool2d_backward_out(
     return grad_input;
 }
 
-class MaxPool2dFunction : public torch::autograd::Function<MaxPool2dFunction> {
-public:
-    static Tensor forward(AutogradContext* ctx,
-                          const Tensor& self,
-                          IntArrayRef kernel_size,
-                          IntArrayRef stride,
-                          IntArrayRef padding,
-                          IntArrayRef dilation,
-                          bool ceil_mode)
-    {
-        at::AutoDispatchBelowADInplaceOrView g;
-        c10::Device dev = self.device();
-
-        Tensor cpu_in = to_cpu(self);
-        Tensor cpu_out = at::max_pool2d(cpu_in, kernel_size, stride,
-                                         padding, dilation, ceil_mode);
-        Tensor result = to_device(cpu_out, dev);
-
-        ctx->save_for_backward({self.contiguous()});
-        ctx->saved_data["kernel_0"]  = kernel_size[0];
-        ctx->saved_data["kernel_1"]  = kernel_size[1];
-        ctx->saved_data["pad_0"]     = padding[0];
-        ctx->saved_data["pad_1"]     = padding[1];
-        ctx->saved_data["stride_0"]  = stride.empty() ? kernel_size[0] : stride[0];
-        ctx->saved_data["stride_1"]  = stride.empty() ? kernel_size[1] : stride[1];
-        ctx->saved_data["dil_0"]     = dilation[0];
-        ctx->saved_data["dil_1"]     = dilation[1];
-        ctx->saved_data["ceil_mode"] = ceil_mode;
-
-        return result;
-    }
-
-    static tensor_list backward(AutogradContext* ctx,
-                                 tensor_list grad_outputs)
-    {
-        Tensor input = ctx->get_saved_variables()[0];
-        c10::Device dev = input.device();
-
-        int64_t k0  = ctx->saved_data["kernel_0"].toInt();
-        int64_t k1  = ctx->saved_data["kernel_1"].toInt();
-        int64_t p0  = ctx->saved_data["pad_0"].toInt();
-        int64_t p1  = ctx->saved_data["pad_1"].toInt();
-        int64_t s0  = ctx->saved_data["stride_0"].toInt();
-        int64_t s1  = ctx->saved_data["stride_1"].toInt();
-        int64_t d0  = ctx->saved_data["dil_0"].toInt();
-        int64_t d1  = ctx->saved_data["dil_1"].toInt();
-        bool ceil_mode = ctx->saved_data["ceil_mode"].toBool();
-
-        Tensor cpu_dy = to_cpu(grad_outputs[0]);
-        Tensor cpu_x  = to_cpu(input);
-
-        auto result_fwd = at::max_pool2d_with_indices(
-            cpu_x, {k0, k1}, {s0, s1}, {p0, p1}, {d0, d1}, ceil_mode);
-        auto cpu_idx = std::get<1>(result_fwd);
-
-        Tensor cpu_dx = at::max_pool2d_with_indices_backward(
-            cpu_dy, cpu_x, {k0, k1}, {s0, s1}, {p0, p1},
-            {d0, d1}, ceil_mode, cpu_idx);
-
-        Tensor dx = to_device(cpu_dx.contiguous(), dev);
-        return {dx, Tensor{}, Tensor{}, Tensor{}, Tensor{}, Tensor{}};
-    }
-};
-
-Tensor max_pool2d_autograd(
-    const Tensor& self,
-    IntArrayRef kernel_size,
-    IntArrayRef stride,
-    IntArrayRef padding,
-    IntArrayRef dilation,
-    bool ceil_mode)
+std::tuple<Tensor&, Tensor&> max_pool2d_with_indices_out(
+    const Tensor& self, IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
+    IntArrayRef dilation, bool ceil_mode, Tensor& out, Tensor& indices)
 {
-    PTSYCL_TRACE_OP("max_pool2d");
-    return MaxPool2dFunction::apply(self, kernel_size, stride,
-                                    padding, dilation, ceil_mode);
+    PTSYCL_TRACE_OP("max_pool2d_with_indices.out");
+    auto res = at::max_pool2d_with_indices(to_cpu(self), kernel_size, stride, padding, dilation, ceil_mode);
+    upload(std::get<0>(res), out);
+    upload(std::get<1>(res), indices);
+    return {out, indices};
+}
+
+Tensor& max_pool2d_with_indices_backward_out(
+    const Tensor& grad_output, const Tensor& self, IntArrayRef kernel_size, IntArrayRef stride,
+    IntArrayRef padding, IntArrayRef dilation, bool ceil_mode, const Tensor& indices,
+    Tensor& grad_input)
+{
+    PTSYCL_TRACE_OP("max_pool2d_with_indices_backward.grad_input");
+    Tensor cpu_dx = at::max_pool2d_with_indices_backward(
+        to_cpu(grad_output), to_cpu(self), kernel_size, stride, padding, dilation, ceil_mode,
+        to_cpu(indices));
+    upload(cpu_dx, grad_input);
+    return grad_input;
 }
 
 struct GemmOperand {
@@ -988,6 +935,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
            &ptsycl::avg_pool2d_out);
     m.impl("aten::avg_pool2d_backward.grad_input",
            &ptsycl::avg_pool2d_backward_out);
+    m.impl("aten::max_pool2d_with_indices.out",
+           &ptsycl::max_pool2d_with_indices_out);
+    m.impl("aten::max_pool2d_with_indices_backward.grad_input",
+           &ptsycl::max_pool2d_with_indices_backward_out);
     m.impl("aten::mm.out",
            &ptsycl::mm_out);
     m.impl("aten::bmm.out",
@@ -1012,8 +963,4 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
            &ptsycl::upsample_bilinear2d_out);
     m.impl("aten::upsample_bilinear2d_backward.grad_input",
            &ptsycl::upsample_bilinear2d_backward_out);
-}
-
-TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
-    m.impl("aten::max_pool2d", &ptsycl::max_pool2d_autograd);
 }

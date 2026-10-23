@@ -125,10 +125,14 @@ def _no_mutation_within(nodes) -> bool:
     inserted at the last node and reads its operands there, so an in-place
     update of an operand inside the pattern's span would change its result."""
     members = set(nodes)
-    graph_nodes = list(next(iter(members)).graph.nodes)
-    positions = [graph_nodes.index(n) for n in members]
-    return not any(_may_mutate(n) and n not in members
-                   for n in graph_nodes[min(positions):max(positions) + 1])
+    first, last = min(members), max(members)
+    n = first
+    while True:
+        if n not in members and _may_mutate(n):
+            return False
+        if n is last:
+            return True
+        n = n.next
 
 
 def _erase(gm: fx.GraphModule, nodes) -> None:
@@ -529,7 +533,6 @@ def fuse_rope(gm: fx.GraphModule) -> int:
 
 def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
     count = 0
-    order = {n: i for i, n in enumerate(gm.graph.nodes)}
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target is not torch.ops.paras.rms_norm.default:
             continue
@@ -550,7 +553,7 @@ def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
             continue
         if not all(u.op == "call_function" and u.target is operator.getitem for u in node.users):
             continue
-        if isinstance(w, fx.Node) and order.get(w, 0) > order[h]:
+        if isinstance(w, fx.Node) and w > h:
             continue
         if not _no_mutation_within([h, node]):
             continue
@@ -572,7 +575,6 @@ def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
         gm.graph.erase_node(node)
         h.replace_all_uses_with(parts[0])
         gm.graph.erase_node(h)
-        order = {n: i for i, n in enumerate(gm.graph.nodes)}
         count += 1
     return count
 

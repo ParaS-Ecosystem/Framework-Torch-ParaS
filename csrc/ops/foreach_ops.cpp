@@ -55,6 +55,7 @@ bool foreach_apply(TensorList out, TensorList a, TensorList b, TensorList c,
     const auto dt = out[0].scalar_type();
     const auto dev = out[0].device();
     if (!c10::isFloatingType(dt) || dev.type() != c10::DeviceType::PrivateUse1) return false;
+    if (!queue_for(out[0]).is_gpu()) return false;
     auto ok = [&](TensorList l) {
         if (l.empty()) return true;
         if (static_cast<int64_t>(l.size()) != n) return false;

@@ -13,7 +13,7 @@ Counted from the `TORCH_LIBRARY_IMPL` blocks in `csrc/ops/*.cpp`
 | | Count |
 |---|---|
 | aten registrations, `PrivateUse1` | 236 |
-| aten registrations, `AutogradPrivateUse1` (`max_pool2d`) | 1 |
+| aten registrations, `AutogradPrivateUse1` | 0 |
 | **Total aten kernel registrations** | **237** |
 | Distinct aten operators (overloads collapsed, e.g. `sort` / `sort.stable`) | 184 |
 | Custom ops, `paras::` namespace (`fused_ops.cpp`) | 8 |
@@ -83,7 +83,7 @@ Everything else goes through the boxed CPU fallback registered in
 | Scatter / `scatter_add` / `masked_fill` | 11 | Native | Yes | `test_device_blas_and_runtime.py` | |
 | Matrix multiply (`mm`, `bmm`, `addmm`) | 3 | Native | Yes | `test_matmul_sort_creation_ops.py`, `test_device_blas_and_runtime.py` | GPU: device GEMM through CLAP (fp32/fp64/fp16/bf16); up to 8 rows against a linear layer's weight (decode): a memory-bound ParaS kernel instead; `linear`/`matmul` decompose into these |
 | Convolution (`convolution_overrideable` + backward) | 2 | Native | **No** | — | No parity test yet |
-| Pooling (`_adaptive_avg_pool2d` ± backward, `avg_pool2d` ± backward, `max_pool2d`) | 5 | Native | Partial | `test_vision_ops.py` | Only adaptive avg pool tested; `max_pool2d` registered at `AutogradPrivateUse1` |
+| Pooling (`_adaptive_avg_pool2d` ± backward, `avg_pool2d` ± backward, `max_pool2d_with_indices` ± backward) | 6 | Host-staged | Partial | `test_vision_ops.py` | `max_pool2d` decomposes into `max_pool2d_with_indices` (traceable by `torch.compile`) |
 | Upsampling (`nearest2d`, `_nearest_exact2d`, `bilinear2d`, each ± backward) | 6 | Native | Partial | `test_vision_ops.py` | Only `upsample_nearest2d` forward tested |
 | Batch / layer norm (`native_batch_norm`, `native_layer_norm`, each ± backward) | 4 | Native | **No** | — | No parity test in repo yet |
 | RMS norm (`aten::rms_norm`) | — | Composite | Yes | `test_attention_norm_ops.py` | Decomposes into pow/mean/rsqrt/mul kernels; the `paras` compile backend replaces it with `paras::rms_norm` (one launch, bit-exact) |
