@@ -24,6 +24,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include <c10/core/Allocator.h>
 #include <c10/core/CachingDeviceAllocator.h>
@@ -66,6 +67,8 @@ private:
 
     static std::size_t round_size(std::size_t v);
     void sync_before_free() noexcept;
+    void release_memory(void* ptr, std::size_t rounded);
+    void dealloc_locked(void* ptr, std::size_t rounded);
 
     compat::Queue& queue_;
     int            device_index_;
@@ -79,6 +82,7 @@ private:
     std::uint64_t                           active_private_ = 0;
     std::size_t                             allocated_ = 0;
     std::size_t                             cached_    = 0;
+    std::vector<std::pair<void*, std::size_t>> deferred_;
     c10::CachingAllocator::Stat                               live_bytes_, live_blocks_;
     c10::CachingAllocator::Stat                               reserved_bytes_, segments_;
 };

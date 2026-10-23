@@ -129,39 +129,49 @@ void MemoryPool::release(void* ptr) {
                 return;
             }
             if (pr.live == 0) private_.erase(pit);
-            allocated_ -= rounded;
-            reserved_bytes_.decrease(rounded);
-            segments_.decrease(1);
         } else if (caching_enabled_) {
             free_lists_[rounded].push_back(ptr);
             cached_ += rounded;
             if (debug_)
                 PTSYCL_WARN("pool[%d] cache %zu bytes @%p", device_index_, rounded, ptr);
             return;
-        } else {
-            allocated_ -= rounded;
-            reserved_bytes_.decrease(rounded);
-            segments_.decrease(1);
         }
     }
     if (debug_)
         PTSYCL_WARN("pool[%d] free %zu bytes @%p", device_index_, rounded, ptr);
-    sync_before_free();
+    release_memory(ptr, rounded);
+}
+
+void MemoryPool::dealloc_locked(void* ptr, std::size_t rounded) {
+    if (queue_.capturing()) {
+        deferred_.emplace_back(ptr, rounded);
+        return;
+    }
     queue_.dealloc(ptr);
+    allocated_ -= rounded;
+    reserved_bytes_.decrease(rounded);
+    segments_.decrease(1);
+}
+
+void MemoryPool::release_memory(void* ptr, std::size_t rounded) {
+    sync_before_free();
+    std::lock_guard<std::mutex> g(mutex_);
+    dealloc_locked(ptr, rounded);
+    if (!queue_.capturing() && !deferred_.empty()) {
+        std::vector<std::pair<void*, std::size_t>> blocks;
+        blocks.swap(deferred_);
+        for (auto [p, n] : blocks) dealloc_locked(p, n);
+    }
 }
 
 void MemoryPool::clear() {
     std::lock_guard<std::mutex> g(mutex_);
-    if (!free_lists_.empty()) sync_before_free();
-    for (auto& [size, list] : free_lists_) {
-        for (void* p : list) {
-            queue_.dealloc(p);
-            allocated_ -= size;
-            reserved_bytes_.decrease(size);
-            segments_.decrease(1);
-        }
-        list.clear();
-    }
+    if (!free_lists_.empty() || !deferred_.empty()) sync_before_free();
+    std::vector<std::pair<void*, std::size_t>> blocks;
+    blocks.swap(deferred_);
+    for (auto& [size, list] : free_lists_)
+        for (void* p : list) blocks.emplace_back(p, size);
+    for (auto [p, n] : blocks) dealloc_locked(p, n);
     free_lists_.clear();
     cached_ = 0;
 }
@@ -211,14 +221,8 @@ void MemoryPool::release_private(std::uint64_t pool) {
     if (it == private_.end()) return;
     TORCH_CHECK(active_private_ != pool, "paras allocator: release of the active graph pool");
     if (!it->second.free_lists.empty()) sync_before_free();
-    for (auto& [size, list] : it->second.free_lists) {
-        for (void* p : list) {
-            queue_.dealloc(p);
-            allocated_ -= size;
-            reserved_bytes_.decrease(size);
-            segments_.decrease(1);
-        }
-    }
+    for (auto& [size, list] : it->second.free_lists)
+        for (void* p : list) dealloc_locked(p, size);
     it->second.free_lists.clear();
     it->second.released = true;
     if (it->second.live == 0) private_.erase(it);

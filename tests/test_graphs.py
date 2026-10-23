@@ -289,3 +289,23 @@ def test_compiled_replay_pieces_with_steady_symbolic_size(device):
                 assert torch.equal(c(x, cache).cpu(), step(x, cache).cpu()), (b, n)
     assert any("in 2 pieces" in r for r in _replay_reports()), _replay_reports()
     assert replay.stats["replays"] > replays, "no piece was replayed"
+
+
+def test_free_of_released_pool_during_capture(device):
+    _require_graphs(device)
+    x = torch.randn(4096, device=device)
+    with torch.no_grad():
+        x * 2
+        g1 = graphs.Graph()
+        with graphs.graph(g1, device=device):
+            y = x * 2
+        g1.reset()
+        g2 = graphs.Graph()
+        with graphs.graph(g2, device=device):
+            z = x + 1
+            del y
+        g2.replay()
+        assert_close(z, x.cpu() + 1, "replay after a deferred free")
+        g2.reset()
+        del z
+        torch_paras.empty_cache()
