@@ -251,26 +251,29 @@ __attribute__((always_inline)) PTSYCL_HOST_DEVICE inline unsigned short flash_p_
 
 template <typename T, int D, int kPer>
 __attribute__((always_inline)) PTSYCL_HOST_DEVICE inline void flash_load_kv(
-    const T* kp, const T* vp, const FlashArgs<T>& a, int64_t j0, int tid, bool kvec, bool vvec,
+    const T* kp, const T* vp, const FlashArgs<T>& a, int j0, int tid, bool kvec, bool vvec,
     flash_v8u (&kreg)[kPer], flash_v8u (&vreg)[kPer]) {
+    const int lk = static_cast<int>(a.Lk);
+    const int ks2 = static_cast<int>(a.ks.s[2]), ks3 = static_cast<int>(a.ks.s[3]);
+    const int vs2 = static_cast<int>(a.vs.s[2]), vs3 = static_cast<int>(a.vs.s[3]);
 #pragma unroll
     for (int t = 0; t < kPer; ++t) {
         const int c = tid + t * kFlashThreads;
         const int r = c / (D / 8), c8 = (c % (D / 8)) * 8;
-        const int64_t key = j0 + r;
-        if (key < a.Lk && kvec) {
-            kreg[t] = *reinterpret_cast<const flash_v8u*>(kp + key * a.ks.s[2] + c8);
+        const int key = j0 + r;
+        if (key < lk && kvec) {
+            kreg[t] = *reinterpret_cast<const flash_v8u*>(kp + key * ks2 + c8);
         } else {
 #pragma unroll
             for (int e = 0; e < 8; ++e)
-                kreg[t][e] = key < a.Lk ? static_cast<unsigned short>(flash_bits(kp[key * a.ks.s[2] + (c8 + e) * a.ks.s[3]])) : 0;
+                kreg[t][e] = key < lk ? static_cast<unsigned short>(flash_bits(kp[key * ks2 + (c8 + e) * ks3])) : 0;
         }
-        if (key < a.Lk && vvec) {
-            vreg[t] = *reinterpret_cast<const flash_v8u*>(vp + key * a.vs.s[2] + c8);
+        if (key < lk && vvec) {
+            vreg[t] = *reinterpret_cast<const flash_v8u*>(vp + key * vs2 + c8);
         } else {
 #pragma unroll
             for (int e = 0; e < 8; ++e)
-                vreg[t][e] = key < a.Lk ? static_cast<unsigned short>(flash_bits(vp[key * a.vs.s[2] + (c8 + e) * a.vs.s[3]])) : 0;
+                vreg[t][e] = key < lk ? static_cast<unsigned short>(flash_bits(vp[key * vs2 + (c8 + e) * vs3])) : 0;
         }
     }
 }
@@ -345,6 +348,7 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
                       reinterpret_cast<std::uintptr_t>(vp) % 16 == 0;
 
     flash_v8u kreg[kPer], vreg[kPer];
+    const int lk32 = static_cast<int>(a.Lk), lq32 = static_cast<int>(a.Lq);
 
     v4s qa[MT][KS];
 #pragma unroll
@@ -371,15 +375,22 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     const int64_t msum = a.mcls == nullptr ? 0
         : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
     const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
-    for (int64_t j0 = 0; j0 < k_end; j0 += kFlashBlockK) {
-        const signed char tile = a.mcls == nullptr
-                                     ? (has_mask ? kMaskMixed : kMaskZero)
-                                     : a.mcls[msum * a.k_blocks + j0 / kFlashBlockK];
-        if (tile == kMaskDead && may_skip) continue;
-        const bool masked = tile != kMaskZero;
-        flash_load_kv<T, D, kPer>(kp, vp, a, j0, tid, kvec, vvec, kreg, vreg);
+    auto tile_of = [&](int64_t j) -> signed char {
+        return a.mcls == nullptr ? (has_mask ? kMaskMixed : kMaskZero)
+                                 : a.mcls[msum * a.k_blocks + j / kFlashBlockK];
+    };
+    auto next_block = [&](int64_t j) -> int64_t {
+        while (j < k_end && may_skip && tile_of(j) == kMaskDead) j += kFlashBlockK;
+        return j;
+    };
+    int64_t j0 = next_block(0);
+    if (j0 < k_end) flash_load_kv<T, D, kPer>(kp, vp, a, static_cast<int>(j0), tid, kvec, vvec, kreg, vreg);
+    while (j0 < k_end) {
+        const bool masked = tile_of(j0) != kMaskZero;
         flash_store_kv<D, kPer>(klds, vlds, tid, kreg, vreg);
         sycl::group_barrier(it.get_group());
+        const int64_t j_next = next_block(j0 + kFlashBlockK);
+        if (j_next < k_end) flash_load_kv<T, D, kPer>(kp, vp, a, static_cast<int>(j_next), tid, kvec, vvec, kreg, vreg);
 
         v4f sacc[MT][4];
 #pragma unroll
@@ -399,6 +410,7 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             const int64_t row = row0 + 16 * mt + lr;
+            const int row32 = static_cast<int>(row);
             const int64_t tile_row0 = row0 + 16 * mt;
             const bool edge = j0 + kFlashBlockK > a.Lk || tile_row0 + 16 > a.Lq ||
                               (a.causal && j0 + kFlashBlockK - 1 > tile_row0);
@@ -409,8 +421,8 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
                 for (int i = 0; i < 4; ++i) {
                     float sv = sacc[mt][n][i] * a.scale;
                     if (edge || masked) {
-                        const int64_t key = j0 + n * 16 + 4 * lg + i;
-                        if (key >= a.Lk || row >= a.Lq || (a.causal && key > row)) {
+                        const int key = static_cast<int>(j0) + n * 16 + 4 * lg + i;
+                        if (key >= lk32 || row32 >= lq32 || (a.causal && key > row32)) {
                             sv = kNegInf;
                         } else if (masked) {
                             const int64_t mo = b * a.ms.s[0] + h * a.ms.s[1] + row * a.ms.s[2] + key * a.ms.s[3];
@@ -454,6 +466,7 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
                 for (int mt = 0; mt < MT; ++mt) oacc[mt][nd] = mfma(va, pb[mt][n], oacc[mt][nd]);
             }
         sycl::group_barrier(it.get_group());
+        j0 = j_next;
     }
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
@@ -905,15 +918,36 @@ void decode_attention(compat::Queue& queue, const T* pq, const T* pk, const T* p
 #endif
 
 #if PTSYCL_SDPA_GEMM_PATH
+bool head_offsets_fit_int(const Tensor& t) {
+    const int64_t m = (t.size(2) - 1) * std::abs(t.stride(2)) + (t.size(3) - 1) * std::abs(t.stride(3));
+    return t.size(2) < std::numeric_limits<int>::max() && m < std::numeric_limits<int>::max();
+}
+
+template <int D>
+struct FlashOccupancy {};
+
+template <>
+struct FlashOccupancy<64> {
+    static constexpr int paras_max_work_group_size = kFlashThreads;
+    static constexpr int paras_min_waves_per_eu = 3;
+};
+
+template <typename T, int D>
+struct FlashFunctor : FlashOccupancy<D> {
+    FlashArgs<T> a;
+    sycl::local_accessor<unsigned short, 1> lds;
+    void operator()(sycl::nd_item<1> it) const { flash_block<T, D>(a, it, &lds[0]); }
+};
+
 template <typename T, int D>
 void flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t groups) {
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<unsigned short, 1> lds(sycl::range<1>(flash_lds_elems<D>()), cgh);
-        const FlashArgs<T> a = args;
+        const FlashFunctor<T, D> f{{}, args, lds};
         cgh.template parallel_for<FlashKernel<T, D>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kFlashThreads)),
                               sycl::range<1>(static_cast<std::size_t>(kFlashThreads))),
-            [=](sycl::nd_item<1> it) { flash_block<T, D>(a, it, &lds[0]); });
+            f);
     });
 }
 
@@ -987,7 +1021,8 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                 at::empty({}, lopts), at::empty({}, lopts), none};
     }
     if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) &&
-        (q.scalar_type() == c10::kBFloat16 || q.scalar_type() == c10::kHalf)) {
+        (q.scalar_type() == c10::kBFloat16 || q.scalar_type() == c10::kHalf) &&
+        head_offsets_fit_int(k) && head_offsets_fit_int(v)) {
         AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "ptsycl_flash_attention", [&] {
             FlashArgs<scalar_t> fa{};
             fa.q = data_ptr<scalar_t>(q); fa.k = data_ptr<scalar_t>(k); fa.v = data_ptr<scalar_t>(v);
