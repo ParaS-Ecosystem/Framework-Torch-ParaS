@@ -18,6 +18,7 @@
 
 
 #include <cmath>
+#include <optional>
 
 #include "core/kernels.h"
 #include "ops/clap_dnn_adapter.h"
@@ -62,11 +63,31 @@ Tensor to_compute(const Tensor& t, c10::ScalarType dtype, c10::Device device) {
     return t.to(t.options().dtype(dtype).device(device));
 }
 
+std::optional<double> opmath_scalar(const Tensor& t, c10::ScalarType out) {
+    if (t.dim() != 0 || !t.device().is_cpu() || !t.unsafeGetTensorImpl()->is_wrapped_number() ||
+        !c10::isFloatingType(out))
+        return std::nullopt;
+    const double v = t.item<double>();
+    return out == c10::kDouble ? v : static_cast<double>(static_cast<float>(v));
+}
+
 template <typename Fn>
 void binary_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
     auto& q = queue_for(out);
     const int64_t n = out.numel();
     if (n == 0) return;
+    if (const auto sb = opmath_scalar(b, out.scalar_type())) {
+        const double sv = *sb;
+        Tensor ac = to_compute(a, out.scalar_type(), out.device());
+        unary_kernel(ac, out, [fn, sv](double x) { return fn(x, sv); });
+        return;
+    }
+    if (const auto sa = opmath_scalar(a, out.scalar_type())) {
+        const double sv = *sa;
+        Tensor bc = to_compute(b, out.scalar_type(), out.device());
+        unary_kernel(bc, out, [fn, sv](double y) { return fn(sv, y); });
+        return;
+    }
     Tensor ae = to_compute(a, out.scalar_type(), out.device()).expand_as(out);
     Tensor be = to_compute(b, out.scalar_type(), out.device()).expand_as(out);
 
@@ -296,7 +317,8 @@ Tensor& div_out(const Tensor& self, const Tensor& other, Tensor& out) {
 
 Tensor& mul_scalar_(Tensor& self, const c10::Scalar& other) {
     PTSYCL_TRACE_OP("mul_.Scalar");
-    const double w = other.toDouble();
+    const double w = self.scalar_type() == c10::kDouble || !c10::isFloatingType(self.scalar_type())
+                         ? other.toDouble() : static_cast<double>(static_cast<float>(other.toDouble()));
     unary_kernel(self, self, [w](double v) { return v * w; });
     return self;
 }

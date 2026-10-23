@@ -433,6 +433,30 @@ def test_topk_values_only_with_ties(device):
 
 # --- structure ----------------------------------------------------------------
 
+def test_python_scalars_at_opmath_precision(device):
+    torch.manual_seed(0)
+    for dt in (torch.bfloat16, torch.float16):
+        x = torch.randn(4099).to(dt)
+        d = x.to(device)
+        f = lambda v: float(torch.tensor(v, dtype=torch.float32))
+        x64 = x.double()
+        cases = {
+            "mul": (d * 0.9, x64 * f(0.9)),
+            "add": (d + 0.1, x64 + f(0.1)),
+            "sub": (d - 0.3, x64 - f(0.3)),
+            "div": (d / 3.0, x64 / f(3.0)),
+            "rsub": (1.7 - d, f(1.7) - x64),
+        }
+        for name, (got, ref) in cases.items():
+            assert torch.equal(got.cpu(), ref.to(dt)), (name, dt)
+        old = x64 * float(torch.tensor(0.9, dtype=dt))
+        assert not torch.equal((d * 0.9).cpu(), old.to(dt))
+        m = d.clone(); m.mul_(0.9)
+        assert torch.equal(m.cpu(), (d * 0.9).cpu())
+    i = torch.arange(7, device=device)
+    assert torch.equal((i * 2.5).cpu(), torch.arange(7) * 2.5)
+
+
 def test_cat_one_launch_cases(device):
     torch.manual_seed(0)
     cases = [

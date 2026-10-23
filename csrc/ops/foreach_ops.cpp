@@ -151,7 +151,7 @@ bool foreach_apply(TensorList out, TensorList a, TensorList b, TensorList c,
 
 template <typename T> double round_to(double v, const T*) { return static_cast<double>(static_cast<T>(v)); }
 double scalar_as(const Tensor& like, double v) {
-    return at::full({}, v, like.options().dtype(like.scalar_type()).device(c10::kCPU)).to(at::kDouble).item<double>();
+    return like.scalar_type() == c10::kDouble ? v : static_cast<double>(static_cast<float>(v));
 }
 std::vector<double> scalars_as(TensorList like, at::ArrayRef<c10::Scalar> s) {
     std::vector<double> out(s.size());
@@ -169,7 +169,7 @@ void foreach_mul_scalar_(TensorList self, const c10::Scalar& w) {
                       [](double x, double, double, double s, auto) { return x * s; }))
         return;
 #endif
-    at::native::foreach_tensor_mul_tensor_kernel_slow_(self, at::scalar_tensor(w, at::kDouble));
+    at::native::foreach_tensor_mul_scalar_kernel_slow_(self, w);
 }
 
 void foreach_mul_tensor_(TensorList self, const Tensor& other) {
