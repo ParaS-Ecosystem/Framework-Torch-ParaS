@@ -59,7 +59,8 @@ are drawn on the host), return their inputs or aliases of them, mutate
 input metadata, or have inputs on several devices or on the host. All
 replayed graphs of a device share one graph pool: they run in program
 order on the device's queue and their outputs are copied out before the
-next replay.
+next replay. A piece whose outputs the next piece reads in place (not
+copied) has a pool of its own.
 """
 
 import collections
@@ -245,6 +246,8 @@ class _Capture:
         private = set(meta.private_outputs)
         self.tensor_outputs = tuple(i for i, o in enumerate(self.outputs)
                                     if isinstance(o, torch.Tensor) and i not in private)
+        self.private_tensors = tuple(o for i, o in enumerate(self.outputs)
+                                     if i in private and isinstance(o, torch.Tensor) and not o.is_inference())
         self.checked_outputs = tuple(i for i, o in enumerate(self.outputs)
                                      if isinstance(o, torch.Tensor))
         for o in self.outputs:
@@ -258,7 +261,9 @@ class _Capture:
         stats["replays"] += 1
         for i, j, buf in self.buffers:
             _load(buf, args[i] if j is None else args[i][j])
-        self.graph.replay()
+        self.graph._replay_versioned()
+        for t in self.private_tensors:
+            torch.autograd.graph.increment_version(t)
         return self.results(args)
 
     def results(self, args):
@@ -325,6 +330,8 @@ class Replayed:
         pool = _pools.get(index)
         if pool is None:
             pool = _pools[index] = graphs.new_pool()
+        if self.meta.private_outputs:
+            pool = None
         buffers = []
         in_place = set()
         captured = [list(a) if isinstance(a, (tuple, list)) else a for a in args]

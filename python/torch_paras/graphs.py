@@ -117,6 +117,13 @@ class Graph:
             raise RuntimeError("replay of a Graph that was not captured")
         _C._graph_replay(self._handle)
 
+    def _replay_versioned(self) -> None:
+        """Replay for a caller that bumps the versions of the tensors the graph
+        writes (compiled replay), so the global replay epoch stays."""
+        if self._handle is None:
+            raise RuntimeError("replay of a Graph that was not captured")
+        _C._graph_replay(self._handle, False)
+
     def pool(self) -> int | None:
         return self._pool
 

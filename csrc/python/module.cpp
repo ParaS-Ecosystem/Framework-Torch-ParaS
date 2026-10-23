@@ -87,10 +87,10 @@ PYBIND11_MODULE(_C, m) {
         ptsycl::graphs::capture_begin(index, pool);
     });
     m.def("_graph_capture_end", [](int index) { return ptsycl::graphs::capture_end(index); });
-    m.def("_graph_replay", [](int64_t graph) {
+    m.def("_graph_replay", [](int64_t graph, bool advance_epoch) {
         py::gil_scoped_release no_gil;
-        ptsycl::graphs::replay(graph);
-    });
+        ptsycl::graphs::replay(graph, advance_epoch);
+    }, py::arg("graph"), py::arg("advance_epoch") = true);
     m.def("_graph_release", [](int64_t graph) { ptsycl::graphs::release(graph); });
     m.def("_graph_pool_release", [](int index, uint64_t pool) {
         ptsycl::graphs::release_pool(index, pool);

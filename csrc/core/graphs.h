@@ -32,7 +32,8 @@ std::uint64_t new_pool();
 void capture_begin(int device, std::uint64_t pool);
 std::int64_t capture_end(int device);
 
-void replay(std::int64_t graph);
+void replay(std::int64_t graph, bool advance_epoch = true);
+std::uint64_t replay_epoch();
 void release(std::int64_t graph);
 void release_pool(int device, std::uint64_t pool);
 

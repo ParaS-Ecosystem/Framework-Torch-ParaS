@@ -90,7 +90,17 @@ std::int64_t capture_end(int device) {
     return id;
 }
 
-void replay(std::int64_t graph) {
+namespace {
+std::atomic<std::uint64_t>& replays() {
+    static std::atomic<std::uint64_t> n{0};
+    return n;
+}
+}
+
+std::uint64_t replay_epoch() { return replays().load(std::memory_order_relaxed); }
+
+void replay(std::int64_t graph, bool advance_epoch) {
+    if (advance_epoch) replays().fetch_add(1, std::memory_order_relaxed);
     Recorded rec;
     {
         std::lock_guard<std::mutex> g(registry_mutex());

@@ -26,6 +26,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "core/graphs.h"
 #include "core/kernels.h"
 #include "ops/device_gemm.h"
 
@@ -551,6 +552,7 @@ MaskSummary mask_block_summary(compat::Queue& queue, const Tensor& attn_bias,
     struct Cached {
         c10::weak_intrusive_ptr<c10::StorageImpl> storage{c10::intrusive_ptr<c10::StorageImpl>()};
         int64_t offset = -1, version = -1, Lq = -1, Lk = -1, B = -1, H = -1;
+        std::uint64_t epoch = ~std::uint64_t{0};
         std::vector<int64_t> sizes, strides;
         c10::ScalarType dtype = c10::ScalarType::Undefined;
         MaskSummary summary;
@@ -561,7 +563,8 @@ MaskSummary mask_block_summary(compat::Queue& queue, const Tensor& attn_bias,
         auto live = cached.storage.lock();
         if (live && live.get() == attn_bias.storage().unsafeGetStorageImpl() &&
             cached.offset == attn_bias.storage_offset() &&
-            cached.version == attn_bias._version() && cached.dtype == attn_bias.scalar_type() &&
+            cached.version == attn_bias._version() && cached.epoch == graphs::replay_epoch() &&
+            cached.dtype == attn_bias.scalar_type() &&
             cached.sizes == attn_bias.sizes().vec() && cached.strides == attn_bias.strides().vec() &&
             cached.B == B && cached.H == H && cached.Lq == Lq && cached.Lk == Lk &&
             cached.summary.cls.device() == mask.device())
@@ -599,6 +602,7 @@ MaskSummary mask_block_summary(compat::Queue& queue, const Tensor& attn_bias,
             attn_bias.storage().getWeakStorageImpl());
         cached.offset = attn_bias.storage_offset();
         cached.version = attn_bias._version();
+        cached.epoch = graphs::replay_epoch();
         cached.dtype = attn_bias.scalar_type();
         cached.sizes = attn_bias.sizes().vec();
         cached.strides = attn_bias.strides().vec();
