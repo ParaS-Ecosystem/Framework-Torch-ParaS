@@ -31,6 +31,7 @@ struct DeviceBackend {
     std::unique_ptr<clap::IBlasBackend> backend;
     bool unavailable = false;
     bool bf16_unsupported = false;
+    bool ex_unsupported = false;
 };
 
 thread_local std::unordered_map<int, DeviceBackend> device_backends;
@@ -104,6 +105,27 @@ bool run_device_gemm(DeviceBackend& entry,
 {
     constexpr auto kRow = clap::Layout::RowMajor;
     clap::IBlasBackend* backend = entry.backend.get();
+#if defined(PTSYCL_CLAP_HAS_GEMM_EX)
+    const auto elem = [](int t) {
+        return t == PTSYCL_CLAP_F16 ? clap::GemmElem::F16
+             : t == PTSYCL_CLAP_BF16 ? clap::GemmElem::BF16 : clap::GemmElem::F32;
+    };
+    if ((dtype == PTSYCL_CLAP_F16 && (c_dtype == PTSYCL_CLAP_F16 || c_dtype == PTSYCL_CLAP_F32)) ||
+        (dtype == PTSYCL_CLAP_BF16 && c_dtype == PTSYCL_CLAP_F32)) {
+        if (entry.ex_unsupported) return false;
+        try {
+            backend->gemm_ex_strided_batched_device(
+                kRow, ta, tb, m, n, k, static_cast<float>(alpha), a, lda, stride_a, b, ldb, stride_b,
+                static_cast<float>(beta), c, ldc, stride_c, batch, elem(dtype), elem(c_dtype), stream);
+        } catch (const std::invalid_argument&) {
+            return false;
+        } catch (const std::exception&) {
+            entry.ex_unsupported = true;
+            return false;
+        }
+        return true;
+    }
+#endif
     if (dtype != c_dtype)
         return false;
     switch (dtype) {

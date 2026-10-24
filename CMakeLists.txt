@@ -350,6 +350,9 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
         if(_ptsycl_clap_blas_api MATCHES "gemm_strided_batched_bf16_device")
             list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_BF16_BATCHED")
         endif()
+        if(_ptsycl_clap_blas_api MATCHES "gemm_ex_strided_batched_device")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_GEMM_EX")
+        endif()
         message(STATUS "CLAP device GEMM: ${PTSYCL_CLAP_WRAPPER_DEFS}")
 
         add_custom_command(
