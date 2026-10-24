@@ -218,3 +218,16 @@ def test_row_reductions_vector_path(device):
     nan[2, 2047] = float("nan")
     for fn in (lambda t: t.amax(-1), lambda t: t.amin(-1), lambda t: t.amax(0)):
         _close(fn(nan.to(device)), fn(nan), "nan propagation")
+
+
+def test_random_integers(device):
+    torch.manual_seed(0)
+    for dtype in (torch.int64, torch.int32, torch.uint8, torch.float32, torch.bfloat16):
+        x = _no_fallback(lambda: torch.randint(3, 17, (20000,), device=device, dtype=dtype), "randint")
+        c = x.cpu().to(torch.int64)
+        assert c.min().item() == 3 and c.max().item() == 16, (dtype, c.min(), c.max())
+        assert (torch.bincount(c - 3).float() / 20000 - 1 / 14).abs().max() < 0.02, dtype
+    y = _no_fallback(lambda: torch.empty(5000, dtype=torch.int64, device=device).random_(10), "random_.to")
+    assert y.min().item() >= 0 and y.max().item() <= 9
+    b = _no_fallback(lambda: torch.empty(5000, dtype=torch.bool, device=device).random_(), "random_ bool")
+    assert 0.4 < b.float().mean().item() < 0.6

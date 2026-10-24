@@ -17,6 +17,8 @@
 // -----------------------------------------------------------------------------
 
 
+#include <limits>
+
 #include "core/kernels.h"
 
 namespace ptsycl {
@@ -300,6 +302,58 @@ Tensor& multinomial_out(
     return out;
 }
 
+Tensor& random_range_(Tensor& self, int64_t from, std::optional<int64_t> to_opt) {
+    const int64_t n = self.numel();
+    if (n == 0) return self;
+    int64_t to = 0;
+    if (to_opt.has_value()) {
+        to = *to_opt;
+    } else {
+        switch (self.scalar_type()) {
+            case c10::kHalf: to = (int64_t{1} << 11) + 1; break;
+            case c10::kBFloat16: to = (int64_t{1} << 8) + 1; break;
+            case c10::kFloat: to = (int64_t{1} << 24) + 1; break;
+            case c10::kDouble: to = (int64_t{1} << 53) + 1; break;
+            case c10::kBool: to = 2; break;
+            default:
+                AT_DISPATCH_INTEGRAL_TYPES(self.scalar_type(), "ptsycl_random_max", [&] {
+                    to = static_cast<int64_t>(std::numeric_limits<scalar_t>::max());
+                    to = to == std::numeric_limits<int64_t>::max() ? to : to + 1;
+                });
+        }
+    }
+    TORCH_CHECK(from < to, "random_ expects 'from' to be less than 'to', but got from=", from, " >= to=", to);
+    const uint64_t range = static_cast<uint64_t>(to) - static_cast<uint64_t>(from);
+    const auto state = draw_state(self, n);
+    const uint64_t seed = state.first, seq = state.second;
+    auto& q = queue_for(self);
+    Tensor dst = self.is_contiguous() ? self : at::empty(self.sizes(), self.options());
+    AT_DISPATCH_ALL_TYPES_AND3(c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_random_", [&] {
+        scalar_t* d = data_ptr<scalar_t>(dst);
+        launch_flat(q, n, [=](std::size_t i) {
+            uint32_t r0, r1;
+            Philox2x32::generate(seed, seq, static_cast<uint64_t>(i), r0, r1);
+            const uint64_t r = range > 0xffffffffull ? ((static_cast<uint64_t>(r1) << 32) | r0) : r0;
+            d[i] = static_cast<scalar_t>(static_cast<int64_t>(from + static_cast<int64_t>(r % range)));
+        });
+    });
+    if (!dst.is_same(self)) self.copy_(dst);
+    return self;
+}
+
+Tensor& random_from_(Tensor& self, int64_t from, std::optional<int64_t> to, std::optional<at::Generator>) {
+    PTSYCL_TRACE_OP("random_.from");
+    return random_range_(self, from, to);
+}
+Tensor& random_to_(Tensor& self, int64_t to, std::optional<at::Generator>) {
+    PTSYCL_TRACE_OP("random_.to");
+    return random_range_(self, 0, to);
+}
+Tensor& random_default_(Tensor& self, std::optional<at::Generator>) {
+    PTSYCL_TRACE_OP("random_");
+    return random_range_(self, 0, std::nullopt);
+}
+
 template <typename F>
 Tensor& fill_from_uniform(Tensor& self, F inverse_cdf) {
     const auto state = draw_state(self, self.numel());
@@ -362,6 +416,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::native_dropout_backward", &ptsycl::native_dropout_backward);
     m.impl("aten::multinomial", &ptsycl::multinomial);
     m.impl("aten::exponential_", &ptsycl::exponential_);
+    m.impl("aten::random_.from", &ptsycl::random_from_);
+    m.impl("aten::random_.to", &ptsycl::random_to_);
+    m.impl("aten::random_", &ptsycl::random_default_);
     m.impl("aten::cauchy_", &ptsycl::cauchy_);
     m.impl("aten::geometric_", &ptsycl::geometric_);
     m.impl("aten::log_normal_", &ptsycl::log_normal_);

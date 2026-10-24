@@ -276,7 +276,7 @@ def test_sdpa_training_uses_fused_path(device):
 def test_sdpa_fused_prefill_path(device):
     import torch_paras
     torch.manual_seed(0)
-    gpu = fast_kernels(device)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
     B, H, L, D = 1, 3, 300, 32
     for dtype, tol in ((torch.float32, 1e-4), (torch.bfloat16, 3e-2)):
         q = torch.randn(B, L, H, D).transpose(1, 2).to(dtype)
@@ -335,7 +335,7 @@ def test_sdpa_long_keys(device):
 def test_sdpa_flash_fp32(device):
     import torch_paras
     torch.manual_seed(0)
-    gpu = fast_kernels(device)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
     cases = [(2, 3, 3, 130, 130, 64), (1, 2, 2, 70, 200, 64), (1, 4, 4, 257, 257, 64), (1, 8, 2, 300, 300, 64),
              (1, 2, 2, 130, 130, 128), (1, 4, 2, 70, 211, 128)]
     for B, H, Hk, Lq, Lk, D in cases:
@@ -476,7 +476,7 @@ def test_reductions_around_work_group_rows(device):
 def test_sdpa_fused_training_gradients(device):
     import torch_paras
     torch.manual_seed(0)
-    gpu = fast_kernels(device)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
     cases = [(2, 4, 4, 70, 70, 64, torch.float32), (1, 8, 2, 130, 130, 64, torch.float32),
              (1, 4, 4, 40, 90, 64, torch.float32), (1, 4, 2, 66, 66, 128, torch.bfloat16)]
     for B, H, Hk, Lq, Lk, D, dt in cases:

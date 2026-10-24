@@ -163,6 +163,7 @@ void Queue::init(const DeviceInfo& dev) {
     native_id_ = dev.native_id;
     wave_size_ = dev.wave_size;
     mfma_ = dev.mfma;
+    generic_ = dev.generic;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
         ::setenv("PARAS_ASYNC_KERNELS", "1", 0);
@@ -213,10 +214,7 @@ void gpu_kernel_caps(const sycl::device& d, DeviceInfo& info) {
     info.mfma = false;
 #endif
     const char* generic = std::getenv("PTSYCL_GENERIC_KERNELS");
-    if (generic != nullptr && std::string(generic) == "1") {
-        info.wave_size = 32;
-        info.mfma = false;
-    }
+    info.generic = generic != nullptr && std::string(generic) == "1";
 }
 }
 #endif

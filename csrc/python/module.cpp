@@ -50,7 +50,8 @@ PYBIND11_MODULE(_C, m) {
         const auto& info = ptsycl::Context::instance().device(index).info;
         py::dict d;
         d["wave_size"] = info.is_gpu ? info.wave_size : 1;
-        d["mfma"] = info.is_gpu && info.mfma;
+        d["mfma"] = info.is_gpu && info.mfma && !info.generic;
+        d["generic"] = info.generic;
         return d;
     });
 

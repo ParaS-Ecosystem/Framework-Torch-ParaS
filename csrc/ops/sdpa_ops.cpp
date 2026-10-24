@@ -37,10 +37,9 @@ using at::Tensor;
 
 constexpr int64_t kFusedMaxQuery = 16;
 
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
 #define PTSYCL_SDPA_GEMM_PATH 1
-constexpr int64_t kRowLanes = 64;
-constexpr int64_t kRowPerLane = 64;
+constexpr int64_t kRowKeys = 4096;
 #else
 #define PTSYCL_SDPA_GEMM_PATH 0
 #endif
@@ -71,7 +70,8 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
                            ((dt == c10::kBFloat16 || dt == c10::kHalf)
                                 ? (q.sym_size(3) == 64 || q.sym_size(3) == 128)
                                 : (dt == c10::kFloat && q.sym_size(3) == 64));
-        if (!flash && (!qq.wave64() || k.sym_size(2) > kRowLanes * kRowPerLane)) return false;
+        const int lanes = qq.wave_size();
+        if (!flash && ((lanes != 32 && lanes != 64) || k.sym_size(2) > kRowKeys)) return false;
 #else
         return false;
 #endif
@@ -115,7 +115,7 @@ struct MaxSum {
 };
 
 #if PTSYCL_SDPA_GEMM_PATH
-template <typename T, int Vec>
+template <typename T, int Vec, int Lanes>
 class SoftmaxRowsKernel;
 
 template <typename T, int Vec>
@@ -123,20 +123,21 @@ struct alignas(sizeof(T) * Vec) Chunk {
     T v[Vec];
 };
 
-template <typename scalar_t, int Vec>
+template <typename scalar_t, int Vec, int Lanes>
 void softmax_rows(compat::Queue& queue, const float* S, scalar_t* P, float* L,
                   int64_t rows, int64_t Lq, int64_t H, int64_t Lk, float sc,
                   bool is_causal, const bool* pmb, const scalar_t* pmf,
                   Strides4 ms) {
     constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+    constexpr int kRowPerLane = kRowKeys / Lanes;
     constexpr int kIters = kRowPerLane / Vec;
     using C = Chunk<float, Vec>;
     using PC = Chunk<scalar_t, Vec>;
     using MC = Chunk<scalar_t, Vec>;
     using BC = Chunk<bool, Vec>;
-    queue.sycl_queue().template parallel_for<SoftmaxRowsKernel<scalar_t, Vec>>(
-        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kRowLanes)),
-                          sycl::range<1>(static_cast<std::size_t>(kRowLanes))),
+    queue.sycl_queue().template parallel_for<SoftmaxRowsKernel<scalar_t, Vec, Lanes>>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * Lanes)),
+                          sycl::range<1>(static_cast<std::size_t>(Lanes))),
         [=](sycl::nd_item<1> it) {
             const auto sg = it.get_sub_group();
             const int64_t r = static_cast<int64_t>(it.get_group(0));
@@ -148,7 +149,7 @@ void softmax_rows(compat::Queue& queue, const float* S, scalar_t* P, float* L,
             float m = kNegInf;
 #pragma unroll
             for (int t = 0; t < kIters; ++t) {
-                const int64_t j0 = (t * kRowLanes + lane) * Vec;
+                const int64_t j0 = (t * Lanes + lane) * Vec;
                 if (j0 < Lk) {
                     const C sv = *reinterpret_cast<const C*>(srow + j0);
                     const MC* mv = pmf != nullptr
@@ -182,7 +183,7 @@ void softmax_rows(compat::Queue& queue, const float* S, scalar_t* P, float* L,
             scalar_t* prow = P + r * Lk;
 #pragma unroll
             for (int t = 0; t < kIters; ++t) {
-                const int64_t j0 = (t * kRowLanes + lane) * Vec;
+                const int64_t j0 = (t * Lanes + lane) * Vec;
                 if (j0 < Lk) {
                     PC pv;
 #pragma unroll
@@ -1101,13 +1102,17 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             c10::kHalf, c10::kBFloat16, q.scalar_type(), "ptsycl_attention_rows", [&] {
                 const bool* pmb = bool_mask ? mask.data_ptr<bool>() : nullptr;
                 const scalar_t* pmf = has_mask && !bool_mask ? data_ptr<scalar_t>(mask) : nullptr;
-                auto run = [&](auto vec) {
-                    softmax_rows<scalar_t, decltype(vec)::value>(
+                auto run = [&](auto vec, auto lanes) {
+                    softmax_rows<scalar_t, decltype(vec)::value, decltype(lanes)::value>(
                         queue, S.data_ptr<float>(), data_ptr<scalar_t>(P),
                         lse.data_ptr<float>(), rows, Lq, H, Lk, sc, is_causal, pmb, pmf, ms);
                 };
-                if (vec4 && sizeof(scalar_t) <= 4) run(std::integral_constant<int, 4>{});
-                else run(std::integral_constant<int, 1>{});
+                auto by_lanes = [&](auto vec) {
+                    if (queue.wave_size() == 32) run(vec, std::integral_constant<int, 32>{});
+                    else run(vec, std::integral_constant<int, 64>{});
+                };
+                if (vec4 && sizeof(scalar_t) <= 4) by_lanes(std::integral_constant<int, 4>{});
+                else by_lanes(std::integral_constant<int, 1>{});
             });
         for (int64_t b = 0; b < B; ++b) {
             at::Tensor ob = out[b];
