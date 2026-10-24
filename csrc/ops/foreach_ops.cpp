@@ -150,7 +150,7 @@ bool foreach_apply(TensorList out, TensorList a, TensorList b, TensorList c,
     return true;
 }
 
-template <typename T> double round_to(double v, const T*) { return static_cast<double>(static_cast<T>(v)); }
+template <typename T> PTSYCL_HOST_DEVICE double round_to(double v, const T*) { return static_cast<double>(static_cast<T>(v)); }
 double scalar_as(const Tensor& like, double v) {
     return like.scalar_type() == c10::kDouble ? v : static_cast<double>(static_cast<float>(v));
 }

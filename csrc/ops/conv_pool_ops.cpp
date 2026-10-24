@@ -34,8 +34,8 @@ namespace {
 
 struct ConvGeom {
     int64_t N, C, D, H, W, O, kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw, Do, Ho, Wo, groups;
-    int64_t ksize() const { return kd * kh * kw; }
-    int64_t out_size() const { return Do * Ho * Wo; }
+    PTSYCL_HOST_DEVICE int64_t ksize() const { return kd * kh * kw; }
+    PTSYCL_HOST_DEVICE int64_t out_size() const { return Do * Ho * Wo; }
 };
 
 template <typename T>
