@@ -200,7 +200,7 @@ void softmax_rows(compat::Queue& queue, const float* S, scalar_t* P, float* L,
 #if PTSYCL_SDPA_GEMM_PATH
 constexpr int kFlashTiles = 1;
 constexpr int kFlashRowsPerWave = 16 * kFlashTiles;
-constexpr int kFlashWaves = 4;
+constexpr int kFlashWaves = 8;
 constexpr int kFlashBlockQ = kFlashRowsPerWave * kFlashWaves;
 constexpr int kFlashBlockK = 64;
 constexpr int kFlashLanes = 64;
@@ -223,6 +223,8 @@ struct FlashArgs {
     bool causal;
     const signed char* mcls; const unsigned char* mqok;
     int64_t k_blocks, mb_stride, mh_stride;
+    int64_t mq_blocks;
+    int mq_shift;
 };
 
 constexpr signed char kMaskDead = 0;
@@ -373,7 +375,7 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     const int64_t k_end = a.causal ? (q0 + kFlashBlockQ < a.Lk ? q0 + kFlashBlockQ : a.Lk) : a.Lk;
     const bool has_mask = a.mf != nullptr || a.mb != nullptr;
     const int64_t msum = a.mcls == nullptr ? 0
-        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
+        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.mq_blocks + (qb >> a.mq_shift);
     const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
     auto tile_of = [&](int64_t j) -> signed char {
         return a.mcls == nullptr ? (has_mask ? kMaskMixed : kMaskZero)
@@ -487,26 +489,30 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
 #endif
 }
 
-constexpr int kFlash32BlockK = 32;
-constexpr int kFlash32KLD = 64 + 2;
-constexpr int kFlash32VLD = 64 + 4;
-constexpr int kFlash32LdsElems = kFlash32BlockK * (kFlash32KLD + kFlash32VLD);
+template <int D> constexpr int flash32_block_k() { return D == 64 ? 32 : 16; }
+template <int D> constexpr int flash32_kld() { return D + 2; }
+template <int D> constexpr int flash32_vld() { return D + 4; }
+constexpr int kFlash32Threads = 4 * kFlashLanes;
+constexpr int kFlash32BlockQ = 4 * kFlashRowsPerWave;
+template <int D> constexpr int flash32_lds_elems() {
+    return flash32_block_k<D>() * (flash32_kld<D>() + flash32_vld<D>());
+}
 
 template <int D> class Flash32Kernel;
 
 template <int D, typename Item>
 PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const Item& it, float* lds) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    static_assert(D == 64, "fp32 flash kernel: head size 64");
+    static_assert(D == 64 || D == 128, "fp32 flash kernel: head size 64 or 128");
     typedef float v4f __attribute__((ext_vector_type(4)));
-    constexpr int BK = kFlash32BlockK;
+    constexpr int BK = flash32_block_k<D>();
     constexpr int KS = D / 4;
     constexpr int NT = BK / 16;
     constexpr int ND = D / 16;
     constexpr int MT = kFlashTiles;
     constexpr float kNegInf = -std::numeric_limits<float>::infinity();
-    constexpr int KLD = kFlash32KLD, VLD = kFlash32VLD;
-    constexpr int kPer = BK * D / 4 / kFlashThreads;
+    constexpr int KLD = flash32_kld<D>(), VLD = flash32_vld<D>();
+    constexpr int kPer = BK * D / 4 / kFlash32Threads;
 
     const auto sg = it.get_sub_group();
     const int tid = static_cast<int>(it.get_local_id(0));
@@ -516,7 +522,7 @@ PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const 
     const int64_t gq = g % a.q_blocks;
     const int64_t bh = g / a.q_blocks, qb = a.causal ? a.q_blocks - 1 - gq : gq;
     const int64_t b = bh / a.H, h = bh % a.H;
-    const int64_t q0 = qb * kFlashBlockQ;
+    const int64_t q0 = qb * kFlash32BlockQ;
     const int64_t row0 = q0 + wave * kFlashRowsPerWave;
     const float* qp = a.q + b * a.qs.s[0] + h * a.qs.s[1];
     const float* kp = a.k + b * a.ks.s[0] + (h / a.kv_group) * a.ks.s[1];
@@ -545,10 +551,10 @@ PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const 
         m_i[mt] = kNegInf; l_i[mt] = 0.f;
     }
 
-    const int64_t k_end = a.causal ? (q0 + kFlashBlockQ < a.Lk ? q0 + kFlashBlockQ : a.Lk) : a.Lk;
+    const int64_t k_end = a.causal ? (q0 + kFlash32BlockQ < a.Lk ? q0 + kFlash32BlockQ : a.Lk) : a.Lk;
     const bool has_mask = a.mf != nullptr || a.mb != nullptr;
     const int64_t msum = a.mcls == nullptr ? 0
-        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
+        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.mq_blocks + (qb >> a.mq_shift);
     const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
     for (int64_t j0 = 0; j0 < k_end; j0 += BK) {
         const signed char tile = a.mcls == nullptr
@@ -558,7 +564,7 @@ PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const 
         const bool masked = tile != kMaskZero;
 #pragma unroll
         for (int t = 0; t < kPer; ++t) {
-            const int c = tid + t * kFlashThreads;
+            const int c = tid + t * kFlash32Threads;
             const int r = c / (D / 4), c4 = (c % (D / 4)) * 4;
             const int64_t key = j0 + r;
             v4f kv, vv;
@@ -929,7 +935,7 @@ struct FlashOccupancy {};
 template <>
 struct FlashOccupancy<64> {
     static constexpr int paras_max_work_group_size = kFlashThreads;
-    static constexpr int paras_min_waves_per_eu = 3;
+    static constexpr int paras_min_waves_per_eu = 4;
 };
 
 template <typename T, int D>
@@ -954,11 +960,11 @@ void flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t gro
 template <int D>
 void flash_attention_f32(compat::Queue& queue, const FlashArgs<float>& args, int64_t groups) {
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> lds(sycl::range<1>(kFlash32LdsElems), cgh);
+        sycl::local_accessor<float, 1> lds(sycl::range<1>(flash32_lds_elems<D>()), cgh);
         const FlashArgs<float> a = args;
         cgh.template parallel_for<Flash32Kernel<D>>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kFlashThreads)),
-                              sycl::range<1>(static_cast<std::size_t>(kFlashThreads))),
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kFlash32Threads)),
+                              sycl::range<1>(static_cast<std::size_t>(kFlash32Threads))),
             [=](sycl::nd_item<1> it) { flash_block_f32<D>(a, it, &lds[0]); });
     });
 }
@@ -996,7 +1002,7 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto lopts = q.options().dtype(c10::kLong);
 
 #if PTSYCL_SDPA_GEMM_PATH
-    if (Lq > kFusedMaxQuery && Dv == D && D == 64 && q.scalar_type() == c10::kFloat) {
+    if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) && q.scalar_type() == c10::kFloat) {
         FlashArgs<float> fa{};
         fa.q = q.data_ptr<float>(); fa.k = k.data_ptr<float>(); fa.v = v.data_ptr<float>();
         fa.o = out.data_ptr<float>(); fa.lse = lse.data_ptr<float>();
@@ -1004,7 +1010,9 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
         fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
         fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
-        fa.q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
+        fa.q_blocks = (Lq + kFlash32BlockQ - 1) / kFlash32BlockQ;
+        fa.mq_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
+        fa.mq_shift = 1;
         fa.scale = sc; fa.causal = is_causal;
         MaskSummary summary;
         if (has_mask) {
@@ -1015,7 +1023,8 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             fa.mb_stride = summary.mb_stride;
             fa.mh_stride = summary.mh_stride;
         }
-        flash_attention_f32<64>(queue, fa, B * H * fa.q_blocks);
+        if (D == 64) flash_attention_f32<64>(queue, fa, B * H * fa.q_blocks);
+        else flash_attention_f32<128>(queue, fa, B * H * fa.q_blocks);
         const Tensor none = Tensor();
         return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
                 at::empty({}, lopts), at::empty({}, lopts), none};
@@ -1032,6 +1041,8 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
             fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
             fa.q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
+            fa.mq_blocks = fa.q_blocks;
+            fa.mq_shift = 0;
             fa.scale = sc; fa.causal = is_causal;
             MaskSummary summary;
             if (has_mask) {

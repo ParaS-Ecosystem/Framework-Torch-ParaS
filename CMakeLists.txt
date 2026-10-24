@@ -148,7 +148,7 @@ if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/sdpa_ops.cpp"
         "${CMAKE_BINARY_DIR}/paras_sources/csrc/ops/sdpa_ops.cpp"
-        PROPERTIES COMPILE_OPTIONS "--gpu-max-threads-per-block=256")
+        PROPERTIES COMPILE_OPTIONS "--gpu-max-threads-per-block=512")
 endif()
 
 add_library(torch_paras_C SHARED ${PTSYCL_SOURCES})

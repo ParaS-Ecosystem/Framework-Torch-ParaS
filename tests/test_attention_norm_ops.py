@@ -333,11 +333,12 @@ def test_sdpa_flash_fp32(device):
     import torch_paras
     torch.manual_seed(0)
     gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
-    cases = [(2, 3, 3, 130, 130), (1, 2, 2, 70, 200), (1, 4, 4, 257, 257), (1, 8, 2, 300, 300)]
-    for B, H, Hk, Lq, Lk in cases:
-        q = torch.randn(B, Lq, H, 64).transpose(1, 2)
-        k = torch.randn(B, Hk, Lk, 64)
-        v = torch.randn(B, Hk, Lk, 64)
+    cases = [(2, 3, 3, 130, 130, 64), (1, 2, 2, 70, 200, 64), (1, 4, 4, 257, 257, 64), (1, 8, 2, 300, 300, 64),
+             (1, 2, 2, 130, 130, 128), (1, 4, 2, 70, 211, 128)]
+    for B, H, Hk, Lq, Lk, D in cases:
+        q = torch.randn(B, Lq, H, D).transpose(1, 2)
+        k = torch.randn(B, Hk, Lk, D)
+        v = torch.randn(B, Hk, Lk, D)
         bmask = torch.rand(B, 1, Lq, Lk) > 0.3
         bmask[..., 0] = True
         fmask = torch.randn(B, 1, Lq, Lk)
