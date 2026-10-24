@@ -37,6 +37,7 @@ MODULES = [
     "test_optimizer",
     "test_graphs",
     "test_moe_ops",
+    "test_nn_device_ops",
 ]
 
 
