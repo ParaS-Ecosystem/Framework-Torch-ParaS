@@ -144,6 +144,15 @@ def test_fuse_moe_experts_keeps_parameters(device):
     assert fuse_moe_experts(m) == 0
 
 
+def test_fuse_moe_experts_releases_former_weights(device):
+    m = _model(device, torch.float32, hidden=256, inter=512, experts=16)
+    allocated = torch_paras.memory_allocated(torch.device(device))
+    fuse_moe_experts(m)
+    assert torch_paras.memory_allocated(torch.device(device)) <= allocated
+    cached = torch_paras.memory_reserved(torch.device(device)) - torch_paras.memory_allocated(torch.device(device))
+    assert cached < 3 * 16 * 512 * 256 * 4, cached
+
+
 def test_fuse_moe_experts_skips_other_layers(device):
     m = _model(device, torch.float32)
     m.experts[2].act_fn = nn.GELU()
