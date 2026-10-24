@@ -176,7 +176,9 @@ def memory_stats(device=None) -> dict:
 
 
 def get_amp_supported_dtype() -> list[torch.dtype]:
-    return [torch.float16, torch.float32]
+    """Dtypes torch.autocast(device_type="paras") accepts (the policy is
+    registered in csrc/core/autocast.cpp)."""
+    return [torch.float16, torch.bfloat16, torch.float32]
 
 
 def runtime_stats() -> dict:

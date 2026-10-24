@@ -39,6 +39,7 @@ MODULES = [
     "test_moe_ops",
     "test_nn_device_ops",
     "test_streams",
+    "test_amp",
 ]
 
 

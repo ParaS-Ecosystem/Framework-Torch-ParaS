@@ -100,6 +100,7 @@ set(PTSYCL_SOURCES
     csrc/core/graphs.cpp
     csrc/core/registration.cpp
     csrc/core/telemetry.cpp
+    csrc/core/autocast.cpp
     csrc/ops/tensor_ops.cpp
     # Python exposes CLAP status/stats even in fast builds and with CLAP disabled.
     csrc/ops/clap_dnn_adapter.cpp
