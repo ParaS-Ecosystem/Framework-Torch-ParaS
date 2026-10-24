@@ -39,8 +39,9 @@ public:
     MemoryPool(compat::Queue& queue, int device_index);
     ~MemoryPool();
 
-    void* acquire(std::size_t nbytes);
+    void* acquire(std::size_t nbytes, int stream = 0);
     void  release(void* ptr);
+    void  record_stream(void* ptr, int stream);
     void  clear();
 
     void begin_private(std::uint64_t pool);
@@ -58,6 +59,8 @@ private:
     struct Live {
         std::size_t   rounded;
         std::uint64_t pool;
+        int           stream = 0;
+        bool          shared = false;
     };
     struct Private {
         std::map<std::size_t, std::list<void*>> free_lists;
@@ -66,6 +69,7 @@ private:
     };
 
     static std::size_t round_size(std::size_t v);
+    bool capturing() const;
     void sync_before_free() noexcept;
     void release_memory(void* ptr, std::size_t rounded);
     void dealloc_locked(void* ptr, std::size_t rounded);
@@ -74,9 +78,10 @@ private:
     int            device_index_;
     bool           caching_enabled_;
     bool           debug_;
+    bool           teardown_ = false;
 
     mutable std::mutex                      mutex_;
-    std::map<std::size_t, std::list<void*>> free_lists_;
+    std::map<int, std::map<std::size_t, std::list<void*>>> free_lists_;
     std::map<void*, Live>                   live_;
     std::map<std::uint64_t, Private>        private_;
     std::uint64_t                           active_private_ = 0;

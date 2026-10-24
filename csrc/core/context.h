@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -31,9 +33,17 @@ namespace ptsycl {
 
 class MemoryPool; // allocator.h
 
+constexpr int kMaxStreams = 64;
+constexpr int kPoolStreams = 8;
+
 struct DeviceState {
     compat::DeviceInfo          info;
     compat::Queue               queue;
+    std::array<std::atomic<compat::Queue*>, kMaxStreams> streams{};
+    std::array<std::unique_ptr<compat::Queue>, kMaxStreams> owned;
+    std::mutex                  streams_mutex;
+    int                         created_streams = 1;
+    std::atomic<int>            next_pool_stream{0};
     std::unique_ptr<MemoryPool> pool;
     std::mutex                  rng_mutex;
     std::uint64_t               rng_seed     = 0x5deece66dULL;
@@ -48,6 +58,17 @@ public:
 
     DeviceState& device(int index);
     compat::Queue& queue(int index) { return device(index).queue; }
+
+    compat::Queue& stream_queue(int index, int id);
+    static int current_stream(int index);
+    static void set_current_stream(int index, int id);
+    compat::Queue& current_queue(int index) {
+        const int id = current_stream(index);
+        return id == 0 ? device(index).queue : stream_queue(index, id);
+    }
+    int pool_stream(int index);
+    int new_stream(int index);
+    int stream_count(int index);
 
    
     void synchronize(int index);

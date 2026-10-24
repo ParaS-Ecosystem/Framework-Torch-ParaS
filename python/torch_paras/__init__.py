@@ -35,6 +35,7 @@ and device N maps to the host CPU engine. In CPU-only builds, device 0 maps
 to the host CPU.
 """
 
+import contextlib
 import types
 
 import torch
@@ -60,6 +61,12 @@ __all__ = [
     "device_name",
     "backend_name",
     "get_amp_supported_dtype",
+    "Stream",
+    "Event",
+    "current_stream",
+    "default_stream",
+    "set_stream",
+    "stream",
     "runtime_stats",
     "reset_runtime_stats",
     "set_strict",
@@ -198,6 +205,47 @@ def is_strict() -> bool:
     return _C.strict()
 
 
+def _dev(device=None) -> torch.device:
+    if device is None:
+        return torch.device("paras", torch.accelerator.current_device_index())
+    d = torch.device(device) if not isinstance(device, int) else torch.device("paras", device)
+    return d if d.index is not None else torch.device("paras", 0)
+
+
+def Stream(device=None, priority: int = 0) -> torch.Stream:
+    """A new stream of a paras device (from the device's pool of streams)."""
+    return torch.Stream(device=_dev(device), priority=priority)
+
+
+def Event(enable_timing: bool = False, device=None) -> torch.Event:
+    return torch.Event(device=_dev(device), enable_timing=enable_timing)
+
+
+def current_stream(device=None) -> torch.Stream:
+    return torch.accelerator.current_stream(_dev(device))
+
+
+def default_stream(device=None) -> torch.Stream:
+    d = _dev(device)
+    cur = torch.accelerator.current_stream(d)
+    return torch.Stream(stream_id=0, device_index=d.index, device_type=cur.device_type)
+
+
+def set_stream(stream: torch.Stream) -> None:
+    torch.accelerator.set_stream(stream)
+
+
+@contextlib.contextmanager
+def stream(s: torch.Stream):
+    """Makes `s` the current stream of its device inside the block."""
+    prev = torch.accelerator.current_stream(s.device)
+    torch.accelerator.set_stream(s)
+    try:
+        yield s
+    finally:
+        torch.accelerator.set_stream(prev)
+
+
 def _register() -> None:
     torch.utils.rename_privateuse1_backend("paras")
 
@@ -215,6 +263,8 @@ def _register() -> None:
     mod.is_bad_fork = _C.is_bad_fork
     mod._is_in_bad_fork = _C.is_bad_fork
     mod.get_amp_supported_dtype = get_amp_supported_dtype
+    for fn in (Stream, Event, current_stream, default_stream, set_stream, stream):
+        setattr(mod, fn.__name__, fn)
     torch._register_device_module("paras", mod)
 
     # tensor.paras() / module.paras() / tensor.is_paras

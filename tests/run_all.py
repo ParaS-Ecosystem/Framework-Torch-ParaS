@@ -38,6 +38,7 @@ MODULES = [
     "test_graphs",
     "test_moe_ops",
     "test_nn_device_ops",
+    "test_streams",
 ]
 
 

@@ -366,6 +366,120 @@ bool Queue::run_native(const std::function<void(void* native_stream)>& fn) {
 #endif
 }
 
+namespace {
+struct EventApi {
+    int (*create)(void** event, unsigned flags) = nullptr;
+    int (*record)(void* event, void* stream) = nullptr;
+    int (*wait)(void* stream, void* event, unsigned flags) = nullptr;
+    int (*query)(void* event) = nullptr;
+    int (*synchronize)(void* event) = nullptr;
+    int (*elapsed)(float* ms, void* start, void* end) = nullptr;
+    int (*destroy)(void* event) = nullptr;
+    int (*stream_query)(void* stream) = nullptr;
+};
+
+const EventApi& event_api() {
+    static const EventApi api = [] {
+        EventApi a;
+#if PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND
+#if PARAS_HIP_BACKEND
+        const char* libs[] = {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"};
+        const char* names[] = {"hipEventCreateWithFlags", "hipEventRecord", "hipStreamWaitEvent", "hipEventQuery",
+                               "hipEventSynchronize", "hipEventElapsedTime", "hipEventDestroy", "hipStreamQuery"};
+#else
+        const char* libs[] = {"libcudart.so", "libcudart.so.12", "libcudart.so.11.0"};
+        const char* names[] = {"cudaEventCreateWithFlags", "cudaEventRecord", "cudaStreamWaitEvent", "cudaEventQuery",
+                               "cudaEventSynchronize", "cudaEventElapsedTime", "cudaEventDestroy", "cudaStreamQuery"};
+#endif
+        void* handle = nullptr;
+        for (const char* lib : libs)
+            if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+        for (const char* lib : libs)
+            if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
+        if (handle != nullptr) {
+            a.create = reinterpret_cast<decltype(a.create)>(dlsym(handle, names[0]));
+            a.record = reinterpret_cast<decltype(a.record)>(dlsym(handle, names[1]));
+            a.wait = reinterpret_cast<decltype(a.wait)>(dlsym(handle, names[2]));
+            a.query = reinterpret_cast<decltype(a.query)>(dlsym(handle, names[3]));
+            a.synchronize = reinterpret_cast<decltype(a.synchronize)>(dlsym(handle, names[4]));
+            a.elapsed = reinterpret_cast<decltype(a.elapsed)>(dlsym(handle, names[5]));
+            a.destroy = reinterpret_cast<decltype(a.destroy)>(dlsym(handle, names[6]));
+            a.stream_query = reinterpret_cast<decltype(a.stream_query)>(dlsym(handle, names[7]));
+        }
+#endif
+        return a;
+    }();
+    return api;
+}
+
+const EventApi& require_events() {
+    const EventApi& a = event_api();
+    if (!a.create || !a.record || !a.wait || !a.query || !a.synchronize || !a.elapsed || !a.destroy ||
+        !a.stream_query)
+        fail("paras events: the HIP / CUDA runtime's event API was not found");
+    return a;
+}
+
+void check_event(int rc, const char* what) {
+    if (rc != 0) {
+        std::ostringstream os;
+        os << "paras events: " << what << " failed with error " << rc;
+        fail(os.str());
+    }
+}
+}
+
+void Queue::record_event(void** event, bool timing) {
+    if (!is_gpu_) return;
+    const EventApi& api = require_events();
+    const bool ran = run_native([&](void* stream) {
+        if (*event == nullptr) check_event(api.create(event, timing ? 0u : 2u ), "event create");
+        check_event(api.record(*event, stream), "event record");
+    });
+    if (!ran) fail("paras events: the queue has no native stream");
+}
+
+void Queue::wait_event(void* event) {
+    if (!is_gpu_ || event == nullptr) return;
+    const EventApi& api = require_events();
+    run_native([&](void* stream) { check_event(api.wait(stream, event, 0), "stream wait"); });
+}
+
+bool Queue::query() {
+    if (!is_gpu_) return true;
+    const EventApi& api = require_events();
+    int rc = 0;
+    run_native([&](void* stream) { rc = api.stream_query(stream); });
+    if (rc == 600) return false;
+    check_event(rc, "stream query");
+    return true;
+}
+
+bool Queue::event_query(void* event) {
+    if (event == nullptr) return true;
+    const int rc = require_events().query(event);
+    if (rc == 600) return false;
+    check_event(rc, "event query");
+    return true;
+}
+
+void Queue::event_synchronize(void* event) {
+    if (event != nullptr) check_event(require_events().synchronize(event), "event synchronize");
+}
+
+float Queue::event_elapsed_ms(void* start, void* end) {
+    if (start == nullptr || end == nullptr) fail("paras events: elapsed time of an event that was never recorded");
+    float ms = 0.f;
+    check_event(require_events().elapsed(&ms, start, end), "event elapsed time (both events need timing)");
+    return ms;
+}
+
+void Queue::event_destroy(void* event) noexcept {
+    if (event == nullptr) return;
+    const EventApi& api = event_api();
+    if (api.destroy != nullptr) api.destroy(event);
+}
+
 bool Queue::graphs_supported() {
 #if defined(PTSYCL_HAVE_GRAPHS)
     return true;

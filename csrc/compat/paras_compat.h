@@ -106,6 +106,14 @@ public:
 
     bool run_native(const std::function<void(void* native_stream)>& fn);
 
+    void record_event(void** event, bool timing);
+    void wait_event(void* event);
+    static bool event_query(void* event);
+    bool query();
+    static void event_synchronize(void* event);
+    static float event_elapsed_ms(void* start, void* end);
+    static void event_destroy(void* event) noexcept;
+
     static bool graphs_supported();
     bool capturing() const { return capturing_; }
     void begin_capture();
