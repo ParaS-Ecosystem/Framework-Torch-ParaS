@@ -8,6 +8,8 @@ import unittest
 import torch
 from torch import nn
 import torch_paras
+
+from common import fast_kernels
 from torch_paras import graphs
 from torch_paras.optimizer import fuse_moe_experts
 
@@ -191,8 +193,8 @@ def test_moe_experts_needs_no_grad(device):
 
 
 def test_moe_experts_graph_capture(device):
-    if not torch_paras.is_gpu_device(torch.device(device).index or 0):
-        raise unittest.SkipTest("graphs capture GPU devices")
+    if not fast_kernels(device):
+        raise unittest.SkipTest("the device path (capturable) needs the AMD wavefront kernels")
     if not graphs.is_supported():
         raise unittest.SkipTest("ParaS without record-and-replay command graphs")
     m = _model(device, torch.bfloat16)
@@ -354,3 +356,53 @@ def test_transformers_moe_models_without_graph_break(device):
         torch._dynamo.reset()
         assert _rel(got, ref) < 1e-4, (name, _rel(got, ref))
         assert ex.graph_break_count == 0, (name, [str(b.reason).splitlines()[0] for b in ex.break_reasons])
+
+
+def test_moe_experts_grouped_gemm(device):
+    if not fast_kernels(device):
+        raise unittest.SkipTest("the grouped GEMM runs on AMD matrix cores")
+    for dtype in (torch.bfloat16, torch.float16):
+        m = _model(device, dtype, hidden=256, inter=128, experts=8, k=2)
+        original = m.moe_infer
+        fuse_moe_experts(m)
+        for tokens, skew in ((400, False), (1000, False), (700, True)):
+            ids, w = _routing(tokens, 8, 2, device)
+            if skew:
+                bias = torch.zeros(8)
+                bias[5], bias[3] = 2.0, -float("inf")
+                ids = (torch.rand(tokens, 8) + bias).topk(2, dim=-1).indices.to(device)
+            x = torch.randn(tokens, 256).to(device, dtype)
+            with torch.no_grad():
+                torch_paras.reset_runtime_stats()
+                got = m.moe_infer(x, ids, w)
+                reads = torch_paras.runtime_stats().get("device_to_host_copies", 0)
+                ref = original(x, ids, w)
+            assert reads == 0, (dtype, tokens, "host reads", reads)
+            err = _rel(got, ref)
+            assert err < 1e-2, f"{dtype} tokens={tokens} skew={skew}: relative error {err}"
+
+
+def test_moe_experts_grouped_gemm_graph_capture(device):
+    if not fast_kernels(device):
+        raise unittest.SkipTest("the grouped GEMM runs on AMD matrix cores")
+    if not graphs.is_supported():
+        raise unittest.SkipTest("ParaS without record-and-replay command graphs")
+    m = _model(device, torch.bfloat16, hidden=256, inter=128, experts=8, k=2)
+    original = m.moe_infer
+    fuse_moe_experts(m)
+    ids, w = _routing(600, 8, 2, device)
+    x = torch.randn(600, 256).to(device, torch.bfloat16)
+    with torch.no_grad():
+        m.moe_infer(x, ids, w)
+        g = graphs.Graph()
+        with graphs.graph(g, device=device):
+            out = m.moe_infer(x, ids, w)
+        for _ in range(2):
+            new_ids, new_w = _routing(600, 8, 2, device)
+            new_x = torch.randn(600, 256).to(device, torch.bfloat16)
+            ids.copy_(new_ids)
+            w.copy_(new_w)
+            x.copy_(new_x)
+            g.replay()
+            assert _rel(out, original(new_x, new_ids, new_w)) < 1e-2
+    g.reset()

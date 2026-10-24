@@ -214,6 +214,189 @@ void moe_expert_gemv(compat::Queue& q, const int32_t* meta, int64_t S, const T* 
     });
 }
 
+constexpr int kGmThreads = 256;
+constexpr int kGmRows = 128;
+constexpr int kGmK = 32;
+constexpr int kGmLd = kGmK + 8;
+
+template <bool GateUp>
+constexpr int gm_cols() { return GateUp ? kGmRows / 2 : kGmRows; }
+
+template <typename T>
+struct MoeGemmArgs {
+    const int32_t* meta;
+    int64_t S;
+    const T* X;
+    int64_t ldx, div;
+    const T* W0;
+    int64_t es0;
+    const T* W1;
+    int64_t es1;
+    int64_t N, Kd;
+    T* out;
+    int64_t col_tiles;
+};
+
+template <typename T, bool GateUp, typename Item>
+PTSYCL_HOST_DEVICE inline void moe_gemm_block(const MoeGemmArgs<T>& a, const Item& it, unsigned short* lds) {
+#if PTSYCL_MFMA_DEVICE
+    typedef short v4s __attribute__((ext_vector_type(4)));
+    typedef _Float16 v4h __attribute__((ext_vector_type(4)));
+    typedef float v4f __attribute__((ext_vector_type(4)));
+    typedef unsigned short v8u __attribute__((ext_vector_type(8)));
+    constexpr bool kBf16 = std::is_same_v<T, c10::BFloat16>;
+    constexpr int kCols = gm_cols<GateUp>();
+    auto mfma = [](v4s x, v4s y, v4f c) -> v4f {
+        if constexpr (kBf16) {
+            return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(x, y, c, 0, 0, 0);
+        } else {
+            v4h hx, hy;
+            __builtin_memcpy(&hx, &x, sizeof(hx));
+            __builtin_memcpy(&hy, &y, sizeof(hy));
+            return __builtin_amdgcn_mfma_f32_16x16x16f16(hx, hy, c, 0, 0, 0);
+        }
+    };
+    const int64_t g = static_cast<int64_t>(it.get_group(0));
+    const int64_t ct = g % a.col_tiles;
+    int64_t rt = g / a.col_tiles;
+    int64_t s = 0;
+    for (; s < a.S; ++s) {
+        const int32_t cnt = a.meta[2 * a.S + s];
+        const int64_t tiles = (cnt + kGmRows - 1) / kGmRows;
+        if (rt < tiles) break;
+        rt -= tiles;
+    }
+    if (s >= a.S || a.meta[s] < 0) return;
+    const int32_t e = a.meta[s];
+    const int32_t count = a.meta[2 * a.S + s];
+    const int32_t* routes = a.meta + 3 * a.S + a.meta[a.S + s];
+    const int64_t m0 = rt * kGmRows, n0 = ct * kCols;
+
+    const int tid = static_cast<int>(it.get_local_id(0));
+    const int lane = tid % 64, wave = tid / 64;
+    const int lr = lane % 16, lg = lane / 16;
+    const T* asrc[2];
+    const T* bsrc[2];
+    int arow[2], acol[2];
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const int c = tid + t * kGmThreads;
+        arow[t] = c / (kGmK / 8);
+        acol[t] = (c % (kGmK / 8)) * 8;
+        const int64_t m = m0 + arow[t] < count ? m0 + arow[t] : m0;
+        asrc[t] = a.X + (static_cast<int64_t>(routes[m]) / a.div) * a.ldx + acol[t];
+        const int j = arow[t];
+        if constexpr (GateUp) {
+            const int64_t n = n0 + (j % kCols);
+            bsrc[t] = (j < kCols ? a.W0 + e * a.es0 : a.W1 + e * a.es1) + n * a.Kd + acol[t];
+        } else {
+            bsrc[t] = a.W0 + e * a.es0 + (n0 + j) * a.Kd + acol[t];
+        }
+    }
+    unsigned short* alds = lds;
+    unsigned short* blds = lds + kGmRows * kGmLd;
+    v8u areg[2], breg[2];
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        areg[t] = *reinterpret_cast<const v8u*>(asrc[t]);
+        breg[t] = *reinterpret_cast<const v8u*>(bsrc[t]);
+    }
+    v4f acc[2][8];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = v4f{0.f, 0.f, 0.f, 0.f};
+
+    for (int64_t k0 = 0; k0 < a.Kd; k0 += kGmK) {
+        sycl::group_barrier(it.get_group());
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            *reinterpret_cast<v8u*>(alds + arow[t] * kGmLd + acol[t]) = areg[t];
+            *reinterpret_cast<v8u*>(blds + arow[t] * kGmLd + acol[t]) = breg[t];
+        }
+        sycl::group_barrier(it.get_group());
+        if (k0 + kGmK < a.Kd) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                areg[t] = *reinterpret_cast<const v8u*>(asrc[t] + k0 + kGmK);
+                breg[t] = *reinterpret_cast<const v8u*>(bsrc[t] + k0 + kGmK);
+            }
+        }
+#pragma unroll
+        for (int ks = 0; ks < kGmK / 16; ++ks) {
+            v4s av[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+                av[i] = *reinterpret_cast<const v4s*>(alds + (wave * 32 + i * 16 + lr) * kGmLd + ks * 16 + lg * 4);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const v4s bv = *reinterpret_cast<const v4s*>(blds + (j * 16 + lr) * kGmLd + ks * 16 + lg * 4);
+#pragma unroll
+                for (int i = 0; i < 2; ++i) acc[i][j] = mfma(av[i], bv, acc[i][j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const int64_t m = m0 + wave * 32 + i * 16 + lg * 4 + v;
+            if (m >= count) continue;
+            T* orow = a.out + static_cast<int64_t>(routes[m]) * a.N + n0;
+            if constexpr (GateUp) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float gt = static_cast<float>(static_cast<T>(acc[i][j][v]));
+                    const T act = static_cast<T>(gt / (1.f + ::expf(-gt)));
+                    const T up = static_cast<T>(acc[i][j + 4][v]);
+                    orow[j * 16 + lr] = static_cast<T>(static_cast<double>(act) * static_cast<double>(up));
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) orow[j * 16 + lr] = static_cast<T>(acc[i][j][v]);
+            }
+        }
+#endif
+}
+
+template <typename T, bool GateUp> class MoeGemmKernel;
+
+struct MoeGemmOccupancy {
+    static constexpr int paras_max_work_group_size = kGmThreads;
+};
+
+template <typename T, bool GateUp>
+struct MoeGemmFunctor : MoeGemmOccupancy {
+    MoeGemmArgs<T> a;
+    sycl::local_accessor<unsigned short, 1> lds;
+    PTSYCL_HOST_DEVICE void operator()(sycl::nd_item<1> it) const { moe_gemm_block<T, GateUp>(a, it, &lds[0]); }
+};
+
+template <typename T, bool GateUp>
+void moe_expert_gemm(compat::Queue& q, const int32_t* meta, int64_t S, int64_t R, const T* X, int64_t ldx,
+                     int64_t div, const T* W0, int64_t es0, const T* W1, int64_t es1, int64_t N, int64_t Kd,
+                     T* out) {
+    const int64_t col_tiles = N / gm_cols<GateUp>();
+    const int64_t row_tiles = (R + kGmRows - 1) / kGmRows + S;
+    const MoeGemmArgs<T> args{meta, S, X, ldx, div, W0, es0, W1, es1, N, Kd, out, col_tiles};
+    q.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<unsigned short, 1> lds(sycl::range<1>(2 * kGmRows * kGmLd), cgh);
+        const MoeGemmFunctor<T, GateUp> f{{}, args, lds};
+        cgh.template parallel_for<MoeGemmKernel<T, GateUp>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(row_tiles * col_tiles * kGmThreads)),
+                              sycl::range<1>(kGmThreads)),
+            f);
+    });
+}
+
+constexpr int64_t kMoeGroupedRoutes = 8;
+
+bool moe_grouped_ok(const Tensor& x, int64_t H, int64_t I) {
+    const auto st = x.scalar_type();
+    return queue_for(x).mfma() && (st == c10::kBFloat16 || st == c10::kHalf) && H % kGmK == 0 && I % kGmK == 0 &&
+           I % gm_cols<true>() == 0 && H % gm_cols<false>() == 0;
+}
+
 template <typename T, typename WT>
 void moe_combine(compat::Queue& q, const T* y, const int64_t* ids, const WT* w, int64_t Tn,
                  int64_t K, int64_t H, int64_t E, T* out) {
@@ -243,9 +426,11 @@ bool device_path(const Tensor& x, const Tensor& ids, const Tensor& w, const Tens
                  const Tensor& w_up, const Tensor& w_down) {
     if (x.device().type() != c10::DeviceType::PrivateUse1) return false;
     auto& q = queue_for(x);
-    if (!q.is_gpu()) return false;
+    if (!q.wave64()) return false;
     const int64_t R = ids.numel(), E = w_gate.size(0);
-    if (R == 0 || R > kMoeDeviceMaxRoutes || (R > kMoeDeviceRoutes && !q.capturing())) return false;
+    if (R == 0) return false;
+    const bool grouped = moe_grouped_ok(x, w_gate.size(2), w_gate.size(1)) && R >= kMoeGroupedRoutes;
+    if (!grouped && (R > kMoeDeviceMaxRoutes || (R > kMoeDeviceRoutes && !q.capturing()))) return false;
     const auto st = x.scalar_type();
     if (!(st == c10::kBFloat16 || st == c10::kHalf || st == c10::kFloat)) return false;
     if (w.scalar_type() != st && w.scalar_type() != c10::kFloat) return false;
@@ -274,15 +459,29 @@ Tensor moe_experts_device(const Tensor& x, const Tensor& ids, const Tensor& w, c
     int32_t* pm = data_ptr<int32_t>(meta);
     const int64_t* pid = data_ptr<int64_t>(ids);
     moe_routes(q, pid, R, E, S, pm);
+    const bool grouped = moe_grouped_ok(x, H, I) && R >= kMoeGroupedRoutes;
     AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, x.scalar_type(), "paras_moe_experts", [&] {
         if constexpr (!std::is_same_v<scalar_t, double>) {
-            moe_expert_gemv<scalar_t, true>(q, pm, S, data_ptr<scalar_t>(x), H, K,
-                                            data_ptr<scalar_t>(w_gate), w_gate.stride(0),
-                                            data_ptr<scalar_t>(w_up), w_up.stride(0), I, H,
-                                            data_ptr<scalar_t>(h));
-            moe_expert_gemv<scalar_t, false>(q, pm, S, data_ptr<scalar_t>(h), I, 1,
-                                             data_ptr<scalar_t>(w_down), w_down.stride(0), nullptr, 0,
-                                             H, I, data_ptr<scalar_t>(y));
+            constexpr bool k16 = !std::is_same_v<scalar_t, float>;
+            if (k16 && grouped) {
+                if constexpr (k16) {
+                    moe_expert_gemm<scalar_t, true>(q, pm, S, R, data_ptr<scalar_t>(x), H, K,
+                                                    data_ptr<scalar_t>(w_gate), w_gate.stride(0),
+                                                    data_ptr<scalar_t>(w_up), w_up.stride(0), I, H,
+                                                    data_ptr<scalar_t>(h));
+                    moe_expert_gemm<scalar_t, false>(q, pm, S, R, data_ptr<scalar_t>(h), I, 1,
+                                                     data_ptr<scalar_t>(w_down), w_down.stride(0), nullptr, 0,
+                                                     H, I, data_ptr<scalar_t>(y));
+                }
+            } else {
+                moe_expert_gemv<scalar_t, true>(q, pm, S, data_ptr<scalar_t>(x), H, K,
+                                                data_ptr<scalar_t>(w_gate), w_gate.stride(0),
+                                                data_ptr<scalar_t>(w_up), w_up.stride(0), I, H,
+                                                data_ptr<scalar_t>(h));
+                moe_expert_gemv<scalar_t, false>(q, pm, S, data_ptr<scalar_t>(h), I, 1,
+                                                 data_ptr<scalar_t>(w_down), w_down.stride(0), nullptr, 0,
+                                                 H, I, data_ptr<scalar_t>(y));
+            }
             if (w.scalar_type() == c10::kFloat)
                 moe_combine<scalar_t, float>(q, data_ptr<scalar_t>(y), pid, data_ptr<float>(w), T, K, H, E,
                                              data_ptr<scalar_t>(out));
