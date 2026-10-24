@@ -75,10 +75,7 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
         return false;
 #endif
     }
-    if (at::GradMode::is_enabled() &&
-        (needs_grad(q) || needs_grad(k) || needs_grad(v) ||
-         (mask.has_value() && needs_grad(*mask))))
-        return false;
+    if (at::GradMode::is_enabled() && mask.has_value() && needs_grad(*mask)) return false;
     if (mask.has_value() && mask->defined()) {
         const Tensor& m = *mask;
         if (m.scalar_type() != c10::kBool && m.scalar_type() != dt) return false;
@@ -942,7 +939,7 @@ template <typename T, int D>
 struct FlashFunctor : FlashOccupancy<D> {
     FlashArgs<T> a;
     sycl::local_accessor<unsigned short, 1> lds;
-    void operator()(sycl::nd_item<1> it) const { flash_block<T, D>(a, it, &lds[0]); }
+    PTSYCL_HOST_DEVICE void operator()(sycl::nd_item<1> it) const { flash_block<T, D>(a, it, &lds[0]); }
 };
 
 template <typename T, int D>
@@ -1207,6 +1204,65 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             at::empty({}, lopts), at::empty({}, lopts), none};
 }
 
+constexpr int64_t kBackwardScoreBytes = int64_t{1} << 30;
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> fused_attention_backward(
+    const Tensor& grad_out, const Tensor& query, const Tensor& key, const Tensor& value,
+    const Tensor& attn_bias, std::array<bool, 4> grad_input_mask, const Tensor& out,
+    const Tensor& logsumexp, const Tensor& , const Tensor& , int64_t ,
+    int64_t , double dropout_p, bool is_causal, const Tensor& ,
+    const Tensor& , std::optional<double> scale) {
+    PTSYCL_TRACE_OP("_scaled_dot_product_fused_attention_overrideable_backward");
+    TORCH_CHECK(dropout_p == 0.0, "paras fused attention backward: dropout is not supported");
+    const int64_t B = query.size(0), H = query.size(1), Lq = query.size(2), D = query.size(3);
+    const int64_t Hk = key.size(1), Lk = key.size(2), Dv = value.size(3);
+    const int64_t G = H / Hk;
+    const double sc = scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(D));
+    const auto f32 = query.options().dtype(c10::kFloat);
+    const Tensor q = query.to(c10::kFloat), k = key.to(c10::kFloat), v = value.to(c10::kFloat);
+    const Tensor dO = grad_out.to(c10::kFloat), O = out.to(c10::kFloat);
+    const Tensor lse = logsumexp.to(c10::kFloat).view({B, H, Lq});
+    const bool has_bias = attn_bias.defined();
+    const Tensor bias = has_bias ? attn_bias.expand({B, H, Lq, Lk}) : Tensor();
+    Tensor dq = at::zeros({B, H, Lq, D}, f32), dk = at::zeros({B, Hk, Lk, D}, f32),
+           dv = at::zeros({B, Hk, Lk, Dv}, f32);
+    Tensor dbias = grad_input_mask[3] && has_bias && attn_bias.is_floating_point()
+                       ? at::zeros({B, H, Lq, Lk}, f32) : Tensor();
+    const Tensor causal = is_causal ? at::ones({Lq, Lk}, query.options().dtype(c10::kBool)).triu(1) : Tensor();
+    const int64_t per_head = Lq * Lk * static_cast<int64_t>(sizeof(float)) * 3;
+    const int64_t chunk = std::max<int64_t>(1, std::min<int64_t>(H, kBackwardScoreBytes / std::max<int64_t>(per_head, 1)));
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t h0 = 0; h0 < H; h0 += chunk) {
+            const int64_t hn = std::min(chunk, H - h0);
+            const Tensor heads = at::arange(h0, h0 + hn, query.options().dtype(c10::kLong));
+            const Tensor kv_heads = at::floor_divide(heads, G);
+            const Tensor qc = q[b].narrow(0, h0, hn);
+            const Tensor kc = k[b].index_select(0, kv_heads), vc = v[b].index_select(0, kv_heads);
+            const Tensor dOc = dO[b].narrow(0, h0, hn), Oc = O[b].narrow(0, h0, hn);
+            Tensor S = at::bmm(qc, kc.transpose(1, 2)).mul_(sc);
+            if (has_bias) {
+                const Tensor bc = bias[b].narrow(0, h0, hn);
+                if (bc.scalar_type() == c10::kBool) S.masked_fill_(bc.logical_not(), -std::numeric_limits<float>::infinity());
+                else S.add_(bc.to(c10::kFloat));
+            }
+            if (is_causal) S.masked_fill_(causal, -std::numeric_limits<float>::infinity());
+            const Tensor l = lse[b].narrow(0, h0, hn).unsqueeze(-1);
+            Tensor P = (S - l).exp_().masked_fill_(l.isneginf().expand_as(S), 0.0);
+            if (grad_input_mask[2]) dv[b].index_add_(0, kv_heads, at::bmm(P.transpose(1, 2), dOc));
+            Tensor dS = at::bmm(dOc, vc.transpose(1, 2));
+            dS.sub_((dOc * Oc).sum(-1, true)).mul_(P);
+            if (dbias.defined()) dbias[b].narrow(0, h0, hn).copy_(dS);
+            if (grad_input_mask[0]) dq[b].narrow(0, h0, hn).copy_(at::bmm(dS, kc).mul_(sc));
+            if (grad_input_mask[1]) dk[b].index_add_(0, kv_heads, at::bmm(dS.transpose(1, 2), qc).mul_(sc));
+        }
+    }
+    Tensor gb;
+    if (dbias.defined()) gb = dbias.sum_to_size(attn_bias.sizes()).to(attn_bias.scalar_type());
+    return {grad_input_mask[0] ? dq.to(query.scalar_type()) : Tensor(),
+            grad_input_mask[1] ? dk.to(key.scalar_type()) : Tensor(),
+            grad_input_mask[2] ? dv.to(value.scalar_type()) : Tensor(), gb};
+}
+
 Tensor paras_sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
                   const std::optional<Tensor>& mask, double scale, bool is_causal) {
     PTSYCL_TRACE_OP("paras::sdpa");
@@ -1224,6 +1280,7 @@ TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::_fused_sdp_choice", &fused_sdp_choice);
+    m.impl("aten::_scaled_dot_product_fused_attention_overrideable_backward", &fused_attention_backward);
     m.impl("aten::_scaled_dot_product_fused_attention_overrideable",
            &fused_attention);
 }
