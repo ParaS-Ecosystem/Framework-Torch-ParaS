@@ -12,14 +12,14 @@ Counted from the `TORCH_LIBRARY_IMPL` blocks in `csrc/ops/*.cpp`
 
 | | Count |
 |---|---|
-| aten registrations, `PrivateUse1` | 236 |
+| aten registrations, `PrivateUse1` | 234 |
 | aten registrations, `AutogradPrivateUse1` | 0 |
-| **Total aten kernel registrations** | **237** |
-| Distinct aten operators (overloads collapsed, e.g. `sort` / `sort.stable`) | 184 |
+| **Total aten kernel registrations** | **235** |
+| Distinct aten operators (overloads collapsed, e.g. `sort` / `sort.stable`) | 182 |
 | Custom ops, `paras::` namespace (`fused_ops.cpp`) | 8 |
 | Custom ops, `torch_paras::` namespace (`rms_swiglu_ops.cpp`, also registered for CPU) | 1 |
 | Custom op `paras::moe_experts` (`moe_ops.cpp`, also registered for CPU) | 1 |
-| **Total native ops** | **247** |
+| **Total native ops** | **245** |
 
 CompositeImplicitAutograd operators (`linear`, `matmul`, `reshape`,
 `contiguous`, `repeat_interleave`, `rms_norm`) are deliberately **not**
@@ -38,7 +38,7 @@ Everything else goes through the boxed CPU fallback registered in
 | File | aten | custom | Total |
 |---|---|---|---|
 | `pointwise_ops.cpp` | 126 | — | 126 |
-| `tensor_ops.cpp` | 30 | — | 30 |
+| `tensor_ops.cpp` | 28 | — | 28 |
 | `indexing_ops.cpp` | 21 | — | 21 |
 | `vision_ops.cpp` | 19 | — | 19 |
 | `scatter_ops.cpp` | 12 | — | 12 |
@@ -50,7 +50,8 @@ Everything else goes through the boxed CPU fallback registered in
 | `sdpa_ops.cpp` | 2 | — | 2 |
 | `sort_ops.cpp` | 2 | — | 2 |
 | `rms_swiglu_ops.cpp` | — | 1 | 1 |
-| **Total** | **237** | **9** | **246** |
+| `moe_ops.cpp` | — | 1 | 1 |
+| **Total** | **235** | **10** | **245** |
 
 ## Status Legend
 
@@ -66,7 +67,7 @@ Everything else goes through the boxed CPU fallback registered in
 
 | Category | Kernels | Status | Tested | Test file | Notes |
 |---|---|---|---|---|---|
-| Tensor lifecycle & views (`empty*`, `_copy_from*`, `_to_copy`, `fill_`, `zero_`, `set_`, `resize_`, `view`, `as_strided`, `transpose`, `permute`, `expand`, `repeat*`, `split*`, `chunk`, `reshape`, `squeeze*`, `unsqueeze`, `narrow`, `slice`, `contiguous`) | 32 | Native | Yes | `test_tensor_ops.py` | Includes cross-device and strided copies |
+| Tensor lifecycle & views (`empty*`, `_copy_from*`, `_to_copy`, `fill_`, `zero_`, `set_`, `resize_`, `view`, `as_strided`, `transpose`, `permute`, `expand`, `repeat*`, `split*`, `reshape`, `squeeze*`, `unsqueeze`, `slice`, `contiguous`; `chunk` and `narrow` decompose into `split` / `slice`, keeping their derivatives) | 30 | Native | Yes | `test_tensor_ops.py` | Includes cross-device and strided copies |
 | Embedding (`embedding`, `embedding_dense_backward`) | 2 | Native | Forward only | `test_tensor_ops.py` | |
 | Creation (`zeros`, `ones`, `full`, `*_like`, `arange`) | 8 | Native | Yes | `test_matmul_sort_creation_ops.py` | `arange.start_out` lives in `pointwise_ops.cpp` |
 | Binary arithmetic (`add`, `sub`, `mul`, `div`, `maximum`, `minimum`, `addcmul`, `addcdiv`) | 11 | Native | Partial | `test_pointwise_ops.py` | `addcmul`/`addcdiv` untested |
