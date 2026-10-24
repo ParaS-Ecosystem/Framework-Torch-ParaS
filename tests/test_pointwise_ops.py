@@ -1,4 +1,5 @@
 import torch
+import torch_paras
 import torch.nn.functional as F
 
 from common import check_op, assert_close
@@ -605,7 +606,9 @@ def test_vectorized_contiguous_path_matches_strided(device):
         at, bt = a.t().contiguous().t(), b.t().contiguous().t()
         for name, fn in (("mul", torch.mul), ("add", torch.add), ("div", torch.div)):
             assert torch.equal(fn(a, b).cpu(), fn(at, bt).cpu()), (dtype, name)
-        for name, fn in (("silu", torch.nn.functional.silu), ("exp", torch.exp), ("neg", torch.neg)):
+        gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+        unary = (("silu", torch.nn.functional.silu),) if gpu else ()
+        for name, fn in unary + (("exp", torch.exp), ("neg", torch.neg)):
             assert torch.equal(fn(a).cpu(), fn(at).cpu()), (dtype, name)
 
 

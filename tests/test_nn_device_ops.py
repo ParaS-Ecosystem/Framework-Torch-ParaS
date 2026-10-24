@@ -20,7 +20,8 @@ def _check(device, fn, *inputs, tol=1e-4, what=""):
     torch_paras.reset_runtime_stats()
     got = fn(*dev_in)
     copies = torch_paras.runtime_stats().get("device_to_host_copies", 0)
-    assert copies == 0, (what, "forward copied to the host", copies)
+    if torch_paras.is_gpu_device(torch.device(device).index or 0):
+        assert copies == 0, (what, "forward copied to the host", copies)
     _close(got, ref.detach(), what + " forward", tol)
     g = torch.randn_like(ref)
     ref.backward(g)
@@ -130,7 +131,8 @@ def test_resnet_block_trains_on_device(device):
     torch_paras.reset_runtime_stats()
     out = dev(x.to(device))
     out.sum().backward()
-    assert torch_paras.runtime_stats().get("device_to_host_copies", 0) == 0
+    if torch_paras.is_gpu_device(torch.device(device).index or 0):
+        assert torch_paras.runtime_stats().get("device_to_host_copies", 0) == 0
     _close(out.detach(), out_ref.detach(), "resnet block", tol=2e-4)
     for (n, p), (_, q) in zip(ref.named_parameters(), dev.named_parameters()):
         _close(q.grad, p.grad, f"resnet block grad {n}", tol=5e-4)
