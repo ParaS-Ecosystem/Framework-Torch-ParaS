@@ -304,7 +304,7 @@ def _replayed(gm, run, example_inputs, meta, report):
     if replay.has_dynamic_shapes(example_inputs):
         replayed = replay.Split(gm, run, example_inputs, meta, report)
     else:
-        replayed = replay.Replayed(run, meta, report)
+        replayed = replay.Replayed(run, meta, report, layouts_guarded=True)
         report.replay = "replayed"
 
     def call(*args):

@@ -189,18 +189,30 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
             const scalar_t* psrc  = data_ptr<scalar_t>(source);
             const int64_t*  pidx  = data_ptr<int64_t>(idx);
 
+            const bool narrow = n <= int64_t{0x7fffffff};
             launch_flat(q, n, [=](std::size_t flat_) {
                 const int64_t flat    = static_cast<int64_t>(flat_);
                 const int64_t src_off = src_spec.index(flat);
 
-                int64_t rem = flat;
                 int64_t self_off = 0;
                 int64_t sel = 0;
-                for (int dd = ndim - 1; dd >= 0; --dd) {
-                    const int64_t c = rem % src_spec.sizes[dd];
-                    rem /= src_spec.sizes[dd];
-                    if (dd == d) sel = c;
-                    else self_off += c * self_spec.strides[dd];
+                if (narrow) {
+                    uint32_t rem = static_cast<uint32_t>(flat);
+                    for (int dd = ndim - 1; dd >= 0; --dd) {
+                        const uint32_t sz = static_cast<uint32_t>(src_spec.sizes[dd]);
+                        const uint32_t c = rem % sz;
+                        rem /= sz;
+                        if (dd == d) sel = c;
+                        else self_off += static_cast<int64_t>(c) * self_spec.strides[dd];
+                    }
+                } else {
+                    int64_t rem = flat;
+                    for (int dd = ndim - 1; dd >= 0; --dd) {
+                        const int64_t c = rem % src_spec.sizes[dd];
+                        rem /= src_spec.sizes[dd];
+                        if (dd == d) sel = c;
+                        else self_off += c * self_spec.strides[dd];
+                    }
                 }
                 self_off += pidx[sel] * self_dim_stride;
                 pself[self_off] = psrc[src_off];

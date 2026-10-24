@@ -555,6 +555,34 @@ def test_gqa_attention_fused_and_exact(device):
             assert torch.equal(out.cpu(), ref.cpu()), (Lq, Lk)
 
 
+def test_gqa_attention_through_contiguous(device):
+    torch.manual_seed(0)
+
+    def attend(q, k, v, mask):
+        return F.scaled_dot_product_attention(q.contiguous(), _repeat_kv(k, 4).contiguous(),
+                                              _repeat_kv(v, 4).contiguous(), attn_mask=mask)
+
+    def attend_shared(q, k, v, mask):
+        kk = _repeat_kv(k, 4).contiguous()
+        return F.scaled_dot_product_attention(q, kk, _repeat_kv(v, 4).contiguous(), attn_mask=mask), kk.sum()
+
+    with torch.no_grad():
+        q = torch.randn(1, 8, 1, 64, device=device, dtype=torch.bfloat16)
+        k = torch.randn(1, 2, 77, 64, device=device, dtype=torch.bfloat16)
+        v = torch.randn(1, 2, 77, 64, device=device, dtype=torch.bfloat16)
+        mask = torch.zeros(1, 1, 1, 77, device=device, dtype=torch.bfloat16)
+        _reset()
+        ref = attend(q, k, v, mask)
+        out = torch_paras.compile(attend)(q, k, v, mask)
+        assert _fusions().get("gqa_attention") == 1, _fusions()
+        assert torch.equal(out.cpu(), ref.cpu())
+        _reset()
+        ref = attend_shared(q, k, v, mask)
+        out = torch_paras.compile(attend_shared)(q, k, v, mask)
+        assert _fusions().get("gqa_attention") is None, _fusions()
+        assert torch.equal(out[0].cpu(), ref[0].cpu())
+
+
 def test_sdpa_bool_mask_fused_and_exact(device):
     torch.manual_seed(0)
 
@@ -617,6 +645,34 @@ def test_rope_fused_and_exact(device):
             out = torch_paras.compile(_apply_partial_rope)(q, cos[..., :32], sin[..., :32])
         assert _fusions().get("rope") == 1, _fusions()
         assert torch.equal(out.cpu(), ref.cpu()), dtype
+
+
+def test_rope_index_copy_fused_and_exact(device):
+    torch.manual_seed(0)
+
+    def step(k_cache, v_cache, pos, q, k, v, cos, sin):
+        q, k = _apply_rope(q, k, cos, sin)
+        k_cache.index_copy_(2, pos, k.to(torch.bfloat16))
+        v_cache.index_copy_(2, pos, v.to(torch.bfloat16))
+        return q * 1
+
+    for L in (1, 3):
+        _reset()
+        args = [torch.randn(1, 4, 16, 64, device=device, dtype=torch.bfloat16) for _ in range(2)]
+        pos = torch.tensor([5, 9, 2][:L], device=device)
+        q = torch.randn(1, 8, L, 64, device=device, dtype=torch.bfloat16)
+        k = torch.randn(1, L, 4, 64, device=device, dtype=torch.bfloat16).transpose(1, 2)
+        v = torch.randn(1, 4, L, 64, device=device, dtype=torch.bfloat16)
+        cos = torch.randn(1, L, 64, device=device, dtype=torch.bfloat16)
+        sin = torch.randn(1, L, 64, device=device, dtype=torch.bfloat16)
+        ref_caches = [t.clone() for t in args]
+        with torch.no_grad():
+            ref_q = step(*ref_caches, pos, q, k, v, cos, sin)
+            got_q = torch_paras.compile(step)(*args, pos, q, k, v, cos, sin)
+        assert _fusions().get("rope_index_copy") == 1, _fusions()
+        assert torch.equal(got_q.cpu(), ref_q.cpu())
+        for g, r in zip(args, ref_caches):
+            assert torch.equal(g.cpu(), r.cpu()), L
 
 
 def test_rope_training_gradient(device):

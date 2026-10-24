@@ -805,7 +805,7 @@ constexpr int kDecodeThreads = 256;
 constexpr int64_t kDecodeMaxKeys = 8192;
 constexpr int64_t kDecodeMaxDim = 256;
 
-template <typename T, bool Vec> class DecodeAttentionKernel;
+template <typename T, bool Vec, bool VecV> class DecodeAttentionKernel;
 
 template <typename T>
 struct alignas(sizeof(T) * 8) DecodeChunk {
@@ -834,7 +834,7 @@ struct DecodeSum {
     PTSYCL_HOST_DEVICE float operator()(float a, float b) const { return a + b; }
 };
 
-template <typename T, bool Vec>
+template <typename T, bool Vec, bool VecV>
 void decode_attention(compat::Queue& queue, const T* pq, const T* pk, const T* pv, T* po,
                       float* L, const bool* pmb, const T* pmf, Strides4 qs, Strides4 ks,
                       Strides4 vs, Strides4 os, Strides4 ms, int64_t rows, int64_t Lq,
@@ -846,8 +846,8 @@ void decode_attention(compat::Queue& queue, const T* pq, const T* pk, const T* p
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> s_lds(sycl::range<1>(static_cast<std::size_t>(Lk)), cgh);
         sycl::local_accessor<float, 1> q_lds(sycl::range<1>(static_cast<std::size_t>(D)), cgh);
-        sycl::local_accessor<float, 1> r_lds(sycl::range<1>(kDecodeThreads), cgh);
-        cgh.template parallel_for<DecodeAttentionKernel<T, Vec>>(
+        sycl::local_accessor<float, 1> r_lds(sycl::range<1>(VecV ? kDecodeThreads * 8 : kDecodeThreads), cgh);
+        cgh.template parallel_for<DecodeAttentionKernel<T, Vec, VecV>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kDecodeThreads)),
                               sycl::range<1>(kDecodeThreads)),
             [=](sycl::nd_item<1> it) {
@@ -898,19 +898,36 @@ void decode_attention(compat::Queue& queue, const T* pq, const T* pk, const T* p
                 }
                 sum = decode_block_reduce(it, rd, sum, DecodeSum{});
 
-                const int64_t d = tid % Dv, slice = tid / Dv;
-                float acc = 0.f;
-                if (slice < slices) {
-                    const T* vd = pv + b * vs.s[0] + (h / G) * vs.s[1] + d * vs.s[3];
-                    for (int64_t j = slice; j < Lk; j += slices)
-                        acc += S[j] * static_cast<float>(vd[j * vs.s[2]]);
-                }
-                rd[tid] = acc;
-                sycl::group_barrier(it.get_group());
                 const bool empty = m == kNegInf;
+                int64_t nsl = slices;
+                if constexpr (VecV) {
+                    const int64_t cols8 = Dv / 8, vslices = kDecodeThreads / cols8;
+                    const int64_t c = tid % cols8, slice = tid / cols8;
+                    const T* vb = pv + b * vs.s[0] + (h / G) * vs.s[1] + c * 8;
+                    float acc8[8] = {};
+                    for (int64_t j = slice; j < Lk; j += vslices) {
+                        const KC ch = *reinterpret_cast<const KC*>(vb + j * vs.s[2]);
+                        const float p = S[j];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) acc8[e] += p * static_cast<float>(ch.v[e]);
+                    }
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) rd[slice * Dv + c * 8 + e] = acc8[e];
+                    nsl = vslices;
+                } else {
+                    const int64_t d = tid % Dv, slice = tid / Dv;
+                    float acc = 0.f;
+                    if (slice < slices) {
+                        const T* vd = pv + b * vs.s[0] + (h / G) * vs.s[1] + d * vs.s[3];
+                        for (int64_t j = slice; j < Lk; j += slices)
+                            acc += S[j] * static_cast<float>(vd[j * vs.s[2]]);
+                    }
+                    rd[tid] = acc;
+                }
+                sycl::group_barrier(it.get_group());
                 if (tid < Dv) {
                     float o = 0.f;
-                    for (int64_t sl = 0; sl < slices; ++sl) o += rd[sl * Dv + tid];
+                    for (int64_t sl = 0; sl < nsl; ++sl) o += rd[sl * Dv + tid];
                     po[b * os.s[0] + h * os.s[1] + i * os.s[2] + tid * os.s[3]] =
                         static_cast<T>(empty ? 0.f : o / sum);
                 }
@@ -1112,15 +1129,20 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                                  ks.s[1] % 8 == 0 && ks.s[0] % 8 == 0 &&
                                  reinterpret_cast<std::uintptr_t>(pk) % 16 == 0 &&
                                  sizeof(scalar_t) <= 2;
-                auto run = [&](auto tag) {
-                    decode_attention<scalar_t, decltype(tag)::value>(
+                const scalar_t* pvv = data_ptr<scalar_t>(v);
+                const bool vecv = vs.s[3] == 1 && Dv % 8 == 0 && kDecodeThreads % (Dv / 8) == 0 &&
+                                  vs.s[2] % 8 == 0 && vs.s[1] % 8 == 0 && vs.s[0] % 8 == 0 &&
+                                  reinterpret_cast<std::uintptr_t>(pvv) % 16 == 0 && sizeof(scalar_t) <= 2;
+                auto run = [&](auto tag, auto vtag) {
+                    decode_attention<scalar_t, decltype(tag)::value, decltype(vtag)::value>(
                         queue, data_ptr<scalar_t>(q), pk, data_ptr<scalar_t>(v), data_ptr<scalar_t>(out),
                         lse.data_ptr<float>(), bool_mask ? mask.data_ptr<bool>() : nullptr,
                         has_mask && !bool_mask ? data_ptr<scalar_t>(mask) : nullptr,
                         qs, ks, vs, os, ms, rows, Lq, H, G, Lk, D, Dv, sc, is_causal);
                 };
-                if (vec) run(std::true_type{});
-                else run(std::false_type{});
+                if (vec && vecv) run(std::true_type{}, std::true_type{});
+                else if (vec) run(std::true_type{}, std::false_type{});
+                else run(std::false_type{}, std::false_type{});
             });
         const Tensor none = Tensor();
         return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),

@@ -268,6 +268,68 @@ Tensor rope(const Tensor& x, const Tensor& cos, const Tensor& sin) {
     return out;
 }
 
+template <typename scalar_t>
+void rope_index_copy_kernel(compat::Queue& q, const Tensor& self, int64_t d, const Tensor& idx,
+                            const Tensor& x, const Tensor& ce, const Tensor& se) {
+    const int64_t n = x.numel();
+    const int64_t D = x.size(-1), half = D / 2;
+    const auto sx = make_flat_spec(x), sc = make_flat_spec(ce), ss = make_flat_spec(se);
+    const auto src_spec = make_spec(x);
+    const auto self_spec = make_spec(self);
+    const int64_t self_dim_stride = self.stride(d);
+    const int ndim = src_spec.ndim;
+    const scalar_t* px = data_ptr<scalar_t>(x);
+    const scalar_t* pc = data_ptr<scalar_t>(ce);
+    const scalar_t* ps = data_ptr<scalar_t>(se);
+    const int64_t* pidx = data_ptr<int64_t>(idx);
+    scalar_t* pself = data_ptr<scalar_t>(self);
+    TORCH_CHECK(n <= int64_t{0x7fffffff}, "paras rope_index_copy_: more than 2^31 elements");
+    launch_flat(q, n, [=](std::size_t flat_) {
+#pragma clang fp contract(off)
+        const int64_t flat = static_cast<int64_t>(flat_);
+        const int64_t col = static_cast<int64_t>(static_cast<uint32_t>(flat) % static_cast<uint32_t>(D));
+        const int64_t partner = flat - col + (col < half ? col + half : col - half);
+        const double xv = static_cast<double>(px[sx.index(flat)]);
+        const double pv = static_cast<double>(px[sx.index(partner)]);
+        const double rot = col < half ? -pv : pv;
+        const double a = static_cast<double>(static_cast<scalar_t>(
+            xv * static_cast<double>(pc[sc.index(flat)])));
+        const double b = static_cast<double>(static_cast<scalar_t>(
+            rot * static_cast<double>(ps[ss.index(flat)])));
+        uint32_t rem = static_cast<uint32_t>(flat);
+        int64_t self_off = 0, sel = 0;
+        for (int dd = ndim - 1; dd >= 0; --dd) {
+            const uint32_t sz = static_cast<uint32_t>(src_spec.sizes[dd]);
+            const uint32_t c = rem % sz;
+            rem /= sz;
+            if (dd == d) sel = c;
+            else self_off += static_cast<int64_t>(c) * self_spec.strides[dd];
+        }
+        pself[self_off + pidx[sel] * self_dim_stride] = static_cast<scalar_t>(a + b);
+    });
+}
+
+void rope_index_copy_(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& x,
+                      const Tensor& cos, const Tensor& sin) {
+    PTSYCL_TRACE_OP("paras::rope_index_copy_");
+    TORCH_CHECK(x.dim() >= 1 && x.size(-1) % 2 == 0, "paras rope_index_copy_: the last dimension must be even");
+    TORCH_CHECK(cos.scalar_type() == x.scalar_type() && sin.scalar_type() == x.scalar_type() &&
+                    self.scalar_type() == x.scalar_type(),
+                "paras rope_index_copy_: self, x, cos and sin must share a dtype");
+    TORCH_CHECK(self.dim() == x.dim() && spec_supported(x), "paras rope_index_copy_: x must have self's rank");
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    TORCH_CHECK(index.dim() <= 1 && index.numel() == x.size(d),
+                "paras rope_index_copy_: one index per slice of x along dim");
+    for (int64_t i = 0; i < x.dim(); ++i)
+        TORCH_CHECK(i == d || x.size(i) == self.size(i), "paras rope_index_copy_: x and self differ off dim");
+    if (x.numel() == 0) return;
+    const Tensor idx = index.to(c10::kLong).contiguous().view({-1});
+    const Tensor ce = cos.expand_as(x), se = sin.expand_as(x);
+    auto& q = queue_for(self);
+    AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, x.scalar_type(), "ptsycl_rope_index_copy",
+                                    [&] { rope_index_copy_kernel<scalar_t>(q, self, d, idx, x, ce, se); });
+}
+
 std::tuple<Tensor, Tensor> rms_norm_backward(const Tensor& grad_out,
                                              const Tensor& input,
                                              const Tensor& weight,
@@ -495,6 +557,7 @@ TORCH_LIBRARY(paras, m) {
     m.def("rotate_half_backward(Tensor grad_out) -> Tensor");
     m.def("add_rms_norm(Tensor a, Tensor b, Tensor weight, float eps) -> (Tensor, Tensor, Tensor)");
     m.def("rope(Tensor x, Tensor cos, Tensor sin) -> Tensor");
+    m.def("rope_index_copy_(Tensor(a!) self, int dim, Tensor index, Tensor x, Tensor cos, Tensor sin) -> ()");
     m.def("sdpa(Tensor q, Tensor k, Tensor v, Tensor? mask, float scale, bool is_causal) -> Tensor");
 }
 
@@ -507,6 +570,7 @@ TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
     m.impl("rotate_half_backward", &ptsycl::rotate_half_backward);
     m.impl("add_rms_norm", &ptsycl::add_rms_norm);
     m.impl("rope", &ptsycl::rope);
+    m.impl("rope_index_copy_", &ptsycl::rope_index_copy_);
 }
 
 namespace ptsycl {

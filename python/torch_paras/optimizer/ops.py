@@ -76,6 +76,10 @@ def register() -> None:
     def _rope_fake(x, cos, sin):
         return torch.empty_like(x)
 
+    @torch.library.register_fake("paras::rope_index_copy_")
+    def _rope_index_copy_fake(self, dim, index, x, cos, sin):
+        return None
+
     @torch.library.register_fake("paras::sdpa")
     def _sdpa_fake(q, k, v, mask, scale, is_causal):
         if v.shape[-1] == q.shape[-1]:
