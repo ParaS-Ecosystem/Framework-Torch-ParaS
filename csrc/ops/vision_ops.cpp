@@ -430,7 +430,7 @@ bool try_small_m_gemm(const Tensor& a, const Tensor& b, Tensor& out, double alph
         return false;
     auto& q = queue_for(out);
     if (!q.is_gpu()) return false;
-#define GEMV_ROWS(MM) (std::is_same_v<scalar_t, float> \
+#define GEMV_ROWS(MM) (std::is_same_v<scalar_t, float> || !q.wave64() \
                            ? small_m_gemm<scalar_t, MM>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be) \
                            : small_m_gemm_wave<scalar_t, MM>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be))
     AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, st, "ptsycl_small_m_gemm", [&] {

@@ -2360,7 +2360,7 @@ bool foreach_norm_fused(c10::ArrayRef<Tensor> tensors, double p, c10::ScalarType
     if (tensors.empty() || p == 0.0 || std::isinf(p)) return false;
     const auto dt = tensors[0].scalar_type();
     const auto dev = tensors[0].device();
-    if (!c10::isFloatingType(dt) || !queue_for(tensors[0]).is_gpu()) return false;
+    if (!c10::isFloatingType(dt) || !queue_for(tensors[0]).wave64()) return false;
     for (const auto& t : tensors)
         if (t.scalar_type() != dt || t.device() != dev || !t.is_contiguous()) return false;
 

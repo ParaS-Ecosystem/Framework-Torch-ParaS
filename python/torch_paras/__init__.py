@@ -100,6 +100,14 @@ def is_gpu_device(device: int) -> bool:
     return _C.is_gpu_device(device)
 
 
+def device_kernel_caps(device: int) -> dict:
+    """What the device's hand-written kernels may use: ``wave_size`` (64 on
+    AMD GCN / CDNA, 32 on RDNA and NVIDIA, 1 for the host engine) and ``mfma``
+    (AMD matrix-core instructions, CDNA 2 and later). Devices without them
+    run the generic kernels and the vendor libraries instead."""
+    return dict(_C.device_kernel_caps(device))
+
+
 def synchronize(device: int | torch.device | None = None) -> None:
     """Blocks until queued work on one device (or all devices) completes."""
     if device is None:

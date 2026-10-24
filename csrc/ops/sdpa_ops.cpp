@@ -65,12 +65,13 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
     if (k.sym_size(2) == 0) return false;
     if (q.sym_size(2) > kFusedMaxQuery) {
 #if PTSYCL_SDPA_GEMM_PATH
-        if (!queue_for(q).is_gpu()) return false;
-        const bool flash = v.sym_size(3) == q.sym_size(3) &&
+        auto& qq = queue_for(q);
+        if (!qq.is_gpu()) return false;
+        const bool flash = qq.mfma() && v.sym_size(3) == q.sym_size(3) &&
                            ((dt == c10::kBFloat16 || dt == c10::kHalf)
                                 ? (q.sym_size(3) == 64 || q.sym_size(3) == 128)
                                 : (dt == c10::kFloat && q.sym_size(3) == 64));
-        if (!flash && k.sym_size(2) > kRowLanes * kRowPerLane) return false;
+        if (!flash && (!qq.wave64() || k.sym_size(2) > kRowLanes * kRowPerLane)) return false;
 #else
         return false;
 #endif
@@ -235,7 +236,7 @@ PTSYCL_HOST_DEVICE inline short flash_bits(T x) {
     return static_cast<short>(x.x);
 }
 
-#if defined(__HIP_DEVICE_COMPILE__)
+#if PTSYCL_MFMA_DEVICE
 typedef unsigned short flash_v8u __attribute__((ext_vector_type(8)));
 
 template <typename T>
@@ -303,7 +304,7 @@ __attribute__((always_inline)) PTSYCL_HOST_DEVICE inline void flash_store_kv(
 template <typename T, int D, typename Item>
 PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it,
                                            unsigned short* lds) {
-#if defined(__HIP_DEVICE_COMPILE__)
+#if PTSYCL_MFMA_DEVICE
     typedef short v4s __attribute__((ext_vector_type(4)));
     typedef _Float16 v4h __attribute__((ext_vector_type(4)));
     typedef float v4f __attribute__((ext_vector_type(4)));
@@ -499,7 +500,7 @@ template <int D> class Flash32Kernel;
 
 template <int D, typename Item>
 PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const Item& it, float* lds) {
-#if defined(__HIP_DEVICE_COMPILE__)
+#if PTSYCL_MFMA_DEVICE
     static_assert(D == 64 || D == 128, "fp32 flash kernel: head size 64 or 128");
     typedef float v4f __attribute__((ext_vector_type(4)));
     constexpr int BK = flash32_block_k<D>();
@@ -1016,7 +1017,8 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto lopts = q.options().dtype(c10::kLong);
 
 #if PTSYCL_SDPA_GEMM_PATH
-    if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) && q.scalar_type() == c10::kFloat) {
+    if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) && q.scalar_type() == c10::kFloat &&
+        queue.mfma()) {
         FlashArgs<float> fa{};
         fa.q = q.data_ptr<float>(); fa.k = k.data_ptr<float>(); fa.v = v.data_ptr<float>();
         fa.o = out.data_ptr<float>(); fa.lse = lse.data_ptr<float>();
@@ -1045,7 +1047,7 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) &&
         (q.scalar_type() == c10::kBFloat16 || q.scalar_type() == c10::kHalf) &&
-        head_offsets_fit_int(k) && head_offsets_fit_int(v)) {
+        head_offsets_fit_int(k) && head_offsets_fit_int(v) && queue.mfma()) {
         AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "ptsycl_flash_attention", [&] {
             FlashArgs<scalar_t> fa{};
             fa.q = data_ptr<scalar_t>(q); fa.k = data_ptr<scalar_t>(k); fa.v = data_ptr<scalar_t>(v);

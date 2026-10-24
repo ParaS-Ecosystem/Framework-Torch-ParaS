@@ -17,6 +17,7 @@
 // -----------------------------------------------------------------------------
 
 #if defined(PTSYCL_BACKEND_SYCL)
+#include <cctype>
 #include <sycl/sycl.hpp>
 #endif
 #include "compat/paras_compat.h"
@@ -160,6 +161,8 @@ void Queue::init(const DeviceInfo& dev) {
     if (initialized_) fail("Queue::init called twice");
     is_gpu_ = dev.is_gpu;
     native_id_ = dev.native_id;
+    wave_size_ = dev.wave_size;
+    mfma_ = dev.mfma;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
         ::setenv("PARAS_ASYNC_KERNELS", "1", 0);
@@ -189,6 +192,35 @@ sycl::queue& Queue::sycl_queue() const {
 }
 #endif
 
+#if defined(PTSYCL_BACKEND_SYCL)
+namespace {
+unsigned gfx_number(const std::string& version) {
+    const auto p = version.find("gfx");
+    if (p == std::string::npos) return 0;
+    unsigned v = 0;
+    for (std::size_t i = p + 3; i < version.size() && std::isxdigit(static_cast<unsigned char>(version[i])); ++i)
+        v = v * 16 + static_cast<unsigned>(std::stoi(std::string(1, version[i]), nullptr, 16));
+    return v;
+}
+
+void gpu_kernel_caps(const sycl::device& d, DeviceInfo& info) {
+    const auto sizes = d.get_info<sycl::info::device::sub_group_sizes>();
+    info.wave_size = sizes.empty() ? 64 : static_cast<int>(sizes.front());
+#if PARAS_HIP_BACKEND
+    const unsigned gfx = gfx_number(d.get_info<sycl::info::device::version>());
+    info.mfma = info.wave_size == 64 && (gfx == 0x90a || (gfx >= 0x940 && gfx <= 0x95f));
+#else
+    info.mfma = false;
+#endif
+    const char* generic = std::getenv("PTSYCL_GENERIC_KERNELS");
+    if (generic != nullptr && std::string(generic) == "1") {
+        info.wave_size = 32;
+        info.mfma = false;
+    }
+}
+}
+#endif
+
 std::vector<DeviceInfo> enumerate_devices() {
 
     std::vector<DeviceInfo> out;
@@ -208,6 +240,7 @@ std::vector<DeviceInfo> enumerate_devices() {
         gpu.compute_units = static_cast<int>(gpus[i].get_info<sycl::info::device::max_compute_units>());
         gpu.global_mem    = gpus[i].get_info<sycl::info::device::global_mem_size>();
         gpu.fp64          = true;
+        gpu_kernel_caps(gpus[i], gpu);
 
         table.push_back(gpus[i]);
         out.push_back(std::move(gpu));

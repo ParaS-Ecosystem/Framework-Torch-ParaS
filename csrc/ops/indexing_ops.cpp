@@ -881,7 +881,7 @@ Tensor& nonzero_out(const Tensor& self, Tensor& out) {
 
     auto& q = queue_for(self);
 #if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
-    if (q.is_gpu()) {
+    if (q.wave64()) {
         nonzero_gpu(q, self, out);
         return out;
     }

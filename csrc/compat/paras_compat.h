@@ -61,6 +61,8 @@ struct DeviceInfo {
     int         compute_units = 0;
     std::size_t global_mem    = 0;
     bool        fp64          = true;
+    int         wave_size     = 64;
+    bool        mfma          = false;
 };
 
 std::vector<DeviceInfo> enumerate_devices();
@@ -97,6 +99,8 @@ public:
     bool initialized() const { return initialized_; }
     bool is_gpu()      const { return is_gpu_; }
     int  native_id()   const { return native_id_; }
+    bool wave64()      const { return is_gpu_ && wave_size_ == 64; }
+    bool mfma()        const { return is_gpu_ && mfma_; }
 
     void* alloc(std::size_t nbytes);
     void  dealloc(void* ptr);
@@ -132,6 +136,8 @@ private:
     bool capturing_   = false;
     bool is_gpu_      = false;
     int  native_id_   = -1;
+    int  wave_size_   = 64;
+    bool mfma_        = false;
 };
 
 const char* backend_name();

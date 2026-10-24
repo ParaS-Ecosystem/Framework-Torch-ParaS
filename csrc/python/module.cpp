@@ -46,6 +46,14 @@ PYBIND11_MODULE(_C, m) {
         return ptsycl::Context::instance().device(index).info.is_gpu;
     });
 
+    m.def("device_kernel_caps", [](int index) {
+        const auto& info = ptsycl::Context::instance().device(index).info;
+        py::dict d;
+        d["wave_size"] = info.is_gpu ? info.wave_size : 1;
+        d["mfma"] = info.is_gpu && info.mfma;
+        return d;
+    });
+
     m.def("synchronize", [](int index) {
         py::gil_scoped_release no_gil;
         ptsycl::Context::instance().synchronize(index);
