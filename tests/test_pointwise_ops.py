@@ -606,8 +606,9 @@ def test_vectorized_contiguous_path_matches_strided(device):
         at, bt = a.t().contiguous().t(), b.t().contiguous().t()
         for name, fn in (("mul", torch.mul), ("add", torch.add), ("div", torch.div)):
             assert torch.equal(fn(a, b).cpu(), fn(at, bt).cpu()), (dtype, name)
-        gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
-        unary = (("silu", torch.nn.functional.silu),) if gpu else ()
+        idx = torch.device(device).index or 0
+        amd = torch_paras.is_gpu_device(idx) and torch_paras.device_kernel_caps(idx)["wave_size"] == 64
+        unary = (("silu", torch.nn.functional.silu),) if amd else ()
         for name, fn in unary + (("exp", torch.exp), ("neg", torch.neg)):
             assert torch.equal(fn(a).cpu(), fn(at).cpu()), (dtype, name)
 
