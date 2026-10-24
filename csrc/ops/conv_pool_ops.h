@@ -33,6 +33,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> conv_backward_device(
     const at::Tensor& grad_output, const at::Tensor& input, const at::Tensor& weight, at::IntArrayRef stride,
     at::IntArrayRef padding, at::IntArrayRef dilation, int64_t groups, std::array<bool, 3> mask);
 
+at::Tensor conv_transposed_forward_device(const at::Tensor& input, const at::Tensor& weight,
+                                          const c10::optional<at::Tensor>& bias, at::IntArrayRef stride,
+                                          at::IntArrayRef padding, at::IntArrayRef output_padding,
+                                          at::IntArrayRef dilation, int64_t groups);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> conv_transposed_backward_device(
+    const at::Tensor& grad_output, const at::Tensor& input, const at::Tensor& weight, at::IntArrayRef stride,
+    at::IntArrayRef padding, at::IntArrayRef output_padding, at::IntArrayRef dilation, int64_t groups,
+    std::array<bool, 3> mask);
+
 at::Tensor adaptive_avg_pool2d_device(const at::Tensor& self, at::IntArrayRef output_size);
 at::Tensor adaptive_avg_pool2d_backward_device(const at::Tensor& grad_output, const at::Tensor& self);
 

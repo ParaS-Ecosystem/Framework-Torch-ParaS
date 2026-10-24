@@ -32,53 +32,65 @@ using at::Tensor;
 
 namespace {
 
-struct Conv2dGeom {
-    int64_t N, C, H, W, O, kh, kw, sh, sw, ph, pw, dh, dw, Ho, Wo, groups;
+struct ConvGeom {
+    int64_t N, C, D, H, W, O, kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw, Do, Ho, Wo, groups;
+    int64_t ksize() const { return kd * kh * kw; }
+    int64_t out_size() const { return Do * Ho * Wo; }
 };
 
 template <typename T>
-void im2col_kernel(compat::Queue& q, const T* x, T* cols, const Conv2dGeom g) {
-    const int64_t L = g.Ho * g.Wo, K = g.C * g.kh * g.kw, NL = g.N * L;
+void im2col_kernel(compat::Queue& q, const T* x, T* cols, const ConvGeom g) {
+    const int64_t L = g.out_size(), KS = g.ksize(), K = g.C * KS, NL = g.N * L;
     launch_flat(q, K * NL, [=](std::size_t idx) {
         const int64_t i = static_cast<int64_t>(idx);
         const int64_t k = i / NL, col = i % NL;
-        const int64_t n = col / L, l = col % L, oh = l / g.Wo, ow = l % g.Wo;
-        const int64_t c = k / (g.kh * g.kw), kk = k % (g.kh * g.kw), ki = kk / g.kw, kj = kk % g.kw;
-        const int64_t h = oh * g.sh - g.ph + ki * g.dh, w = ow * g.sw - g.pw + kj * g.dw;
-        cols[i] = (h >= 0 && h < g.H && w >= 0 && w < g.W)
-                      ? x[((n * g.C + c) * g.H + h) * g.W + w]
+        const int64_t n = col / L, l = col % L;
+        const int64_t ow = l % g.Wo, oh = (l / g.Wo) % g.Ho, od = l / (g.Wo * g.Ho);
+        const int64_t c = k / KS, kk = k % KS;
+        const int64_t kj = kk % g.kw, ki = (kk / g.kw) % g.kh, ka = kk / (g.kw * g.kh);
+        const int64_t d = od * g.sd - g.pd + ka * g.dd, h = oh * g.sh - g.ph + ki * g.dh,
+                      w = ow * g.sw - g.pw + kj * g.dw;
+        cols[i] = (d >= 0 && d < g.D && h >= 0 && h < g.H && w >= 0 && w < g.W)
+                      ? x[(((n * g.C + c) * g.D + d) * g.H + h) * g.W + w]
                       : static_cast<T>(0);
     });
 }
 
 template <typename T>
-void col2im_kernel(compat::Queue& q, const T* cols, T* x, const Conv2dGeom g) {
-    const int64_t L = g.Ho * g.Wo, NL = g.N * L;
+void col2im_kernel(compat::Queue& q, const T* cols, T* x, const ConvGeom g) {
+    const int64_t L = g.out_size(), NL = g.N * L;
     using acc_t = std::conditional_t<std::is_same_v<T, double>, double, float>;
-    launch_flat(q, g.N * g.C * g.H * g.W, [=](std::size_t idx) {
+    launch_flat(q, g.N * g.C * g.D * g.H * g.W, [=](std::size_t idx) {
         const int64_t i = static_cast<int64_t>(idx);
-        const int64_t w = i % g.W, h = (i / g.W) % g.H, c = (i / (g.W * g.H)) % g.C, n = i / (g.W * g.H * g.C);
+        const int64_t w = i % g.W, h = (i / g.W) % g.H, d = (i / (g.W * g.H)) % g.D;
+        const int64_t c = (i / (g.W * g.H * g.D)) % g.C, n = i / (g.W * g.H * g.D * g.C);
         acc_t acc = 0;
-        for (int64_t ki = 0; ki < g.kh; ++ki) {
-            const int64_t th = h + g.ph - ki * g.dh;
-            if (th < 0 || th % g.sh) continue;
-            const int64_t oh = th / g.sh;
-            if (oh >= g.Ho) continue;
-            for (int64_t kj = 0; kj < g.kw; ++kj) {
-                const int64_t tw = w + g.pw - kj * g.dw;
-                if (tw < 0 || tw % g.sw) continue;
-                const int64_t ow = tw / g.sw;
-                if (ow >= g.Wo) continue;
-                const int64_t k = (c * g.kh + ki) * g.kw + kj;
-                acc += static_cast<acc_t>(cols[k * NL + n * L + oh * g.Wo + ow]);
+        for (int64_t ka = 0; ka < g.kd; ++ka) {
+            const int64_t td = d + g.pd - ka * g.dd;
+            if (td < 0 || td % g.sd) continue;
+            const int64_t od = td / g.sd;
+            if (od >= g.Do) continue;
+            for (int64_t ki = 0; ki < g.kh; ++ki) {
+                const int64_t th = h + g.ph - ki * g.dh;
+                if (th < 0 || th % g.sh) continue;
+                const int64_t oh = th / g.sh;
+                if (oh >= g.Ho) continue;
+                for (int64_t kj = 0; kj < g.kw; ++kj) {
+                    const int64_t tw = w + g.pw - kj * g.dw;
+                    if (tw < 0 || tw % g.sw) continue;
+                    const int64_t ow = tw / g.sw;
+                    if (ow >= g.Wo) continue;
+                    const int64_t k = c * g.ksize() + (ka * g.kh + ki) * g.kw + kj;
+                    acc += static_cast<acc_t>(cols[k * NL + n * L + (od * g.Ho + oh) * g.Wo + ow]);
+                }
             }
         }
         x[i] = static_cast<T>(acc);
     });
 }
 
-Tensor im2col(const Tensor& x, const Conv2dGeom& g) {
-    Tensor cols = at::empty({g.C * g.kh * g.kw, g.N * g.Ho * g.Wo}, x.options());
+Tensor im2col(const Tensor& x, const ConvGeom& g) {
+    Tensor cols = at::empty({g.C * g.ksize(), g.N * g.out_size()}, x.options());
     auto& q = queue_for(x);
     AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, x.scalar_type(), "ptsycl_im2col", [&] {
         im2col_kernel<scalar_t>(q, data_ptr<scalar_t>(x), data_ptr<scalar_t>(cols), g);
@@ -86,8 +98,8 @@ Tensor im2col(const Tensor& x, const Conv2dGeom& g) {
     return cols;
 }
 
-Tensor col2im(const Tensor& cols, const Conv2dGeom& g) {
-    Tensor x = at::empty({g.N, g.C, g.H, g.W}, cols.options());
+Tensor col2im(const Tensor& cols, const ConvGeom& g) {
+    Tensor x = at::empty({g.N, g.C, g.D, g.H, g.W}, cols.options());
     auto& q = queue_for(cols);
     AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, cols.scalar_type(), "ptsycl_col2im", [&] {
         col2im_kernel<scalar_t>(q, data_ptr<scalar_t>(cols), data_ptr<scalar_t>(x), g);
@@ -96,43 +108,105 @@ Tensor col2im(const Tensor& cols, const Conv2dGeom& g) {
 }
 
 bool conv_geometry(const Tensor& input, const Tensor& weight, at::IntArrayRef stride,
-                   at::IntArrayRef padding, at::IntArrayRef dilation, int64_t groups, Conv2dGeom& g) {
+                   at::IntArrayRef padding, at::IntArrayRef dilation, int64_t groups, ConvGeom& g) {
     const int64_t d = input.dim();
-    if ((d != 3 && d != 4) || weight.dim() != d) return false;
-    const bool one = d == 3;
-    auto at = [&](at::IntArrayRef v, int64_t i, int64_t dflt) {
+    if (d < 3 || d > 5 || weight.dim() != d) return false;
+    const int64_t sp = d - 2;
+    auto pick = [&](at::IntArrayRef v, int64_t axis, int64_t dflt) {
+        const int64_t i = axis - (3 - sp);
+        if (i < 0) return dflt == 0 ? int64_t{0} : int64_t{1};
         if (v.empty()) return dflt;
         return v.size() == 1 ? v[0] : v[i];
     };
+    auto dim = [&](const Tensor& t, int64_t axis) { const int64_t i = axis - (3 - sp); return i < 0 ? int64_t{1} : t.size(2 + i); };
     g.N = input.size(0);
     g.C = input.size(1);
-    g.H = one ? 1 : input.size(2);
-    g.W = input.size(d - 1);
+    g.D = dim(input, 0); g.H = dim(input, 1); g.W = dim(input, 2);
     g.O = weight.size(0);
-    g.kh = one ? 1 : weight.size(2);
-    g.kw = weight.size(d - 1);
-    g.sh = one ? 1 : at(stride, 0, 1);
-    g.sw = at(stride, one ? 0 : 1, 1);
-    g.ph = one ? 0 : at(padding, 0, 0);
-    g.pw = at(padding, one ? 0 : 1, 0);
-    g.dh = one ? 1 : at(dilation, 0, 1);
-    g.dw = at(dilation, one ? 0 : 1, 1);
+    g.kd = dim(weight, 0); g.kh = dim(weight, 1); g.kw = dim(weight, 2);
+    g.sd = pick(stride, 0, 1); g.sh = pick(stride, 1, 1); g.sw = pick(stride, 2, 1);
+    g.pd = pick(padding, 0, 0); g.ph = pick(padding, 1, 0); g.pw = pick(padding, 2, 0);
+    g.dd = pick(dilation, 0, 1); g.dh = pick(dilation, 1, 1); g.dw = pick(dilation, 2, 1);
     g.groups = groups;
     if (groups < 1 || g.C % groups || g.O % groups || weight.size(1) * groups != g.C) return false;
+    if (g.sd <= 0 || g.sh <= 0 || g.sw <= 0) return false;
+    g.Do = (g.D + 2 * g.pd - g.dd * (g.kd - 1) - 1) / g.sd + 1;
     g.Ho = (g.H + 2 * g.ph - g.dh * (g.kh - 1) - 1) / g.sh + 1;
     g.Wo = (g.W + 2 * g.pw - g.dw * (g.kw - 1) - 1) / g.sw + 1;
-    return g.Ho > 0 && g.Wo > 0 && g.sh > 0 && g.sw > 0;
+    return g.Do > 0 && g.Ho > 0 && g.Wo > 0;
 }
 
-Tensor shaped_output(const Tensor& y_ol, const Conv2dGeom& g, int64_t dim) {
-    Tensor y = y_ol.view({g.O, g.N, g.Ho * g.Wo}).permute({1, 0, 2}).contiguous();
-    return dim == 3 ? y.view({g.N, g.O, g.Wo}) : y.view({g.N, g.O, g.Ho, g.Wo});
+std::vector<int64_t> spatial_shape(int64_t N, int64_t C, int64_t D, int64_t H, int64_t W, int64_t rank) {
+    if (rank == 3) return {N, C, W};
+    if (rank == 4) return {N, C, H, W};
+    return {N, C, D, H, W};
+}
+
+Tensor conv_columns_gemm(const Tensor& x, const Tensor& weight, const ConvGeom& g) {
+    const Tensor cols = im2col(x.contiguous(), g);
+    const int64_t Kg = (g.C / g.groups) * g.ksize(), Og = g.O / g.groups;
+    const Tensor w2 = weight.contiguous().view({g.O, Kg});
+    if (g.groups == 1) return at::mm(w2, cols);
+    Tensor y = at::empty({g.O, g.N * g.out_size()}, x.options());
+    for (int64_t gi = 0; gi < g.groups; ++gi) {
+        Tensor yg = y.narrow(0, gi * Og, Og);
+        at::mm_out(yg, w2.narrow(0, gi * Og, Og), cols.narrow(0, gi * Kg, Kg));
+    }
+    return y;
+}
+
+Tensor shaped_output(const Tensor& y_ol, const ConvGeom& g, int64_t rank) {
+    Tensor y = y_ol.view({g.O, g.N, g.out_size()}).permute({1, 0, 2}).contiguous();
+    return y.view(spatial_shape(g.N, g.O, g.Do, g.Ho, g.Wo, rank));
+}
+
+Tensor as_ol(const Tensor& t, const ConvGeom& g) {
+    return t.contiguous().view({g.N, g.O, g.out_size()}).permute({1, 0, 2}).contiguous().view({g.O, g.N * g.out_size()});
+}
+
+Tensor conv_input_grad(const Tensor& dy_ol, const Tensor& weight, const ConvGeom& g, int64_t rank) {
+    const int64_t Kg = (g.C / g.groups) * g.ksize(), Og = g.O / g.groups;
+    const Tensor w2 = weight.contiguous().view({g.O, Kg});
+    Tensor dcols = at::empty({g.C * g.ksize(), g.N * g.out_size()}, dy_ol.options());
+    for (int64_t gi = 0; gi < g.groups; ++gi) {
+        Tensor dg = dcols.narrow(0, gi * Kg, Kg);
+        at::mm_out(dg, w2.narrow(0, gi * Og, Og).t(), dy_ol.narrow(0, gi * Og, Og));
+    }
+    return col2im(dcols, g).view(spatial_shape(g.N, g.C, g.D, g.H, g.W, rank));
+}
+
+Tensor conv_weight_grad(const Tensor& dy_ol, const Tensor& x, const Tensor& weight, const ConvGeom& g) {
+    const int64_t Kg = (g.C / g.groups) * g.ksize(), Og = g.O / g.groups;
+    const Tensor cols = im2col(x.contiguous(), g);
+    Tensor dw2 = at::empty({g.O, Kg}, dy_ol.options());
+    for (int64_t gi = 0; gi < g.groups; ++gi) {
+        Tensor dg = dw2.narrow(0, gi * Og, Og);
+        at::mm_out(dg, dy_ol.narrow(0, gi * Og, Og), cols.narrow(0, gi * Kg, Kg).t());
+    }
+    return dw2.view(weight.sizes());
+}
+
+bool transposed_geometry(const Tensor& input, const Tensor& weight, at::IntArrayRef stride,
+                         at::IntArrayRef padding, at::IntArrayRef output_padding, at::IntArrayRef dilation,
+                         int64_t groups, ConvGeom& g, std::vector<int64_t>& out_shape) {
+    const int64_t d = input.dim();
+    if (d < 3 || d > 5 || weight.dim() != d) return false;
+    const int64_t sp = d - 2;
+    auto v = [&](at::IntArrayRef a, int64_t i, int64_t dflt) { return a.empty() ? dflt : (a.size() == 1 ? a[0] : a[i]); };
+    out_shape = {input.size(0), weight.size(1) * groups};
+    for (int64_t i = 0; i < sp; ++i)
+        out_shape.push_back((input.size(2 + i) - 1) * v(stride, i, 1) - 2 * v(padding, i, 0) +
+                            v(dilation, i, 1) * (weight.size(2 + i) - 1) + v(output_padding, i, 0) + 1);
+    const Tensor like = at::empty(out_shape, at::TensorOptions().device(at::kMeta));
+    if (!conv_geometry(like, weight, stride, padding, dilation, groups, g)) return false;
+    const auto expect = spatial_shape(g.N, g.O, g.Do, g.Ho, g.Wo, d);
+    return g.O == input.size(1) && std::equal(expect.begin() + 2, expect.end(), input.sizes().begin() + 2);
 }
 
 }
 
-bool conv_device_supported(const Tensor& input, const Tensor& weight, bool transposed) {
-    if (transposed || !(input.dim() == 3 || input.dim() == 4)) return false;
+bool conv_device_supported(const Tensor& input, const Tensor& weight, bool ) {
+    if (input.dim() < 3 || input.dim() > 5) return false;
     const auto st = input.scalar_type();
     return (st == c10::kFloat || st == c10::kDouble || st == c10::kHalf || st == c10::kBFloat16) &&
            weight.scalar_type() == st && input.device() == weight.device();
@@ -141,23 +215,10 @@ bool conv_device_supported(const Tensor& input, const Tensor& weight, bool trans
 Tensor conv_forward_device(const Tensor& input, const Tensor& weight, const c10::optional<Tensor>& bias,
                            at::IntArrayRef stride, at::IntArrayRef padding, at::IntArrayRef dilation,
                            int64_t groups) {
-    Conv2dGeom g{};
+    ConvGeom g{};
     TORCH_CHECK(conv_geometry(input, weight, stride, padding, dilation, groups, g),
                 "paras convolution: unsupported geometry");
-    const Tensor x = input.contiguous();
-    const Tensor cols = im2col(x, g);
-    const int64_t Kg = (g.C / groups) * g.kh * g.kw, Og = g.O / groups;
-    const Tensor w2 = weight.contiguous().view({g.O, Kg});
-    Tensor y;
-    if (groups == 1) {
-        y = at::mm(w2, cols);
-    } else {
-        y = at::empty({g.O, g.N * g.Ho * g.Wo}, x.options());
-        for (int64_t gi = 0; gi < groups; ++gi) {
-            Tensor yg = y.narrow(0, gi * Og, Og);
-            at::mm_out(yg, w2.narrow(0, gi * Og, Og), cols.narrow(0, gi * Kg, Kg));
-        }
-    }
+    Tensor y = conv_columns_gemm(input, weight, g);
     if (bias && bias->defined()) y.add_(bias->to(y.scalar_type()).view({g.O, 1}));
     return shaped_output(y, g, input.dim());
 }
@@ -165,32 +226,49 @@ Tensor conv_forward_device(const Tensor& input, const Tensor& weight, const c10:
 std::tuple<Tensor, Tensor, Tensor> conv_backward_device(
     const Tensor& grad_output, const Tensor& input, const Tensor& weight, at::IntArrayRef stride,
     at::IntArrayRef padding, at::IntArrayRef dilation, int64_t groups, std::array<bool, 3> mask) {
-    Conv2dGeom g{};
+    ConvGeom g{};
     TORCH_CHECK(conv_geometry(input, weight, stride, padding, dilation, groups, g),
                 "paras convolution backward: unsupported geometry");
-    const int64_t Kg = (g.C / groups) * g.kh * g.kw, Og = g.O / groups, L = g.Ho * g.Wo;
-    const Tensor dy = grad_output.contiguous().view({g.N, g.O, L}).permute({1, 0, 2}).contiguous().view({g.O, g.N * L});
-    const Tensor w2 = weight.contiguous().view({g.O, Kg});
+    const Tensor dy = as_ol(grad_output, g);
     Tensor dx, dw, db;
-    if (mask[0]) {
-        Tensor dcols = at::empty({g.C * g.kh * g.kw, g.N * L}, dy.options());
-        for (int64_t gi = 0; gi < groups; ++gi) {
-            Tensor dg = dcols.narrow(0, gi * Kg, Kg);
-            at::mm_out(dg, w2.narrow(0, gi * Og, Og).t(), dy.narrow(0, gi * Og, Og));
-        }
-        dx = col2im(dcols, g);
-        if (input.dim() == 3) dx = dx.view(input.sizes());
-    }
-    if (mask[1]) {
-        const Tensor cols = im2col(input.contiguous(), g);
-        Tensor dw2 = at::empty({g.O, Kg}, dy.options());
-        for (int64_t gi = 0; gi < groups; ++gi) {
-            Tensor dg = dw2.narrow(0, gi * Og, Og);
-            at::mm_out(dg, dy.narrow(0, gi * Og, Og), cols.narrow(0, gi * Kg, Kg).t());
-        }
-        dw = dw2.view(weight.sizes());
-    }
+    if (mask[0]) dx = conv_input_grad(dy, weight, g, input.dim());
+    if (mask[1]) dw = conv_weight_grad(dy, input, weight, g);
     if (mask[2]) db = dy.sum(1);
+    return {dx, dw, db};
+}
+
+Tensor conv_transposed_forward_device(const Tensor& input, const Tensor& weight, const c10::optional<Tensor>& bias,
+                                      at::IntArrayRef stride, at::IntArrayRef padding,
+                                      at::IntArrayRef output_padding, at::IntArrayRef dilation, int64_t groups) {
+    ConvGeom g{};
+    std::vector<int64_t> out_shape;
+    TORCH_CHECK(transposed_geometry(input, weight, stride, padding, output_padding, dilation, groups, g, out_shape),
+                "paras transposed convolution: unsupported geometry");
+    Tensor y = conv_input_grad(as_ol(input, g), weight, g, input.dim());
+    if (bias && bias->defined()) {
+        std::vector<int64_t> bs(static_cast<std::size_t>(input.dim()), 1);
+        bs[1] = bias->numel();
+        y.add_(bias->to(y.scalar_type()).view(bs));
+    }
+    return y;
+}
+
+std::tuple<Tensor, Tensor, Tensor> conv_transposed_backward_device(
+    const Tensor& grad_output, const Tensor& input, const Tensor& weight, at::IntArrayRef stride,
+    at::IntArrayRef padding, at::IntArrayRef output_padding, at::IntArrayRef dilation, int64_t groups,
+    std::array<bool, 3> mask) {
+    ConvGeom g{};
+    std::vector<int64_t> out_shape;
+    TORCH_CHECK(transposed_geometry(input, weight, stride, padding, output_padding, dilation, groups, g, out_shape),
+                "paras transposed convolution backward: unsupported geometry");
+    Tensor dx, dw, db;
+    if (mask[0]) dx = shaped_output(conv_columns_gemm(grad_output, weight, g), g, input.dim());
+    if (mask[1]) dw = conv_weight_grad(as_ol(input, g), grad_output, weight, g);
+    if (mask[2]) {
+        std::vector<int64_t> dims = {0};
+        for (int64_t i = 2; i < grad_output.dim(); ++i) dims.push_back(i);
+        db = grad_output.sum(dims);
+    }
     return {dx, dw, db};
 }
 

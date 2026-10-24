@@ -81,7 +81,9 @@ Tensor convolution_overrideable(
 {
     PTSYCL_TRACE_OP("convolution_overrideable");
     if (conv_device_supported(input, weight, transposed))
-        return conv_forward_device(input, weight, bias, stride, padding, dilation, groups);
+        return transposed
+                   ? conv_transposed_forward_device(input, weight, bias, stride, padding, output_padding, dilation, groups)
+                   : conv_forward_device(input, weight, bias, stride, padding, dilation, groups);
     c10::Device dev = input.device();
 
     Tensor cpu_in = to_cpu(input);
@@ -111,7 +113,10 @@ Tensor convolution_overrideable(
 {
     PTSYCL_TRACE_OP("convolution_backward_overrideable");
     if (conv_device_supported(input, weight, transposed))
-        return conv_backward_device(grad_output, input, weight, stride, padding, dilation, groups, output_mask);
+        return transposed ? conv_transposed_backward_device(grad_output, input, weight, stride, padding,
+                                                            output_padding, dilation, groups, output_mask)
+                          : conv_backward_device(grad_output, input, weight, stride, padding, dilation, groups,
+                                                 output_mask);
     c10::Device dev = input.device();
 
     Tensor cpu_dy = to_cpu(grad_output);

@@ -204,8 +204,8 @@ def test_compiled_replay_fallbacks(device):
     check(m, xs, "needs autograd", grad=True)
     check(lambda x: F.dropout(m(x), 0.5, training=True), xs, "random operators")
     check(lambda x: F.layer_norm(m(x), (64,)), xs, "replayed")
-    w3 = torch.randn(2, 1, 2, 2, 2, device=device)
-    check(lambda x: F.conv3d(m(x).view(2, 1, 4, 4, 4), w3), xs, "capture failed")
+    eye = torch.eye(8, device=device) * 4
+    check(lambda x: torch.linalg.inv(m(x).view(2, 8, 8) + eye), xs, "capture failed")
     _reset()
     c = torch_paras.compile(m, graphs=True, dynamic=True)
     with torch.no_grad():

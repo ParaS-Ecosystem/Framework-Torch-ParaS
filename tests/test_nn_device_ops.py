@@ -134,3 +134,20 @@ def test_resnet_block_trains_on_device(device):
     _close(out.detach(), out_ref.detach(), "resnet block", tol=2e-4)
     for (n, p), (_, q) in zip(ref.named_parameters(), dev.named_parameters()):
         _close(q.grad, p.grad, f"resnet block grad {n}", tol=5e-4)
+
+
+def test_conv3d_and_transposed(device):
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, 6, 7, 5)
+    w = torch.randn(6, 2, 3, 2, 3) * 0.3
+    b = torch.randn(6)
+    _check(device, lambda x, w, b: F.conv3d(x, w, b, (1, 2, 1), (1, 0, 1), (1, 1, 2), 2), x, w, b,
+           tol=2e-4, what="conv3d")
+    for dim, (x, w, kw) in {
+            1: (torch.randn(2, 4, 9), torch.randn(4, 3, 4) * 0.3, dict(stride=2, padding=1, output_padding=1)),
+            2: (torch.randn(2, 4, 5, 6), torch.randn(4, 3, 3, 2) * 0.3,
+                dict(stride=(2, 1), padding=(1, 0), output_padding=(1, 0), groups=2, dilation=(1, 2))),
+            3: (torch.randn(1, 2, 3, 4, 3), torch.randn(2, 2, 2, 3, 2) * 0.3, dict(stride=2))}.items():
+        fn = {1: F.conv_transpose1d, 2: F.conv_transpose2d, 3: F.conv_transpose3d}[dim]
+        b = torch.randn(w.size(1) * kw.get("groups", 1))
+        _check(device, lambda x, w, b: fn(x, w, b, **kw), x, w, b, tol=2e-4, what=f"conv_transpose{dim}d")
