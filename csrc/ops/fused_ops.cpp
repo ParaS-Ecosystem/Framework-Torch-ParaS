@@ -38,42 +38,47 @@ namespace {
 using at::Tensor;
 
 #if defined(PTSYCL_BACKEND_SYCL)
-template <typename T, int K> class RmsNormRowsKernel;
+template <typename T, int K, int E> class RmsNormRowsKernel;
 
-template <typename T, int K>
+template <typename T, int K, int E>
 void rms_norm_rows(compat::Queue& q, const T* pin, const T* padd, T* psum, const T* pw, T* pout,
                    float* pr, int64_t rows, int64_t H, double inv_h, double eps32) {
     q.sycl_queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<double, 1> lds(sycl::range<1>(kReduceWG), cgh);
-        cgh.template parallel_for<RmsNormRowsKernel<T, K>>(
+        cgh.template parallel_for<RmsNormRowsKernel<T, K, E>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
                               sycl::range<1>(kReduceWG)),
             [=](sycl::nd_item<1> it) {
                 const int64_t r = static_cast<int64_t>(it.get_group(0));
                 const int64_t l = static_cast<int64_t>(it.get_local_id(0));
                 const T* in = pin + r * H;
-                float x[K];
-                T w[K];
+                const auto index = [l](int t, int e) { return (l + t * kReduceWG) * E + e; };
+                float x[K][E];
+                T w[K][E];
 #pragma unroll
-                for (int t = 0; t < K; ++t) {
-                    const int64_t j = l + t * kReduceWG;
-                    if (j < H) {
-                        x[t] = padd == nullptr
-                            ? static_cast<float>(in[j])
-                            : static_cast<float>(static_cast<T>(
-                                  static_cast<double>(in[j]) +
-                                  static_cast<double>(padd[r * H + j])));
-                        w[t] = pw[j];
+                for (int t = 0; t < K; ++t)
+#pragma unroll
+                    for (int e = 0; e < E; ++e) {
+                        const int64_t j = index(t, e);
+                        if (j < H) {
+                            x[t][e] = padd == nullptr
+                                ? static_cast<float>(in[j])
+                                : static_cast<float>(static_cast<T>(
+                                      static_cast<double>(in[j]) +
+                                      static_cast<double>(padd[r * H + j])));
+                            w[t][e] = pw[j];
+                        }
                     }
-                }
                 double acc = 0.0;
 #pragma unroll
-                for (int t = 0; t < K; ++t) {
-                    if (l + t * kReduceWG < H) {
-                        const double xd = static_cast<double>(x[t]);
-                        acc = acc + static_cast<double>(static_cast<float>(xd * xd));
+                for (int t = 0; t < K; ++t)
+#pragma unroll
+                    for (int e = 0; e < E; ++e) {
+                        if (index(t, e) < H) {
+                            const double xd = static_cast<double>(x[t][e]);
+                            acc = acc + static_cast<double>(static_cast<float>(xd * xd));
+                        }
                     }
-                }
                 const double sum = combine_in_group(it, &lds[0], acc,
                                                     [](double a, double b) { return a + b; });
                 const float mean = static_cast<float>(static_cast<double>(static_cast<float>(sum)) * inv_h);
@@ -81,18 +86,33 @@ void rms_norm_rows(compat::Queue& q, const T* pin, const T* padd, T* psum, const
                 const float rs = static_cast<float>(1.0 / ::sqrt(static_cast<double>(var)));
                 if (l == 0) pr[r] = rs;
 #pragma unroll
-                for (int t = 0; t < K; ++t) {
-                    const int64_t j = l + t * kReduceWG;
-                    if (j < H) {
-                        const T nb = static_cast<T>(static_cast<float>(
-                            static_cast<double>(x[t]) * static_cast<double>(rs)));
-                        pout[r * H + j] = static_cast<T>(static_cast<double>(w[t]) *
-                                                         static_cast<double>(nb));
-                        if (psum != nullptr) psum[r * H + j] = static_cast<T>(x[t]);
+                for (int t = 0; t < K; ++t)
+#pragma unroll
+                    for (int e = 0; e < E; ++e) {
+                        const int64_t j = index(t, e);
+                        if (j < H) {
+                            const T nb = static_cast<T>(static_cast<float>(
+                                static_cast<double>(x[t][e]) * static_cast<double>(rs)));
+                            pout[r * H + j] = static_cast<T>(static_cast<double>(w[t][e]) *
+                                                             static_cast<double>(nb));
+                            if (psum != nullptr) psum[r * H + j] = static_cast<T>(x[t][e]);
+                        }
                     }
-                }
             });
     });
+}
+
+template <typename T, int E>
+void rms_norm_rows_k(compat::Queue& q, const T* pin, const T* padd, T* psum, const T* pw, T* pout, float* pr,
+                     int64_t rows, int64_t H, double inv_h, double eps32) {
+    const int64_t per = (H / E + kReduceWG - 1) / kReduceWG;
+    if (per <= 1)       rms_norm_rows<T, 1, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+    else if (per <= 2)  rms_norm_rows<T, 2, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+    else if (per <= 4)  rms_norm_rows<T, 4, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+    else if (per <= 8)  rms_norm_rows<T, 8, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+    else if (per <= 16) rms_norm_rows<T, 16, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+    else if (per <= 32) rms_norm_rows<T, 32, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+    else                rms_norm_rows<T, 64, E>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
 }
 #endif
 
@@ -170,14 +190,10 @@ std::tuple<Tensor, Tensor> rms_norm_impl(const Tensor& input, const Tensor* adde
             };
 #if defined(PTSYCL_BACKEND_SYCL)
             if (reduce_in_groups(q, H)) {
-                const int64_t per = (H + kReduceWG - 1) / kReduceWG;
-                if (per <= 1)       rms_norm_rows<scalar_t, 1>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
-                else if (per <= 2)  rms_norm_rows<scalar_t, 2>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
-                else if (per <= 4)  rms_norm_rows<scalar_t, 4>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
-                else if (per <= 8)  rms_norm_rows<scalar_t, 8>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
-                else if (per <= 16) rms_norm_rows<scalar_t, 16>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
-                else if (per <= 32) rms_norm_rows<scalar_t, 32>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
-                else                rms_norm_rows<scalar_t, 64>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                if (H % kRowVec<float> == 0)
+                    rms_norm_rows_k<scalar_t, kRowVec<float>>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
+                else
+                    rms_norm_rows_k<scalar_t, 1>(q, pin, padd, psum, pw, pout, pr, rows, H, inv_h, eps32);
                 return;
             }
 #endif

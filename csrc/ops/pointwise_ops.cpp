@@ -316,10 +316,26 @@ void reduce_dims_typed(compat::Queue& q, const in_t* in,
                 switch (k) {
                     case 0: return static_cast<acc_t>(a + b);
                     case 1: return static_cast<acc_t>(a * b);
-                    case 2: return a < b ? a : b;
-                    default: return a > b ? a : b;
+                    case 2: return (a != a || a < b) ? a : b;
+                    default: return (a != a || a > b) ? a : b;
                 }
             };
+            const auto store = [=](int64_t o, acc_t acc) {
+                out_t v = static_cast<out_t>(acc);
+                if (post_scale != 1.0) v = static_cast<out_t>(static_cast<double>(v) * post_scale);
+                po[so.index(o)] = v;
+            };
+#if defined(PTSYCL_BACKEND_SYCL)
+            if constexpr (std::is_same_v<in_t, float> || std::is_same_v<in_t, c10::Half> ||
+                          std::is_same_v<in_t, c10::BFloat16>) {
+                if (red.identity && rs.out_n > 0 &&
+                    (kept.ndim == 0 || (kept.ndim == 1 && kept.strides[0] == red_n)) &&
+                    rows_vectorizable(q, in, red_n)) {
+                    reduce_rows_vec<in_t, acc_t>(q, in, rs.out_n, red_n, init, combine, store);
+                    return;
+                }
+            }
+#endif
 
             reduce_outer<acc_t>(
                 q, rs.out_n, red_n, init,
@@ -327,13 +343,7 @@ void reduce_dims_typed(compat::Queue& q, const in_t* in,
                     return static_cast<acc_t>(
                         in[kept.index(o) + red.index(j)]);
                 },
-                combine,
-                [=](int64_t o, acc_t acc) {
-                    out_t v = static_cast<out_t>(acc);
-                    if (post_scale != 1.0) v = static_cast<out_t>(static_cast<double>(v) * post_scale);
-                    po[so.index(o)] = v;
-                },
-                out_view);
+                combine, store, out_view);
         });
 }
 

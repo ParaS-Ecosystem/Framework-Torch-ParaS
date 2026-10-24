@@ -109,7 +109,7 @@ def test_backend_registered(device):
 
 def test_rms_norm_fused_and_matches_eager(device):
     for dtype in (torch.float32, torch.bfloat16):
-        for shape in ((3, 5, 48), (2, 128, 2048), (1, 1, 2048)):
+        for shape in ((3, 5, 48), (2, 128, 2048), (1, 1, 2048), (2, 3, 5632), (2, 7, 1030)):
             _reset()
             norm = RMSNorm(shape[-1]).to(device, dtype)
             x = torch.randn(*shape).to(device, dtype)

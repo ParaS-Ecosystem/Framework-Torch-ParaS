@@ -249,6 +249,61 @@ PTSYCL_HOST_DEVICE inline acc_t reduce_row_in_group(const sycl::nd_item<1>& it, 
 
 template <typename acc_t, typename Map, typename Combine, typename Store>
 class ReduceRowsKernel;
+
+template <typename T>
+constexpr int kRowVec = 16 / static_cast<int>(sizeof(T));
+
+template <typename T>
+inline bool rows_vectorizable(compat::Queue& q, const T* p, int64_t n) {
+    return q.is_gpu() && reinterpret_cast<std::uintptr_t>(p) % 16 == 0 && n % kRowVec<T> == 0 &&
+           n >= kReduceWG && n <= kReduceWGMax;
+}
+
+template <typename T, int V>
+struct alignas(16) RowChunk {
+    T v[V];
+};
+
+template <typename T, typename acc_t, typename Combine, typename Store>
+class ReduceRowsVecKernel;
+
+template <typename T, typename acc_t, typename Combine, typename Store>
+inline void reduce_rows_vec(compat::Queue& q, const T* in, int64_t rows, int64_t n, acc_t init,
+                            Combine combine, Store store) {
+    constexpr int V = kRowVec<T>;
+    using Ch = RowChunk<T, V>;
+    const int64_t chunks = n / V;
+    q.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<acc_t, 1> lds(sycl::range<1>(kReduceWG), cgh);
+        cgh.template parallel_for<ReduceRowsVecKernel<T, acc_t, Combine, Store>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
+                              sycl::range<1>(kReduceWG)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t o = static_cast<int64_t>(it.get_group(0));
+                const Ch* row = reinterpret_cast<const Ch*>(in + o * n);
+                const int l = static_cast<int>(it.get_local_id(0));
+                constexpr int kAhead = 4;
+                acc_t acc = init;
+                int64_t c = l;
+                for (; c + (kAhead - 1) * kReduceWG < chunks; c += kAhead * kReduceWG) {
+                    Ch v[kAhead];
+#pragma unroll
+                    for (int t = 0; t < kAhead; ++t) v[t] = row[c + t * kReduceWG];
+#pragma unroll
+                    for (int t = 0; t < kAhead; ++t)
+#pragma unroll
+                        for (int e = 0; e < V; ++e) acc = combine(acc, static_cast<acc_t>(v[t].v[e]));
+                }
+                for (; c < chunks; c += kReduceWG) {
+                    const Ch v = row[c];
+#pragma unroll
+                    for (int e = 0; e < V; ++e) acc = combine(acc, static_cast<acc_t>(v.v[e]));
+                }
+                acc = combine_in_group(it, &lds[0], acc, combine);
+                if (l == 0) store(o, acc);
+            });
+    });
+}
 #endif
 
 template <typename acc_t, typename Map, typename Combine>
