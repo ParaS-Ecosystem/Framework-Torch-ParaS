@@ -253,6 +253,10 @@ void device_to_device_copy(const Tensor& src, Tensor& dst) {
                /*blocking=*/false);
         return;
     }
+    if (same_type && dst_contig && !dst.storage().is_alias_of(src.storage())) {
+        device_gather_contiguous(q, src, dst.data_ptr());
+        return;
+    }
 
   
     Tensor src_c = src_contig

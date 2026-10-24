@@ -1077,6 +1077,38 @@ struct MaxSumD {
     double s;
 };
 
+#if defined(PTSYCL_BACKEND_SYCL)
+template <typename in_t, typename out_t> class SoftmaxRowsKernel;
+
+template <typename in_t, typename out_t>
+void softmax_rows(compat::Queue& q, const in_t* pin, out_t* pout, int64_t rows, int64_t n, bool safe) {
+    constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+    q.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<double, 1> lds(sycl::range<1>(kReduceWG), cgh);
+        cgh.parallel_for<SoftmaxRowsKernel<in_t, out_t>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
+                              sycl::range<1>(kReduceWG)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t r = static_cast<int64_t>(it.get_group(0));
+                const in_t* x = pin + r * n;
+                const double m = reduce_row_in_group<double>(
+                    it, &lds[0], r, n, kNegInf, [=](int64_t, int64_t j) { return static_cast<double>(x[j]); },
+                    [](double a, double b) { return a > b ? a : b; });
+                sycl::group_barrier(it.get_group());
+                const double sum = m == kNegInf ? 0.0 : reduce_row_in_group<double>(
+                    it, &lds[0], r, n, 0.0,
+                    [=](int64_t, int64_t j) { return ::exp(static_cast<double>(x[j]) - m); },
+                    [](double a, double b) { return a + b; });
+                for (int64_t j = static_cast<int64_t>(it.get_local_id(0)); j < n; j += kReduceWG) {
+                    const double v = m == kNegInf ? (safe ? 0.0 : std::numeric_limits<double>::quiet_NaN())
+                                                  : ::exp(static_cast<double>(x[j]) - m) / sum;
+                    pout[r * n + j] = static_cast<out_t>(v);
+                }
+            });
+    });
+}
+#endif
+
 static Tensor& softmax_impl(const Tensor& self, int64_t dim, bool safe,
                             Tensor& out) {
     auto& q = queue_for(self);
@@ -1089,6 +1121,18 @@ static Tensor& softmax_impl(const Tensor& self, int64_t dim, bool safe,
     const int64_t out_n = rs_in.out_n;
     if (out_n == 0 || red_n == 0) return out;
     constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (q.is_gpu() && d == self.dim() - 1 && self.is_contiguous() && out.is_contiguous() &&
+        red_n <= kReduceWGMax) {
+        AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_softmax_rows_in", [&] {
+            using in_t = scalar_t;
+            AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_softmax_rows_out", [&] {
+                softmax_rows<in_t, scalar_t>(q, data_ptr<in_t>(self), data_ptr<scalar_t>(out), out_n, red_n, safe);
+            });
+        });
+        return out;
+    }
+#endif
 
     Tensor stats = at::empty({out_n * 2}, self.options().dtype(c10::kDouble));
     double* st = stats.data_ptr<double>();

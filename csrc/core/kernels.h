@@ -290,7 +290,8 @@ inline void reduce_outer(compat::Queue& q, int64_t out_n, int64_t red_n,
                          const at::Tensor& like, int64_t min_stripes = 1) {
     if (out_n <= 0) return;
 #if defined(PTSYCL_BACKEND_SYCL)
-    if (reduce_in_groups(q, red_n)) {
+    if (reduce_in_groups(q, red_n) ||
+        (q.is_gpu() && red_n >= 32 && red_n < kReduceWG && out_n < (int64_t{1} << 16))) {
         q.sycl_queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<acc_t, 1> lds(sycl::range<1>(kReduceWG), cgh);
             cgh.template parallel_for<ReduceRowsKernel<acc_t, Map, Combine, Store>>(
