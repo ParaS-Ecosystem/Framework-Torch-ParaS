@@ -126,7 +126,11 @@ Tensor as_strided(const Tensor& self, c10::IntArrayRef size,
     _(double, c10::kDouble)                                                   \
     _(bool, c10::kBool)                                                       \
     _(c10::Half, c10::kHalf)                                                  \
-    _(c10::BFloat16, c10::kBFloat16)
+    _(c10::BFloat16, c10::kBFloat16)                                          \
+    _(c10::Float8_e4m3fn, c10::kFloat8_e4m3fn)                                \
+    _(c10::Float8_e5m2, c10::kFloat8_e5m2)                                    \
+    _(c10::Float8_e4m3fnuz, c10::kFloat8_e4m3fnuz)                            \
+    _(c10::Float8_e5m2fnuz, c10::kFloat8_e5m2fnuz)
 
 // Gathers a strided tensor into a contiguous buffer (same dtype).
 void device_gather_contiguous(compat::Queue& q, const Tensor& src, void* dst) {

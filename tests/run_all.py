@@ -41,6 +41,8 @@ MODULES = [
     "test_streams",
     "test_amp",
     "test_more_ops",
+    "test_profiler",
+    "test_quant_ops",
 ]
 
 

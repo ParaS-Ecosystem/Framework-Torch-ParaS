@@ -357,6 +357,12 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
         if(_ptsycl_clap_blas_api MATCHES "gemm_ex_strided_batched_device")
             list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_GEMM_EX")
         endif()
+        if(_ptsycl_clap_blas_api MATCHES "BF16, I8, I32")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_INT8")
+        endif()
+        if(_ptsycl_clap_blas_api MATCHES "gemm_scaled_device")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_GEMM_SCALED")
+        endif()
         message(STATUS "CLAP device GEMM: ${PTSYCL_CLAP_WRAPPER_DEFS}")
 
         add_custom_command(
