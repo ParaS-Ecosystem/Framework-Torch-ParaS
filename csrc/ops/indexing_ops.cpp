@@ -101,6 +101,12 @@ Tensor& index_select_out(const Tensor& self, int64_t dim, const Tensor& index,
     PTSYCL_TRACE_OP("index_select.out");
     TORCH_CHECK(index.dim() <= 1,
                 "paras index_select: index must be 0-D or 1-D");
+    if (self.dim() == 0) {
+        c10::maybe_wrap_dim(dim, 0);
+        Tensor o = out.view({1});
+        ptsycl::index_select_out(self.view({1}), 0, index, o);
+        return out;
+    }
     TORCH_CHECK(spec_supported(self) && spec_supported(out),
                 "paras index_select: rank exceeds kernel limit");
 
@@ -145,6 +151,10 @@ Tensor& index_select_out(const Tensor& self, int64_t dim, const Tensor& index,
 
 Tensor index_select(const Tensor& self, int64_t dim, const Tensor& index) {
     PTSYCL_TRACE_OP("index_select");
+    if (self.dim() == 0) {
+        Tensor out = at::empty({}, self.options());
+        return ptsycl::index_select_out(self, dim, index, out);
+    }
     const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
     auto sizes = self.sizes().vec();
     sizes[d] = index.dim() == 0 ? 1 : index.numel();

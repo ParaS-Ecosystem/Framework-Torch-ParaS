@@ -615,7 +615,7 @@ Tensor transpose(const Tensor& self, int64_t dim0, int64_t dim1) {
     const int64_t ndim = self.dim();
     const int64_t d0 = c10::maybe_wrap_dim(dim0, ndim);
     const int64_t d1 = c10::maybe_wrap_dim(dim1, ndim);
-    if (d0 == d1) return self;
+    if (d0 == d1) return at::alias(self);
     auto sizes = self.sizes().vec();
     auto strides = self.strides().vec();
     std::swap(sizes[d0], sizes[d1]);
@@ -772,7 +772,7 @@ Tensor squeeze_dim(const Tensor& self, int64_t dim) {
         }
         return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
     }
-    return self;
+    return at::alias(self);
 }
 
 Tensor squeeze_dims(const Tensor& self, c10::IntArrayRef dims) {
@@ -781,7 +781,7 @@ Tensor squeeze_dims(const Tensor& self, c10::IntArrayRef dims) {
     std::vector<bool> to_squeeze(ndim, false);
     for (auto d : dims) {
         const int64_t wrapped = c10::maybe_wrap_dim(d, ndim);
-        if (self.size(wrapped) == 1) {
+        if (ndim > 0 && self.size(wrapped) == 1) {
             to_squeeze[wrapped] = true;
         }
     }

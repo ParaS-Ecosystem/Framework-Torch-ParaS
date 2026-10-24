@@ -151,3 +151,10 @@ def test_conv3d_and_transposed(device):
         fn = {1: F.conv_transpose1d, 2: F.conv_transpose2d, 3: F.conv_transpose3d}[dim]
         b = torch.randn(w.size(1) * kw.get("groups", 1))
         _check(device, lambda x, w, b: fn(x, w, b, **kw), x, w, b, tol=2e-4, what=f"conv_transpose{dim}d")
+
+
+def test_conv_transpose_output_padding_beyond_stride(device):
+    torch.manual_seed(0)
+    x, w, b = torch.randn(2, 2, 4, 5), torch.randn(2, 2, 4, 4) * 0.3, torch.randn(4)
+    _check(device, lambda x, w, b: F.conv_transpose2d(x, w, b, stride=(3, 2), padding=(1, 2), output_padding=(2, 3),
+                                                      groups=2, dilation=(4, 4)), x, w, b, tol=2e-4, what="convT op>=s")

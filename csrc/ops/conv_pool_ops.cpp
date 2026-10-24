@@ -199,8 +199,14 @@ bool transposed_geometry(const Tensor& input, const Tensor& weight, at::IntArray
                             v(dilation, i, 1) * (weight.size(2 + i) - 1) + v(output_padding, i, 0) + 1);
     const Tensor like = at::empty(out_shape, at::TensorOptions().device(at::kMeta));
     if (!conv_geometry(like, weight, stride, padding, dilation, groups, g)) return false;
-    const auto expect = spatial_shape(g.N, g.O, g.Do, g.Ho, g.Wo, d);
-    return g.O == input.size(1) && std::equal(expect.begin() + 2, expect.end(), input.sizes().begin() + 2);
+    if (g.O != input.size(1)) return false;
+    int64_t* out_dims[3] = {&g.Do, &g.Ho, &g.Wo};
+    for (int64_t i = 0; i < 3; ++i) {
+        const int64_t in = i < 3 - sp ? 1 : input.size(2 + i - (3 - sp));
+        if (*out_dims[i] < in) return false;
+        *out_dims[i] = in;
+    }
+    return true;
 }
 
 }

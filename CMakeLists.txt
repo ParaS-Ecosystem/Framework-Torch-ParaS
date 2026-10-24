@@ -123,6 +123,8 @@ if(NOT PTSYCL_FAST_BUILD)
     csrc/ops/foreach_ops.cpp
     csrc/ops/moe_ops.cpp
     csrc/ops/conv_pool_ops.cpp
+    csrc/ops/shape_select_ops.cpp
+    csrc/ops/quant_ops.cpp
     )
 else()
     message(STATUS "Fast build: only tensor_ops.cpp; other operator registrations are omitted")

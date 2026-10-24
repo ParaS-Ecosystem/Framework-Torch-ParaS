@@ -342,7 +342,17 @@ void reduce_dims_op(const Tensor& self, c10::ArrayRef<int64_t> dims,
                     double post_scale = 1.0) {
     auto& q = queue_for(self);
     const auto rs = split_dims(self, dims);
-    Tensor out_view = squeeze_out(out, self, dims, keepdim);
+    std::vector<int64_t> want;
+    {
+        std::vector<bool> red(static_cast<std::size_t>(self.dim()), false);
+        for (int64_t d : dims)
+            if (self.dim() > 0) red[c10::maybe_wrap_dim(d, self.dim())] = true;
+        for (int64_t d = 0; d < self.dim(); ++d)
+            if (!red[d]) want.push_back(self.size(d));
+            else if (keepdim) want.push_back(1);
+    }
+    if (!out.sizes().equals(want)) out.resize_(want);
+    Tensor out_view = squeeze_out(out, self, self.dim() > 0 ? dims : c10::ArrayRef<int64_t>{}, keepdim);
     TORCH_CHECK(out_view.numel() == rs.out_n,
                 "paras reduce: unexpected output shape");
 
@@ -420,13 +430,13 @@ Tensor& mul_scalar_(Tensor& self, const c10::Scalar& other) {
 
 Tensor& maximum_out(const Tensor& self, const Tensor& other, Tensor& out) {
     binary_kernel(self, other, out,
-                  [](double x, double y) { return x > y ? x : y; });
+                  [](double x, double y) { return (x != x || x > y) ? x : y; });
     return out;
 }
 
 Tensor& minimum_out(const Tensor& self, const Tensor& other, Tensor& out) {
     binary_kernel(self, other, out,
-                  [](double x, double y) { return x < y ? x : y; });
+                  [](double x, double y) { return (x != x || x < y) ? x : y; });
     return out;
 }
 
@@ -909,7 +919,8 @@ Tensor& mean_out(const Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
                     ? std::vector<int64_t>(dim->begin(), dim->end())
                     : all_dims(self);
     int64_t count = 1;
-    for (auto d : dims) count *= self.size(c10::maybe_wrap_dim(d, self.dim()));
+    if (self.dim() > 0)
+        for (auto d : dims) count *= self.size(c10::maybe_wrap_dim(d, self.dim()));
     reduce_dims_op(self, dims, keepdim, out, ReduceKind::Sum,
                    count > 0 ? 1.0 / static_cast<double>(count) : 0.0);
     return out;
@@ -1542,7 +1553,37 @@ PTSYCL_BINARY_OUT(remainder_out, "remainder.Tensor_out", remainder_d(a, b))
 PTSYCL_BINARY_OUT(logaddexp_out, "logaddexp.out", logaddexp_d(a, b))
 PTSYCL_BINARY_OUT(logaddexp2_out, "logaddexp2.out", logaddexp2_d(a, b))
 PTSYCL_BINARY_OUT(xlogy_out, "xlogy.OutTensor", std::isnan(b) ? b : (a == 0 ? 0.0 : a * ::log(b)))
+PTSYCL_BINARY_OUT(pow_tensor_out, "pow.Tensor_Tensor_out", ::pow(a, b))
+PTSYCL_BINARY_OUT(fmax_out, "fmax.out", std::isnan(a) ? b : (std::isnan(b) ? a : (a > b ? a : b)))
+PTSYCL_BINARY_OUT(fmin_out, "fmin.out", std::isnan(a) ? b : (std::isnan(b) ? a : (a < b ? a : b)))
 #undef PTSYCL_BINARY_OUT
+
+PTSYCL_HOST_DEVICE inline double div_floor_d(double a, double b) {
+    if (b == 0) return a / b;
+    const double mod = ::fmod(a, b);
+    double div = (a - mod) / b;
+    if (mod != 0 && ((b < 0) != (mod < 0))) div -= 1.0;
+    if (div == 0) return ::copysign(0.0, a / b);
+    double fl = ::floor(div);
+    if (div - fl > 0.5) fl += 1.0;
+    return fl;
+}
+
+Tensor& div_mode_out(const Tensor& self, const Tensor& other, std::optional<c10::string_view> mode, Tensor& out) {
+    PTSYCL_TRACE_OP("div.out_mode");
+    if (!mode.has_value()) return div_out(self, other, out);
+    const bool integral = c10::isIntegralType(out.scalar_type(), true);
+    if (*mode == "trunc") {
+        binary_kernel(self, other, out, [](double a, double b) { return ::trunc(a / b); });
+    } else {
+        TORCH_CHECK(*mode == "floor", "div expected rounding_mode to be one of None, 'trunc', or 'floor'");
+        if (integral)
+            binary_kernel(self, other, out, [](double a, double b) { return ::floor(a / b); });
+        else
+            binary_kernel(self, other, out, [](double a, double b) { return div_floor_d(a, b); });
+    }
+    return out;
+}
 
 Tensor& fmod_scalar_out(const Tensor& self, const c10::Scalar& other, Tensor& out) {
     return fmod_out(self, wrap_scalar(other, self), out);
@@ -1817,6 +1858,11 @@ std::tuple<Tensor&, Tensor&> topk_out(const Tensor& self, c10::SymInt k_sym,
 std::tuple<Tensor, Tensor> topk(const Tensor& self, c10::SymInt k,
                                 int64_t dim, bool largest, bool sorted) {
     PTSYCL_TRACE_OP("topk");
+    if (self.dim() == 0) {
+        c10::maybe_wrap_dim(dim, 0);
+        auto [v, i] = ptsycl::topk(self.view({1}), k, 0, largest, sorted);
+        return {v.view(c10::IntArrayRef{}), i.view(c10::IntArrayRef{})};
+    }
     const int64_t d  = c10::maybe_wrap_dim(dim, self.dim());
     const int64_t kk = k.guard_int(__FILE__, __LINE__);
     std::vector<int64_t> sizes(self.sizes().begin(), self.sizes().end());
@@ -2052,6 +2098,32 @@ Tensor& logical_not_out(const Tensor& self, Tensor& out) {
     return out;
 }
 
+template <typename Fn>
+Tensor& logical_binary_out(const Tensor& self, const Tensor& other, Tensor& out, Fn fn) {
+    at::native::resize_output(out, at::infer_size(self.sizes(), other.sizes()));
+    if (out.scalar_type() == c10::kBool) {
+        compare_kernel(self, other, out, fn);
+        return out;
+    }
+    Tensor mask = at::empty(out.sizes(), out.options().dtype(c10::kBool));
+    compare_kernel(self, other, mask, fn);
+    out.copy_(mask);
+    return out;
+}
+
+Tensor& logical_and_out(const Tensor& self, const Tensor& other, Tensor& out) {
+    PTSYCL_TRACE_OP("logical_and.out");
+    return logical_binary_out(self, other, out, [](double x, double y) { return x != 0 && y != 0; });
+}
+Tensor& logical_or_out(const Tensor& self, const Tensor& other, Tensor& out) {
+    PTSYCL_TRACE_OP("logical_or.out");
+    return logical_binary_out(self, other, out, [](double x, double y) { return x != 0 || y != 0; });
+}
+Tensor& logical_xor_out(const Tensor& self, const Tensor& other, Tensor& out) {
+    PTSYCL_TRACE_OP("logical_xor.out");
+    return logical_binary_out(self, other, out, [](double x, double y) { return (x != 0) != (y != 0); });
+}
+
 Tensor& isneginf_out(const Tensor& self, Tensor& out) {
     PTSYCL_TRACE_OP("isneginf.out");
     at::native::resize_output(out, self.sizes());
@@ -2091,7 +2163,11 @@ Tensor& any_all_dims(const Tensor& self, c10::IntArrayRef dims_in, bool keepdim,
         : std::vector<int64_t>(dims_in.begin(), dims_in.end());
     std::vector<int64_t> out_sizes;
     std::vector<bool> reduced(self.dim(), false);
-    for (int64_t d : dims) reduced[c10::maybe_wrap_dim(d, self.dim())] = true;
+    for (int64_t d : dims) {
+        const int64_t w = c10::maybe_wrap_dim(d, self.dim());
+        if (self.dim() > 0) reduced[w] = true;
+    }
+    if (self.dim() == 0) dims.clear();
     for (int64_t d = 0; d < self.dim(); ++d) {
         if (!reduced[d]) out_sizes.push_back(self.size(d));
         else if (keepdim) out_sizes.push_back(1);
@@ -2516,6 +2592,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::logaddexp.out", &ptsycl::logaddexp_out);
     m.impl("aten::logaddexp2.out", &ptsycl::logaddexp2_out);
     m.impl("aten::xlogy.OutTensor", &ptsycl::xlogy_out);
+    m.impl("aten::pow.Tensor_Tensor_out", &ptsycl::pow_tensor_out);
+    m.impl("aten::fmax.out", &ptsycl::fmax_out);
+    m.impl("aten::fmin.out", &ptsycl::fmin_out);
+    m.impl("aten::div.out_mode", &ptsycl::div_mode_out);
     m.impl("aten::softplus.out", &ptsycl::softplus_out);
     m.impl("aten::softplus_backward.grad_input", &ptsycl::softplus_backward_out);
     m.impl("aten::elu.out", &ptsycl::elu_out);
@@ -2542,6 +2622,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::sort.values_stable", &ptsycl::sort_out);
 
     m.impl("aten::logical_not.out", &ptsycl::logical_not_out);
+    m.impl("aten::logical_and.out", &ptsycl::logical_and_out);
+    m.impl("aten::logical_or.out", &ptsycl::logical_or_out);
+    m.impl("aten::logical_xor.out", &ptsycl::logical_xor_out);
     m.impl("aten::isneginf.out", &ptsycl::isneginf_out);
     m.impl("aten::isposinf.out", &ptsycl::isposinf_out);
     m.impl("aten::any.all_out", &ptsycl::any_all_out);
