@@ -1440,6 +1440,277 @@ c10::ScalarType cumsum_out_dtype(const Tensor& self,
     return self.scalar_type();
 }
 
+PTSYCL_HOST_DEVICE inline double digamma_d(double x) {
+    constexpr double kPi = 3.14159265358979323846;
+    if (x == 0.0) return ::copysign(std::numeric_limits<double>::infinity(), -x);
+    double result = 0.0;
+    if (x < 0.0) {
+        if (x == ::floor(x)) return std::numeric_limits<double>::quiet_NaN();
+        result = -kPi / ::tan(kPi * x);
+        x = 1.0 - x;
+    }
+    while (x < 6.0) {
+        result -= 1.0 / x;
+        x += 1.0;
+    }
+    const double f = 1.0 / (x * x);
+    return result + ::log(x) - 0.5 / x -
+           f * (1.0 / 12 - f * (1.0 / 120 - f * (1.0 / 252 - f * (1.0 / 240 - f / 132))));
+}
+
+PTSYCL_HOST_DEVICE inline double erfinv_d(double y) {
+    if (!(y > -1.0 && y < 1.0)) {
+        if (y == 1.0) return std::numeric_limits<double>::infinity();
+        if (y == -1.0) return -std::numeric_limits<double>::infinity();
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    double w = -::log((1.0 - y) * (1.0 + y)), p;
+    if (w < 5.0) {
+        w -= 2.5;
+        p = 2.81022636e-08;
+        p = 3.43273939e-07 + p * w; p = -3.5233877e-06 + p * w; p = -4.39150654e-06 + p * w;
+        p = 0.00021858087 + p * w; p = -0.00125372503 + p * w; p = -0.00417768164 + p * w;
+        p = 0.246640727 + p * w; p = 1.50140941 + p * w;
+    } else {
+        w = ::sqrt(w) - 3.0;
+        p = -0.000200214257;
+        p = 0.000100950558 + p * w; p = 0.00134934322 + p * w; p = -0.00367342844 + p * w;
+        p = 0.00573950773 + p * w; p = -0.0076224613 + p * w; p = 0.00943887047 + p * w;
+        p = 1.00167406 + p * w; p = 2.83297682 + p * w;
+    }
+    double x = p * y;
+    constexpr double kTwoOverSqrtPi = 1.12837916709551257390;
+    for (int i = 0; i < 2; ++i) x -= (::erf(x) - y) / (kTwoOverSqrtPi * ::exp(-x * x));
+    return x;
+}
+
+#define PTSYCL_UNARY_OUT(name, expr)                                               \
+    Tensor& name##_out(const Tensor& self, Tensor& out) {                          \
+        PTSYCL_TRACE_OP(#name ".out");                                             \
+        unary_kernel(self, out, [](double v) { return (expr); });                  \
+        return out;                                                                \
+    }
+PTSYCL_UNARY_OUT(erf, ::erf(v))
+PTSYCL_UNARY_OUT(erfc, ::erfc(v))
+PTSYCL_UNARY_OUT(erfinv, erfinv_d(v))
+PTSYCL_UNARY_OUT(expm1, ::expm1(v))
+PTSYCL_UNARY_OUT(log1p, ::log1p(v))
+PTSYCL_UNARY_OUT(log2, ::log2(v))
+PTSYCL_UNARY_OUT(log10, ::log10(v))
+PTSYCL_UNARY_OUT(exp2, ::exp2(v))
+PTSYCL_UNARY_OUT(tan, ::tan(v))
+PTSYCL_UNARY_OUT(asin, ::asin(v))
+PTSYCL_UNARY_OUT(acos, ::acos(v))
+PTSYCL_UNARY_OUT(sinh, ::sinh(v))
+PTSYCL_UNARY_OUT(cosh, ::cosh(v))
+PTSYCL_UNARY_OUT(asinh, ::asinh(v))
+PTSYCL_UNARY_OUT(acosh, ::acosh(v))
+PTSYCL_UNARY_OUT(atanh, ::atanh(v))
+PTSYCL_UNARY_OUT(floor, ::floor(v))
+PTSYCL_UNARY_OUT(trunc, ::trunc(v))
+PTSYCL_UNARY_OUT(frac, v - ::trunc(v))
+PTSYCL_UNARY_OUT(lgamma, ::lgamma(v))
+PTSYCL_UNARY_OUT(digamma, digamma_d(v))
+PTSYCL_UNARY_OUT(sign, v > 0 ? 1.0 : (v < 0 ? -1.0 : v))
+#undef PTSYCL_UNARY_OUT
+
+#define PTSYCL_BINARY_OUT(fn, name, expr)                                          \
+    Tensor& fn(const Tensor& self, const Tensor& other, Tensor& out) {             \
+        PTSYCL_TRACE_OP(name);                                                     \
+        binary_kernel(self, other, out, [](double a, double b) { return (expr); }); \
+        return out;                                                                \
+    }
+PTSYCL_HOST_DEVICE inline double logaddexp_d(double a, double b) {
+    if (a == b && std::isinf(a)) return a;
+    const double m = a > b ? a : b;
+    return m + ::log1p(::exp(-::fabs(a - b)));
+}
+PTSYCL_HOST_DEVICE inline double logaddexp2_d(double a, double b) {
+    if (a == b && std::isinf(a)) return a;
+    const double m = a > b ? a : b;
+    return m + ::log1p(::exp2(-::fabs(a - b))) / 0.69314718055994530942;
+}
+PTSYCL_HOST_DEVICE inline double remainder_d(double a, double b) {
+    const double r = ::fmod(a, b);
+    return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r;
+}
+PTSYCL_BINARY_OUT(atan2_out, "atan2.out", ::atan2(a, b))
+PTSYCL_BINARY_OUT(hypot_out, "hypot.out", ::hypot(a, b))
+PTSYCL_BINARY_OUT(copysign_out, "copysign.out", ::copysign(a, b))
+PTSYCL_BINARY_OUT(fmod_out, "fmod.Tensor_out", ::fmod(a, b))
+PTSYCL_BINARY_OUT(remainder_out, "remainder.Tensor_out", remainder_d(a, b))
+PTSYCL_BINARY_OUT(logaddexp_out, "logaddexp.out", logaddexp_d(a, b))
+PTSYCL_BINARY_OUT(logaddexp2_out, "logaddexp2.out", logaddexp2_d(a, b))
+PTSYCL_BINARY_OUT(xlogy_out, "xlogy.OutTensor", std::isnan(b) ? b : (a == 0 ? 0.0 : a * ::log(b)))
+#undef PTSYCL_BINARY_OUT
+
+Tensor& fmod_scalar_out(const Tensor& self, const c10::Scalar& other, Tensor& out) {
+    return fmod_out(self, wrap_scalar(other, self), out);
+}
+Tensor& remainder_scalar_out(const Tensor& self, const c10::Scalar& other, Tensor& out) {
+    return remainder_out(self, wrap_scalar(other, self), out);
+}
+
+Tensor& softplus_out(const Tensor& self, const c10::Scalar& beta, const c10::Scalar& threshold, Tensor& out) {
+    PTSYCL_TRACE_OP("softplus.out");
+    const double b = beta.toDouble(), t = threshold.toDouble();
+    unary_kernel(self, out, [b, t](double v) { return v * b > t ? v : ::log1p(::exp(v * b)) / b; });
+    return out;
+}
+
+Tensor& softplus_backward_out(const Tensor& grad_output, const Tensor& self, const c10::Scalar& beta,
+                              const c10::Scalar& threshold, Tensor& grad_input) {
+    PTSYCL_TRACE_OP("softplus_backward.grad_input");
+    const double b = beta.toDouble(), t = threshold.toDouble();
+    binary_kernel(grad_output, self, grad_input, [b, t](double g, double x) {
+        if (x * b > t) return g;
+        const double z = ::exp(x * b);
+        return g * z / (z + 1.0);
+    });
+    return grad_input;
+}
+
+Tensor& elu_out(const Tensor& self, const c10::Scalar& alpha, const c10::Scalar& scale,
+                const c10::Scalar& input_scale, Tensor& out) {
+    PTSYCL_TRACE_OP("elu.out");
+    const double a = alpha.toDouble(), s = scale.toDouble(), is = input_scale.toDouble();
+    unary_kernel(self, out, [a, s, is](double v) { return v > 0 ? s * v : s * a * (::exp(v * is) - 1.0); });
+    return out;
+}
+
+Tensor& elu_backward_out(const Tensor& grad_output, const c10::Scalar& alpha, const c10::Scalar& scale,
+                         const c10::Scalar& input_scale, bool is_result, const Tensor& self_or_result,
+                         Tensor& grad_input) {
+    PTSYCL_TRACE_OP("elu_backward.grad_input");
+    const double a = alpha.toDouble(), s = scale.toDouble(), is = input_scale.toDouble();
+    if (is_result)
+        binary_kernel(grad_output, self_or_result, grad_input,
+                      [a, s, is](double g, double y) { return y <= 0 ? g * is * (y + a * s) : g * s; });
+    else
+        binary_kernel(grad_output, self_or_result, grad_input,
+                      [a, s, is](double g, double x) { return x <= 0 ? g * is * a * s * ::exp(x * is) : g * s; });
+    return grad_input;
+}
+
+Tensor& mish_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("mish.out");
+    unary_kernel(self, out, [](double v) { return v * ::tanh(::log1p(::exp(v))); });
+    return out;
+}
+
+Tensor mish_backward(const Tensor& grad_output, const Tensor& self) {
+    PTSYCL_TRACE_OP("mish_backward");
+    Tensor grad_input = at::empty_like(grad_output);
+    binary_kernel(grad_output, self, grad_input, [](double g, double x) {
+        const double t = ::tanh(::log1p(::exp(x)));
+        return g * (t + x * (1.0 / (1.0 + ::exp(-x))) * (1.0 - t * t));
+    });
+    return grad_input;
+}
+
+std::pair<Tensor, Tensor> var_mean_impl(const Tensor& self, at::OptionalIntArrayRef dim,
+                                        const std::optional<c10::Scalar>& correction, bool keepdim) {
+    const auto acc = self.scalar_type() == c10::kDouble ? c10::kDouble : c10::kFloat;
+    const Tensor x = self.to(acc);
+    std::vector<int64_t> dims;
+    if (dim.has_value() && !dim->empty()) dims.assign(dim->begin(), dim->end());
+    else for (int64_t i = 0; i < self.dim(); ++i) dims.push_back(i);
+    int64_t n = 1;
+    for (int64_t d : dims) n *= self.size(c10::maybe_wrap_dim(d, self.dim()));
+    const Tensor mean = x.mean(dims, true);
+    const double c = correction.has_value() ? correction->toDouble() : 1.0;
+    const double denom = std::max(static_cast<double>(n) - c, 0.0);
+    Tensor var = (x - mean).square_().sum(dims, keepdim).div_(denom);
+    Tensor m = keepdim ? mean : mean.squeeze(dims);
+    if (dims.empty()) m = mean;
+    return {var.to(self.scalar_type()), m.to(self.scalar_type())};
+}
+
+Tensor var_correction(const Tensor& self, at::OptionalIntArrayRef dim, const std::optional<c10::Scalar>& correction,
+                      bool keepdim) {
+    PTSYCL_TRACE_OP("var.correction");
+    return var_mean_impl(self, dim, correction, keepdim).first;
+}
+Tensor std_correction(const Tensor& self, at::OptionalIntArrayRef dim, const std::optional<c10::Scalar>& correction,
+                      bool keepdim) {
+    PTSYCL_TRACE_OP("std.correction");
+    return var_mean_impl(self, dim, correction, keepdim).first.sqrt_();
+}
+std::tuple<Tensor, Tensor> var_mean_correction(const Tensor& self, at::OptionalIntArrayRef dim,
+                                               const std::optional<c10::Scalar>& correction, bool keepdim) {
+    PTSYCL_TRACE_OP("var_mean.correction");
+    auto [v, m] = var_mean_impl(self, dim, correction, keepdim);
+    return {v, m};
+}
+std::tuple<Tensor, Tensor> std_mean_correction(const Tensor& self, at::OptionalIntArrayRef dim,
+                                               const std::optional<c10::Scalar>& correction, bool keepdim) {
+    PTSYCL_TRACE_OP("std_mean.correction");
+    auto [v, m] = var_mean_impl(self, dim, correction, keepdim);
+    return {v.sqrt_(), m};
+}
+Tensor& var_correction_out(const Tensor& self, at::OptionalIntArrayRef dim, const std::optional<c10::Scalar>& correction,
+                           bool keepdim, Tensor& out) {
+    Tensor v = var_correction(self, dim, correction, keepdim);
+    out.resize_(v.sizes());
+    return out.copy_(v);
+}
+Tensor& std_correction_out(const Tensor& self, at::OptionalIntArrayRef dim, const std::optional<c10::Scalar>& correction,
+                           bool keepdim, Tensor& out) {
+    Tensor v = std_correction(self, dim, correction, keepdim);
+    out.resize_(v.sizes());
+    return out.copy_(v);
+}
+
+template <typename Step>
+void scan_along(const Tensor& self, int64_t dim, Tensor& out, Step step, double init) {
+    auto& q = queue_for(self);
+    const int64_t d = c10::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+    if (self.dim() == 0) {
+        out.copy_(self);
+        return;
+    }
+    const auto rs_in = split_dims(self, {d});
+    const auto rs_out = split_dims(out, {d});
+    AT_DISPATCH_ALL_TYPES_AND2(c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_scan_in", [&] {
+        using in_t = scalar_t;
+        const in_t* pin = data_ptr<in_t>(self);
+        const auto kin = rs_in.kept;
+        const auto rin = rs_in.red;
+        const int64_t red_n = rs_in.red_n, out_n = rs_in.out_n;
+        AT_DISPATCH_ALL_TYPES_AND2(c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_scan_out", [&] {
+            using out_t = scalar_t;
+            out_t* pout = data_ptr<out_t>(out);
+            const auto kout = rs_out.kept;
+            const auto rout = rs_out.red;
+            launch_flat(q, out_n, [=](std::size_t o_) {
+                const int64_t o = static_cast<int64_t>(o_);
+                double acc = init;
+                for (int64_t j = 0; j < red_n; ++j) {
+                    acc = step(acc, static_cast<double>(pin[kin.index(o) + rin.index(j)]), j);
+                    pout[kout.index(o) + rout.index(j)] = static_cast<out_t>(acc);
+                }
+            });
+        });
+    });
+}
+
+Tensor& cumprod_out(const Tensor& self, int64_t dim, std::optional<c10::ScalarType> , Tensor& out) {
+    PTSYCL_TRACE_OP("cumprod.out");
+    scan_along(self, dim, out, [](double acc, double x, int64_t) { return acc * x; }, 1.0);
+    return out;
+}
+
+Tensor& logcumsumexp_out(const Tensor& self, int64_t dim, Tensor& out) {
+    PTSYCL_TRACE_OP("_logcumsumexp.out");
+    scan_along(self, dim, out, [](double acc, double x, int64_t j) { return j == 0 ? x : logaddexp_d(acc, x); }, 0.0);
+    return out;
+}
+
+Tensor logcumsumexp(const Tensor& self, int64_t dim) {
+    Tensor out = at::empty_like(self);
+    return logcumsumexp_out(self, dim, out);
+}
+
 Tensor& cumsum_out(const Tensor& self, int64_t dim,
                    c10::optional<c10::ScalarType> /*dtype*/, Tensor& out) {
     PTSYCL_TRACE_OP("cumsum.out");
@@ -2210,6 +2481,53 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::_log_softmax_backward_data.out",
            &ptsycl::log_softmax_backward_out);
     m.impl("aten::cumsum", &ptsycl::cumsum);
+    m.impl("aten::cumprod.out", &ptsycl::cumprod_out);
+    m.impl("aten::_logcumsumexp", &ptsycl::logcumsumexp);
+    m.impl("aten::_logcumsumexp.out", &ptsycl::logcumsumexp_out);
+    m.impl("aten::erf.out", &ptsycl::erf_out);
+    m.impl("aten::erfc.out", &ptsycl::erfc_out);
+    m.impl("aten::erfinv.out", &ptsycl::erfinv_out);
+    m.impl("aten::expm1.out", &ptsycl::expm1_out);
+    m.impl("aten::log1p.out", &ptsycl::log1p_out);
+    m.impl("aten::log2.out", &ptsycl::log2_out);
+    m.impl("aten::log10.out", &ptsycl::log10_out);
+    m.impl("aten::exp2.out", &ptsycl::exp2_out);
+    m.impl("aten::tan.out", &ptsycl::tan_out);
+    m.impl("aten::asin.out", &ptsycl::asin_out);
+    m.impl("aten::acos.out", &ptsycl::acos_out);
+    m.impl("aten::sinh.out", &ptsycl::sinh_out);
+    m.impl("aten::cosh.out", &ptsycl::cosh_out);
+    m.impl("aten::asinh.out", &ptsycl::asinh_out);
+    m.impl("aten::acosh.out", &ptsycl::acosh_out);
+    m.impl("aten::atanh.out", &ptsycl::atanh_out);
+    m.impl("aten::floor.out", &ptsycl::floor_out);
+    m.impl("aten::trunc.out", &ptsycl::trunc_out);
+    m.impl("aten::frac.out", &ptsycl::frac_out);
+    m.impl("aten::lgamma.out", &ptsycl::lgamma_out);
+    m.impl("aten::digamma.out", &ptsycl::digamma_out);
+    m.impl("aten::sign.out", &ptsycl::sign_out);
+    m.impl("aten::atan2.out", &ptsycl::atan2_out);
+    m.impl("aten::hypot.out", &ptsycl::hypot_out);
+    m.impl("aten::copysign.out", &ptsycl::copysign_out);
+    m.impl("aten::fmod.Tensor_out", &ptsycl::fmod_out);
+    m.impl("aten::fmod.Scalar_out", &ptsycl::fmod_scalar_out);
+    m.impl("aten::remainder.Tensor_out", &ptsycl::remainder_out);
+    m.impl("aten::remainder.Scalar_out", &ptsycl::remainder_scalar_out);
+    m.impl("aten::logaddexp.out", &ptsycl::logaddexp_out);
+    m.impl("aten::logaddexp2.out", &ptsycl::logaddexp2_out);
+    m.impl("aten::xlogy.OutTensor", &ptsycl::xlogy_out);
+    m.impl("aten::softplus.out", &ptsycl::softplus_out);
+    m.impl("aten::softplus_backward.grad_input", &ptsycl::softplus_backward_out);
+    m.impl("aten::elu.out", &ptsycl::elu_out);
+    m.impl("aten::elu_backward.grad_input", &ptsycl::elu_backward_out);
+    m.impl("aten::mish.out", &ptsycl::mish_out);
+    m.impl("aten::mish_backward", &ptsycl::mish_backward);
+    m.impl("aten::var.correction", &ptsycl::var_correction);
+    m.impl("aten::var.correction_out", &ptsycl::var_correction_out);
+    m.impl("aten::std.correction", &ptsycl::std_correction);
+    m.impl("aten::std.correction_out", &ptsycl::std_correction_out);
+    m.impl("aten::var_mean.correction", &ptsycl::var_mean_correction);
+    m.impl("aten::std_mean.correction", &ptsycl::std_mean_correction);
     m.impl("aten::cumsum.out", &ptsycl::cumsum_out);
     m.impl("aten::cumsum_", &ptsycl::cumsum_);
     m.impl("aten::topk", &ptsycl::topk);

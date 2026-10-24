@@ -40,6 +40,7 @@ MODULES = [
     "test_nn_device_ops",
     "test_streams",
     "test_amp",
+    "test_more_ops",
 ]
 
 
