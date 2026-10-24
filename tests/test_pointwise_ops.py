@@ -596,3 +596,22 @@ def test_safe_softmax_masked_rows_dtype_and_grad(device):
     (torch.ops.aten._safe_softmax(xs, -1, None) * w).sum().backward()
     (torch.ops.aten._safe_softmax(dxs, -1, None) * w.to(device)).sum().backward()
     torch.testing.assert_close(dxs.grad.cpu(), xs.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_vectorized_contiguous_path_matches_strided(device):
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        a = torch.randn(64, 515).to(device, dtype)
+        b = torch.randn(64, 515).to(device, dtype)
+        at, bt = a.t().contiguous().t(), b.t().contiguous().t()
+        for name, fn in (("mul", torch.mul), ("add", torch.add), ("div", torch.div)):
+            assert torch.equal(fn(a, b).cpu(), fn(at, bt).cpu()), (dtype, name)
+        for name, fn in (("silu", torch.nn.functional.silu), ("exp", torch.exp), ("neg", torch.neg)):
+            assert torch.equal(fn(a).cpu(), fn(at).cpu()), (dtype, name)
+
+
+def test_transcendentals_at_fp32_opmath(device):
+    x = torch.randn(4096) * 4
+    for fn in (torch.nn.functional.silu, torch.exp, torch.sigmoid):
+        got = fn(x.to(device)).cpu()
+        ref = fn(x.double()).float()
+        assert torch.allclose(got, ref, rtol=4e-7, atol=1e-30), fn

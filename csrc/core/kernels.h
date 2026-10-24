@@ -20,6 +20,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <type_traits>
 #include <vector>
@@ -161,6 +162,9 @@ PTSYCL_HOST_DEVICE inline void atomic_add(T* address, T val) {
 #endif
 }
 
+PTSYCL_HOST_DEVICE inline float opmath_exp(float v) { return ::expf(v); }
+PTSYCL_HOST_DEVICE inline double opmath_exp(double v) { return ::exp(v); }
+
 template <typename F>
 inline void launch_flat(compat::Queue& q, int64_t n, F fn) {
     if (n <= 0) return;
@@ -230,7 +234,16 @@ PTSYCL_HOST_DEVICE inline acc_t reduce_row_in_group(const sycl::nd_item<1>& it, 
                                                     const Map& map, const Combine& combine) {
     const int l = static_cast<int>(it.get_local_id(0));
     acc_t acc = init;
-    for (int64_t j = l; j < red_n; j += kReduceWG) acc = combine(acc, map(o, j));
+    constexpr int kAhead = 8;
+    int64_t j = l;
+    for (; j + (kAhead - 1) * kReduceWG < red_n; j += kAhead * kReduceWG) {
+        acc_t v[kAhead];
+#pragma unroll
+        for (int t = 0; t < kAhead; ++t) v[t] = map(o, j + t * kReduceWG);
+#pragma unroll
+        for (int t = 0; t < kAhead; ++t) acc = combine(acc, v[t]);
+    }
+    for (; j < red_n; j += kReduceWG) acc = combine(acc, map(o, j));
     return combine_in_group(it, lds, acc, combine);
 }
 

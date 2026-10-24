@@ -34,19 +34,82 @@ using at::Tensor;
 // Elementwise launch helpers
 // -----------------------------------------------------------------------------
 
+template <typename T, int V>
+struct alignas(16) VecChunk {
+    T v[V];
+};
+
+inline bool vec_ok(compat::Queue& q, const Tensor& out, std::initializer_list<const Tensor*> ins) {
+    const int64_t max_bytes = ins.size() > 1 ? 2 : 4;
+    if (!q.is_gpu() || out.element_size() > max_bytes || !out.is_contiguous() || out.numel() < 4096 ||
+        reinterpret_cast<std::uintptr_t>(out.data_ptr()) % 16)
+        return false;
+    for (const Tensor* t : ins)
+        if (!t->is_contiguous() || t->sizes() != out.sizes() || t->scalar_type() != out.scalar_type() ||
+            reinterpret_cast<std::uintptr_t>(t->data_ptr()) % 16)
+            return false;
+    return true;
+}
+
+template <typename T, typename C = double, typename Fn>
+void unary_vec(compat::Queue& q, const T* pa, T* po, int64_t n, Fn fn) {
+    constexpr int V = 16 / sizeof(T);
+    using Ch = VecChunk<T, V>;
+    const int64_t chunks = (n + V - 1) / V;
+    launch_flat(q, chunks, [=](std::size_t c) {
+        const int64_t i0 = static_cast<int64_t>(c) * V;
+        if (i0 + V <= n) {
+            const Ch x = reinterpret_cast<const Ch*>(pa)[c];
+            Ch y;
+#pragma unroll
+            for (int e = 0; e < V; ++e) y.v[e] = static_cast<T>(fn(static_cast<C>(x.v[e])));
+            reinterpret_cast<Ch*>(po)[c] = y;
+        } else {
+            for (int64_t i = i0; i < n; ++i) po[i] = static_cast<T>(fn(static_cast<C>(pa[i])));
+        }
+    });
+}
+
+template <typename T, typename Fn>
+void binary_vec(compat::Queue& q, const T* pa, const T* pb, T* po, int64_t n, Fn fn) {
+    constexpr int V = 16 / sizeof(T);
+    using Ch = VecChunk<T, V>;
+    const int64_t chunks = (n + V - 1) / V;
+    launch_flat(q, chunks, [=](std::size_t c) {
+        const int64_t i0 = static_cast<int64_t>(c) * V;
+        if (i0 + V <= n) {
+            const Ch x = reinterpret_cast<const Ch*>(pa)[c];
+            const Ch z = reinterpret_cast<const Ch*>(pb)[c];
+            Ch y;
+#pragma unroll
+            for (int e = 0; e < V; ++e)
+                y.v[e] = static_cast<T>(fn(static_cast<double>(x.v[e]), static_cast<double>(z.v[e])));
+            reinterpret_cast<Ch*>(po)[c] = y;
+        } else {
+            for (int64_t i = i0; i < n; ++i)
+                po[i] = static_cast<T>(fn(static_cast<double>(pa[i]), static_cast<double>(pb[i])));
+        }
+    });
+}
+
 template <typename Fn>
 void unary_kernel(const Tensor& a, Tensor& out, Fn fn) {
     auto& q = queue_for(out);
     const int64_t n = out.numel();
     if (n == 0) return;
     Tensor ae = a.expand_as(out);
+    const bool vec = vec_ok(q, out, {&ae});
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, ae.scalar_type(), "ptsycl_unary", [&] {
-            const auto sa = make_flat_spec(ae);
-            const auto so = make_flat_spec(out);
             const scalar_t* pa = data_ptr<scalar_t>(ae);
             scalar_t* po = data_ptr<scalar_t>(out);
+            if (vec) {
+                unary_vec<scalar_t>(q, pa, po, n, fn);
+                return;
+            }
+            const auto sa = make_flat_spec(ae);
+            const auto so = make_flat_spec(out);
             launch_flat(q, n, [=](std::size_t idx) {
                 const int64_t i = static_cast<int64_t>(idx);
                 po[so.index(i)] = static_cast<scalar_t>(
@@ -55,6 +118,36 @@ void unary_kernel(const Tensor& a, Tensor& out, Fn fn) {
         });
 }
 
+
+template <typename Fn>
+void unary_opmath(const Tensor& a, Tensor& out, Fn fn) {
+    const auto st = out.scalar_type();
+    if (!(st == c10::kFloat || st == c10::kHalf || st == c10::kBFloat16) || a.scalar_type() != st) {
+        unary_kernel(a, out, [fn](double v) { return fn(v); });
+        return;
+    }
+    auto& q = queue_for(out);
+    const int64_t n = out.numel();
+    if (n == 0) return;
+    Tensor ae = a.expand_as(out);
+    const bool vec = vec_ok(q, out, {&ae});
+    AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, st, "ptsycl_unary_opmath", [&] {
+        if constexpr (!std::is_same_v<scalar_t, double>) {
+            const scalar_t* pa = data_ptr<scalar_t>(ae);
+            scalar_t* po = data_ptr<scalar_t>(out);
+            if (vec) {
+                unary_vec<scalar_t, float>(q, pa, po, n, fn);
+                return;
+            }
+            const auto sa = make_flat_spec(ae);
+            const auto so = make_flat_spec(out);
+            launch_flat(q, n, [=](std::size_t idx) {
+                const int64_t i = static_cast<int64_t>(idx);
+                po[so.index(i)] = static_cast<scalar_t>(fn(static_cast<float>(pa[sa.index(i)])));
+            });
+        }
+    });
+}
 
 Tensor to_compute(const Tensor& t, c10::ScalarType dtype, c10::Device device) {
     if (t.scalar_type() == dtype && t.device() == device) return t;
@@ -90,15 +183,20 @@ void binary_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
     }
     Tensor ae = to_compute(a, out.scalar_type(), out.device()).expand_as(out);
     Tensor be = to_compute(b, out.scalar_type(), out.device()).expand_as(out);
+    const bool vec = vec_ok(q, out, {&ae, &be});
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, ae.scalar_type(), "ptsycl_binary", [&] {
-            const auto sa = make_flat_spec(ae);
-            const auto sb = make_flat_spec(be);
-            const auto so = make_flat_spec(out);
             const scalar_t* pa = data_ptr<scalar_t>(ae);
             const scalar_t* pb = data_ptr<scalar_t>(be);
             scalar_t* po = data_ptr<scalar_t>(out);
+            if (vec) {
+                binary_vec<scalar_t>(q, pa, pb, po, n, fn);
+                return;
+            }
+            const auto sa = make_flat_spec(ae);
+            const auto sb = make_flat_spec(be);
+            const auto so = make_flat_spec(out);
             launch_flat(q, n, [=](std::size_t idx) {
                 const int64_t i = static_cast<int64_t>(idx);
                 po[so.index(i)] = static_cast<scalar_t>(
@@ -194,7 +292,7 @@ enum class ReduceKind { Sum, Prod, Min, Max };
 template <typename in_t, typename acc_t>
 void reduce_dims_typed(compat::Queue& q, const in_t* in,
                        const ReduceShape& rs, const Tensor& out_view,
-                       ReduceKind kind) {
+                       ReduceKind kind, double post_scale = 1.0) {
     const auto kept = rs.kept;
     const auto red  = rs.red;
     const int64_t red_n = rs.red_n;
@@ -231,7 +329,9 @@ void reduce_dims_typed(compat::Queue& q, const in_t* in,
                 },
                 combine,
                 [=](int64_t o, acc_t acc) {
-                    po[so.index(o)] = static_cast<out_t>(acc);
+                    out_t v = static_cast<out_t>(acc);
+                    if (post_scale != 1.0) v = static_cast<out_t>(static_cast<double>(v) * post_scale);
+                    po[so.index(o)] = v;
                 },
                 out_view);
         });
@@ -250,16 +350,11 @@ void reduce_dims_op(const Tensor& self, c10::ArrayRef<int64_t> dims,
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_reduce", [&] {
             const scalar_t* in = data_ptr<scalar_t>(self);
             if (c10::isIntegralType(self.scalar_type(), true)) {
-                reduce_dims_typed<scalar_t, int64_t>(q, in, rs, out_view, kind);
+                reduce_dims_typed<scalar_t, int64_t>(q, in, rs, out_view, kind, post_scale);
             } else {
-                reduce_dims_typed<scalar_t, double>(q, in, rs, out_view, kind);
+                reduce_dims_typed<scalar_t, double>(q, in, rs, out_view, kind, post_scale);
             }
         });
-
-    if (post_scale != 1.0) {
-        Tensor ov = out_view;
-        unary_kernel(ov, ov, [post_scale](double v) { return v * post_scale; });
-    }
 }
 
 std::vector<int64_t> all_dims(const Tensor& t) {
@@ -358,7 +453,7 @@ Tensor& addcdiv_out(const Tensor& self, const Tensor& t1, const Tensor& t2,
 
 // --- unary math ---------------------------------------------------------------
 Tensor& exp_out(const Tensor& self, Tensor& out) {
-    unary_kernel(self, out, [](double v) { return ::exp(v); });
+    unary_opmath(self, out, [](auto v) { return opmath_exp(v); });
     return out;
 }
 Tensor& log_out(const Tensor& self, Tensor& out) {
@@ -452,7 +547,7 @@ Tensor& sigmoid_out(const Tensor& self, Tensor& out) {
         return out;
     }
 
-    unary_kernel(self, out, [](double v) { return 1.0 / (1.0 + ::exp(-v)); });
+    unary_opmath(self, out, [](auto v) { return decltype(v)(1) / (decltype(v)(1) + opmath_exp(-v)); });
     return out;
 }
 Tensor sigmoid(const Tensor& self) {
@@ -487,8 +582,7 @@ Tensor& silu_out(const Tensor& self, Tensor& out) {
     if (clap_dnn::try_silu_forward(self, out)) {
         return out;
     }
-    unary_kernel(self, out,
-                 [](double v) { return v / (1.0 + ::exp(-v)); });
+    unary_opmath(self, out, [](auto v) { return v / (decltype(v)(1) + opmath_exp(-v)); });
     return out;
 }
 Tensor& silu_backward_out(const Tensor& grad_output, const Tensor& self,

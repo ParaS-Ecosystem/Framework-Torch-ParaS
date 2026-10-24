@@ -199,8 +199,8 @@ void moe_expert_gemv(compat::Queue& q, const int32_t* meta, int64_t S, const T* 
                         if (m < mr && n0 + c < N) {
                             T res;
                             if constexpr (GateUp) {
-                                const double gt = static_cast<double>(static_cast<T>(mine[0]));
-                                const T act = static_cast<T>(gt / (1.0 + ::exp(-gt)));
+                                const float gt = static_cast<float>(static_cast<T>(mine[0]));
+                                const T act = static_cast<T>(gt / (1.f + ::expf(-gt)));
                                 const T up = static_cast<T>(mine[1]);
                                 res = static_cast<T>(static_cast<double>(act) * static_cast<double>(up));
                             } else {

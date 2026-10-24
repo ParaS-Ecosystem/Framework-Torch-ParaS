@@ -344,8 +344,9 @@ Tensor swiglu(const Tensor& gate, const Tensor& up) {
 
             launch_flat(q, n, [=](std::size_t idx) {
                 const int64_t i = static_cast<int64_t>(idx);
-                const double g = static_cast<double>(pg[sg.index(i)]);
-                const scalar_t s = static_cast<scalar_t>(g / (1.0 + ::exp(-g)));
+                using opmath_t = std::conditional_t<std::is_same_v<scalar_t, double>, double, float>;
+                const opmath_t g = static_cast<opmath_t>(pg[sg.index(i)]);
+                const scalar_t s = static_cast<scalar_t>(g / (opmath_t(1) + opmath_exp(-g)));
                 po[so.index(i)] = static_cast<scalar_t>(
                     static_cast<double>(s) * static_cast<double>(pu[su.index(i)]));
             });

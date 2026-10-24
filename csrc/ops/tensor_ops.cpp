@@ -173,16 +173,44 @@ void device_scatter_strided(compat::Queue& q, const void* src, Tensor& dst) {
 }
 
 
+template <typename T, int V>
+struct alignas(sizeof(T) * V) ConvertChunk {
+    T v[V];
+};
+
+template <typename T, typename SrcT>
+void convert_contiguous(compat::Queue& q, const SrcT* s, T* d, int64_t n) {
+    constexpr int V = 4;
+    const bool vec = q.is_gpu() && n >= 4096 &&
+                     reinterpret_cast<std::uintptr_t>(s) % (sizeof(SrcT) * V) == 0 &&
+                     reinterpret_cast<std::uintptr_t>(d) % (sizeof(T) * V) == 0;
+    if (!vec) {
+        launch_flat(q, n, [=](std::size_t i) { d[i] = static_cast<T>(s[i]); });
+        return;
+    }
+    using In = ConvertChunk<SrcT, V>;
+    using Out = ConvertChunk<T, V>;
+    launch_flat(q, (n + V - 1) / V, [=](std::size_t c) {
+        const int64_t i0 = static_cast<int64_t>(c) * V;
+        if (i0 + V <= n) {
+            const In x = reinterpret_cast<const In*>(s)[c];
+            Out y;
+#pragma unroll
+            for (int e = 0; e < V; ++e) y.v[e] = static_cast<T>(x.v[e]);
+            reinterpret_cast<Out*>(d)[c] = y;
+        } else {
+            for (int64_t i = i0; i < n; ++i) d[i] = static_cast<T>(s[i]);
+        }
+    });
+}
+
 template <typename SrcT>
 void device_convert_from(compat::Queue& q, const SrcT* s, Tensor& dst,
                          int64_t n) {
     switch (dst.scalar_type()) {
 #define CASE(T, ST)                                                           \
     case ST: {                                                                \
-        T* d = data_ptr<T>(dst);                                              \
-        launch_flat(q, n, [=](std::size_t i) {                                \
-            d[i] = static_cast<T>(s[i]);                                      \
-        });                                                                   \
+        convert_contiguous<T>(q, s, data_ptr<T>(dst), n);                     \
         break;                                                                \
     }
         PTSYCL_COPY_TYPES(CASE)
