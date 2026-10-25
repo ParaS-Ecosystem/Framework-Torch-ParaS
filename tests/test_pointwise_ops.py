@@ -619,3 +619,18 @@ def test_transcendentals_at_fp32_opmath(device):
         got = fn(x.to(device)).cpu()
         ref = fn(x.double()).float()
         assert torch.allclose(got, ref, rtol=4e-7, atol=1e-30), fn
+
+
+def test_softmax_rows_lengths(device):
+    torch.manual_seed(0)
+    for n in (7, 256, 300, 1000, 2048, 4096, 9000, 16384):
+        for dtype, tol in ((torch.float32, 1e-6), (torch.bfloat16, 1e-2), (torch.float16, 1e-3)):
+            x = (torch.randn(3, n) * 4).to(dtype)
+            x[1, : n // 2] = float("-inf")
+            got = torch.softmax(x.to(device), -1).cpu().float()
+            ref = torch.softmax(x.float(), -1)
+            assert torch.allclose(got, ref, atol=tol, rtol=tol), (n, dtype, (got - ref).abs().max())
+    x = torch.randn(2, 4096)
+    x[0] = float("-inf")
+    assert torch.isnan(torch.softmax(x.to(device), -1).cpu()[0]).all()
+    assert torch.equal(torch.ops.aten._safe_softmax(x.to(device), -1, None).cpu()[0], torch.zeros(4096))

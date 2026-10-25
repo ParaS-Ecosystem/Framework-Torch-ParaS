@@ -1099,34 +1099,62 @@ struct MaxSumD {
 };
 
 #if defined(PTSYCL_BACKEND_SYCL)
-template <typename in_t, typename out_t> class SoftmaxRowsKernel;
+template <typename in_t, typename out_t, int K> class SoftmaxRowsKernel;
 
-template <typename in_t, typename out_t>
-void softmax_rows(compat::Queue& q, const in_t* pin, out_t* pout, int64_t rows, int64_t n, bool safe) {
-    constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+template <typename in_t, typename out_t, int K>
+void softmax_rows_k(compat::Queue& q, const in_t* pin, out_t* pout, int64_t rows, int64_t n, bool safe) {
+    using acc_t = std::conditional_t<std::is_same_v<in_t, double>, double, float>;
+    constexpr acc_t kNegInf = -std::numeric_limits<acc_t>::infinity();
     q.sycl_queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<double, 1> lds(sycl::range<1>(kReduceWG), cgh);
-        cgh.parallel_for<SoftmaxRowsKernel<in_t, out_t>>(
+        sycl::local_accessor<acc_t, 1> lds(sycl::range<1>(kReduceWG), cgh);
+        cgh.parallel_for<SoftmaxRowsKernel<in_t, out_t, K>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kReduceWG)),
                               sycl::range<1>(kReduceWG)),
             [=](sycl::nd_item<1> it) {
                 const int64_t r = static_cast<int64_t>(it.get_group(0));
+                const int64_t l = static_cast<int64_t>(it.get_local_id(0));
                 const in_t* x = pin + r * n;
-                const double m = reduce_row_in_group<double>(
-                    it, &lds[0], r, n, kNegInf, [=](int64_t, int64_t j) { return static_cast<double>(x[j]); },
-                    [](double a, double b) { return a > b ? a : b; });
+                acc_t v[K];
+                acc_t m = kNegInf;
+#pragma unroll
+                for (int t = 0; t < K; ++t) {
+                    const int64_t j = l + t * kReduceWG;
+                    v[t] = j < n ? static_cast<acc_t>(x[j]) : kNegInf;
+                    m = v[t] > m ? v[t] : m;
+                }
+                m = combine_in_group(it, &lds[0], m, [](acc_t a, acc_t b) { return a > b ? a : b; });
                 sycl::group_barrier(it.get_group());
-                const double sum = m == kNegInf ? 0.0 : reduce_row_in_group<double>(
-                    it, &lds[0], r, n, 0.0,
-                    [=](int64_t, int64_t j) { return ::exp(static_cast<double>(x[j]) - m); },
-                    [](double a, double b) { return a + b; });
-                for (int64_t j = static_cast<int64_t>(it.get_local_id(0)); j < n; j += kReduceWG) {
-                    const double v = m == kNegInf ? (safe ? 0.0 : std::numeric_limits<double>::quiet_NaN())
-                                                  : ::exp(static_cast<double>(x[j]) - m) / sum;
-                    pout[r * n + j] = static_cast<out_t>(v);
+                acc_t sum = 0;
+                if (m != kNegInf) {
+#pragma unroll
+                    for (int t = 0; t < K; ++t) {
+                        v[t] = v[t] == kNegInf ? acc_t(0) : ::exp(v[t] - m);
+                        sum += v[t];
+                    }
+                }
+                sum = combine_in_group(it, &lds[0], sum, [](acc_t a, acc_t b) { return a + b; });
+                const acc_t inv = acc_t(1) / sum;
+#pragma unroll
+                for (int t = 0; t < K; ++t) {
+                    const int64_t j = l + t * kReduceWG;
+                    if (j < n)
+                        pout[r * n + j] = static_cast<out_t>(
+                            m == kNegInf ? (safe ? acc_t(0) : std::numeric_limits<acc_t>::quiet_NaN()) : v[t] * inv);
                 }
             });
     });
+}
+
+template <typename in_t, typename out_t>
+void softmax_rows(compat::Queue& q, const in_t* pin, out_t* pout, int64_t rows, int64_t n, bool safe) {
+    const int64_t per = (n + kReduceWG - 1) / kReduceWG;
+    if (per <= 1) softmax_rows_k<in_t, out_t, 1>(q, pin, pout, rows, n, safe);
+    else if (per <= 2) softmax_rows_k<in_t, out_t, 2>(q, pin, pout, rows, n, safe);
+    else if (per <= 4) softmax_rows_k<in_t, out_t, 4>(q, pin, pout, rows, n, safe);
+    else if (per <= 8) softmax_rows_k<in_t, out_t, 8>(q, pin, pout, rows, n, safe);
+    else if (per <= 16) softmax_rows_k<in_t, out_t, 16>(q, pin, pout, rows, n, safe);
+    else if (per <= 32) softmax_rows_k<in_t, out_t, 32>(q, pin, pout, rows, n, safe);
+    else softmax_rows_k<in_t, out_t, 64>(q, pin, pout, rows, n, safe);
 }
 #endif
 
