@@ -61,10 +61,8 @@ Tensor moe_experts_composite(const Tensor& x, const Tensor& ids, const Tensor& w
     return routed.view({T, K, H}).to(w.scalar_type()).mul_(weights.unsqueeze(-1)).sum(1).to(x.scalar_type());
 }
 
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
 constexpr int kMoeThreads = 256;
-constexpr int kMoeLanes = 64;
-constexpr int kMoeWaves = kMoeThreads / kMoeLanes;
 constexpr int kMoeCols = 4;
 constexpr int kMoeRows = 4;
 
@@ -74,7 +72,7 @@ struct alignas(sizeof(T) * V) MoeChunk {
 };
 
 class MoeRoutesKernel;
-template <typename T, bool GateUp> class MoeExpertKernel;
+template <typename T, bool GateUp, int Lanes> class MoeExpertKernel;
 template <typename T, typename WT> class MoeCombineKernel;
 
 void moe_routes(compat::Queue& q, const int64_t* ids, int64_t R, int64_t E, int64_t S, int32_t* meta) {
@@ -125,17 +123,19 @@ void moe_routes(compat::Queue& q, const int64_t* ids, int64_t R, int64_t E, int6
     });
 }
 
-template <typename T, bool GateUp>
+template <typename T, bool GateUp, int Lanes>
 void moe_expert_gemv(compat::Queue& q, const int32_t* meta, int64_t S, const T* X, int64_t ldx,
                      int64_t div, const T* W0, int64_t es0, const T* W1, int64_t es1, int64_t N,
                      int64_t Kd, T* out) {
+    constexpr int kMoeLanes = Lanes, kMoeWaves = kMoeThreads / Lanes;
+    static_assert(kMoeRows * kMoeCols <= Lanes, "a lane per output of a pass");
     constexpr int V = 16 / sizeof(T);
     constexpr int M = GateUp ? 2 : 1;
     using Ch = MoeChunk<T, V>;
     const int64_t chunks = Kd / V;
     const int64_t tiles = (N + kMoeWaves * kMoeCols - 1) / (kMoeWaves * kMoeCols);
     q.sycl_queue().submit([&](sycl::handler& cgh) {
-        cgh.template parallel_for<MoeExpertKernel<T, GateUp>>(
+        cgh.template parallel_for<MoeExpertKernel<T, GateUp, Lanes>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(S * tiles * kMoeThreads)),
                               sycl::range<1>(kMoeThreads)),
             [=](sycl::nd_item<1> it) {
@@ -426,7 +426,7 @@ bool device_path(const Tensor& x, const Tensor& ids, const Tensor& w, const Tens
                  const Tensor& w_up, const Tensor& w_down) {
     if (x.device().type() != c10::DeviceType::PrivateUse1) return false;
     auto& q = queue_for(x);
-    if (!q.wave64()) return false;
+    if (!q.wave64() && q.wave_size() != 32) return false;
     const int64_t R = ids.numel(), E = w_gate.size(0);
     if (R == 0) return false;
     const bool grouped = moe_grouped_ok(x, w_gate.size(2), w_gate.size(1)) && R >= kMoeGroupedRoutes;
@@ -474,13 +474,18 @@ Tensor moe_experts_device(const Tensor& x, const Tensor& ids, const Tensor& w, c
                                                      H, I, data_ptr<scalar_t>(y));
                 }
             } else {
-                moe_expert_gemv<scalar_t, true>(q, pm, S, data_ptr<scalar_t>(x), H, K,
-                                                data_ptr<scalar_t>(w_gate), w_gate.stride(0),
-                                                data_ptr<scalar_t>(w_up), w_up.stride(0), I, H,
-                                                data_ptr<scalar_t>(h));
-                moe_expert_gemv<scalar_t, false>(q, pm, S, data_ptr<scalar_t>(h), I, 1,
-                                                 data_ptr<scalar_t>(w_down), w_down.stride(0), nullptr, 0,
-                                                 H, I, data_ptr<scalar_t>(y));
+                auto gemvs = [&](auto lanes) {
+                    constexpr int L = decltype(lanes)::value;
+                    moe_expert_gemv<scalar_t, true, L>(q, pm, S, data_ptr<scalar_t>(x), H, K,
+                                                       data_ptr<scalar_t>(w_gate), w_gate.stride(0),
+                                                       data_ptr<scalar_t>(w_up), w_up.stride(0), I, H,
+                                                       data_ptr<scalar_t>(h));
+                    moe_expert_gemv<scalar_t, false, L>(q, pm, S, data_ptr<scalar_t>(h), I, 1,
+                                                        data_ptr<scalar_t>(w_down), w_down.stride(0), nullptr, 0,
+                                                        H, I, data_ptr<scalar_t>(y));
+                };
+                if (q.wave64()) gemvs(std::integral_constant<int, 64>{});
+                else gemvs(std::integral_constant<int, 32>{});
             }
             if (w.scalar_type() == c10::kFloat)
                 moe_combine<scalar_t, float>(q, data_ptr<scalar_t>(y), pid, data_ptr<float>(w), T, K, H, E,
@@ -521,7 +526,7 @@ Tensor moe_experts(const Tensor& x, const Tensor& topk_ids, const Tensor& topk_w
     PTSYCL_TRACE_OP("paras::moe_experts");
     check_args(x, topk_ids, topk_weight, w_gate, w_up, w_down);
     if (x.size(0) == 0) return at::empty({0, x.size(1)}, x.options());
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
     if (device_path(x, topk_ids, topk_weight, w_gate, w_up, w_down))
         return moe_experts_device(x, topk_ids, topk_weight, w_gate, w_up, w_down);
 #endif

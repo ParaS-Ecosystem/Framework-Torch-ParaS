@@ -192,9 +192,17 @@ def test_moe_experts_needs_no_grad(device):
         raise AssertionError("expected an error with weights that require grad")
 
 
+def _device_path(device) -> bool:
+    """paras::moe_experts' device path (no host read, capturable): GPUs with
+    64-lane (CDNA) or 32-lane (NVIDIA) wavefronts, generic kernels not forced."""
+    index = torch.device(device).index or 0
+    caps = torch_paras.device_kernel_caps(index)
+    return torch_paras.is_gpu_device(index) and not caps["generic"] and caps["wave_size"] in (32, 64)
+
+
 def test_moe_experts_graph_capture(device):
-    if not fast_kernels(device):
-        raise unittest.SkipTest("the device path (capturable) needs the AMD wavefront kernels")
+    if not _device_path(device):
+        raise unittest.SkipTest("the device path (capturable) needs 32- or 64-lane wavefronts")
     if not graphs.is_supported():
         raise unittest.SkipTest("ParaS without record-and-replay command graphs")
     m = _model(device, torch.bfloat16)
