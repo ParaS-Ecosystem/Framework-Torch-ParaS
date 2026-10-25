@@ -87,7 +87,14 @@ void* MemoryPool::acquire(std::size_t nbytes, int stream) {
             return p;
         }
     }
-    void* p = queue_.alloc(rounded);
+    void* p = nullptr;
+    try {
+        p = queue_.alloc(rounded);
+    } catch (const std::exception&) {
+        if (capturing()) throw;
+        clear();
+        p = queue_.alloc(rounded);
+    }
     {
         std::lock_guard<std::mutex> g(mutex_);
         live_[p] = Live{rounded, pool, stream};
