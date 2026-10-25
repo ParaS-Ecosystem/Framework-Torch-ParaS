@@ -28,6 +28,10 @@
 
 #include "core/graphs.h"
 #include "core/kernels.h"
+
+#if PTSYCL_WMMA_FLASH
+#include <mma.h>
+#endif
 #include "ops/device_gemm.h"
 
 namespace ptsycl {
@@ -66,10 +70,12 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
 #if PTSYCL_SDPA_GEMM_PATH
         auto& qq = queue_for(q);
         if (!qq.is_gpu()) return false;
-        const bool flash = qq.mfma() && v.sym_size(3) == q.sym_size(3) &&
+        const bool wmma = PTSYCL_WMMA_FLASH && dt == c10::kHalf && v.sym_size(3) == q.sym_size(3) &&
+                          (q.sym_size(3) == 64 || q.sym_size(3) == 128);
+        const bool flash = wmma || (qq.mfma() && v.sym_size(3) == q.sym_size(3) &&
                            ((dt == c10::kBFloat16 || dt == c10::kHalf)
                                 ? (q.sym_size(3) == 64 || q.sym_size(3) == 128)
-                                : (dt == c10::kFloat && q.sym_size(3) == 64));
+                                : (dt == c10::kFloat && q.sym_size(3) == 64)));
         const int lanes = qq.wave_size();
         if (!flash && ((lanes != 32 && lanes != 64) || k.sym_size(2) > kRowKeys)) return false;
 #else
@@ -986,6 +992,197 @@ void flash_attention_f32(compat::Queue& queue, const FlashArgs<float>& args, int
 }
 #endif
 
+#if defined(PTSYCL_BACKEND_SYCL) && PARAS_CUDA_BACKEND
+template <int D>
+constexpr int wmma_keys() { return 32; }
+
+template <int D>
+constexpr int wmma_warps() { return D == 64 ? 4 : 2; }
+
+template <int D>
+constexpr int wmma_smem_bytes() {
+    constexpr int kWmmaKeys = wmma_keys<D>();
+    constexpr int LDK = D + 8, LDS = kWmmaKeys + 4, LDO = D + 4;
+    constexpr int tiles = 2 * kWmmaKeys * LDK * 2;
+    constexpr int per_warp = 16 * LDK * 2 + 16 * LDS * 4 + 16 * LDO * 4;
+    return tiles + wmma_warps<D>() * per_warp;
+}
+
+template <int D>
+class WmmaFlashKernel;
+
+template <int D, typename Item>
+PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, const Item& it,
+                                                unsigned char* smem) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    using namespace nvcuda;
+    constexpr int W = wmma_warps<D>(), BQ = 16 * W, BK = wmma_keys<D>(), HC = BK / 2;
+    constexpr int LDK = D + 8, LDS = BK + 4, LDO = D + 4, KS = D / 16;
+    constexpr float kNegInf = -INFINITY;
+    const int tid = static_cast<int>(it.get_local_id(0));
+    const int warp = tid / 32, lane = tid % 32;
+    const int64_t g = static_cast<int64_t>(it.get_group(0));
+    const int64_t gq = g % a.q_blocks, bh = g / a.q_blocks;
+    const int64_t qb = a.causal ? a.q_blocks - 1 - gq : gq;
+    const int64_t b = bh / a.H, h = bh % a.H, kh = h / a.kv_group;
+    const int64_t q0 = qb * BQ, row0 = q0 + warp * 16;
+
+    __half* Ks = reinterpret_cast<__half*>(smem);
+    __half* Vs = Ks + BK * LDK;
+    static_assert(BK <= D, "P reuses the Q rows");
+    unsigned char* wbase = smem + 2 * BK * LDK * 2 + warp * (16 * LDK * 2 + 16 * LDS * 4 + 16 * LDO * 4);
+    __half* Qs = reinterpret_cast<__half*>(wbase);
+    float* Ss = reinterpret_cast<float*>(wbase + 16 * LDK * 2);
+    float* Os = Ss + 16 * LDS;
+    __half* Ps = Qs;
+    constexpr int LDP = LDK;
+
+    const __half* qp = reinterpret_cast<const __half*>(a.q) + b * a.qs.s[0] + h * a.qs.s[1];
+    const __half* kp = reinterpret_cast<const __half*>(a.k) + b * a.ks.s[0] + kh * a.ks.s[1];
+    const __half* vp = reinterpret_cast<const __half*>(a.v) + b * a.vs.s[0] + kh * a.vs.s[1];
+    const __half zero = __float2half(0.f);
+    auto vec_ok = [](const __half* p, const Strides4& st) {
+        return st.s[3] == 1 && st.s[2] % 8 == 0 && reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
+    };
+    const bool qv = vec_ok(qp, a.qs), kv = vec_ok(kp, a.ks), vv = vec_ok(vp, a.vs);
+    constexpr int C8 = D / 8;
+
+    if (qv) {
+        for (int c = lane; c < 16 * C8; c += 32) {
+            const int r = c / C8, d = (c % C8) * 8;
+            const int64_t qi = row0 + r;
+            *reinterpret_cast<uint4*>(Qs + r * LDK + d) =
+                qi < a.Lq ? *reinterpret_cast<const uint4*>(qp + qi * a.qs.s[2] + d) : make_uint4(0, 0, 0, 0);
+        }
+    } else {
+        for (int e = lane; e < 16 * D; e += 32) {
+            const int r = e / D, d = e % D;
+            const int64_t qi = row0 + r;
+            Qs[r * LDK + d] = qi < a.Lq ? qp[qi * a.qs.s[2] + d * a.qs.s[3]] : zero;
+        }
+    }
+    for (int e = lane; e < 16 * D; e += 32) Os[(e / D) * LDO + e % D] = 0.f;
+    __syncwarp();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa[KS];
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) wmma::load_matrix_sync(qa[ks], Qs + ks * 16, LDK);
+    __syncwarp();
+
+    const int r = lane / 2, half = lane % 2;
+    const int64_t qi = row0 + r;
+    float m_i = kNegInf, l_i = 0.f;
+    const int64_t mrow = b * a.ms.s[0] + h * a.ms.s[1] + qi * a.ms.s[2];
+    const int64_t k_end = a.causal ? (q0 + BQ < a.Lk ? q0 + BQ : a.Lk) : a.Lk;
+
+    for (int64_t j0 = 0; j0 < k_end; j0 += BK) {
+        if (kv && vv) {
+            for (int c = tid; c < BK * C8; c += W * 32) {
+                const int kr = c / C8, d = (c % C8) * 8;
+                const int64_t key = j0 + kr;
+                const bool in = key < a.Lk;
+                *reinterpret_cast<uint4*>(Ks + kr * LDK + d) =
+                    in ? *reinterpret_cast<const uint4*>(kp + key * a.ks.s[2] + d) : make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(Vs + kr * LDK + d) =
+                    in ? *reinterpret_cast<const uint4*>(vp + key * a.vs.s[2] + d) : make_uint4(0, 0, 0, 0);
+            }
+        } else {
+            for (int e = tid; e < BK * D; e += W * 32) {
+                const int kr = e / D, d = e % D;
+                const int64_t key = j0 + kr;
+                Ks[kr * LDK + d] = key < a.Lk ? kp[key * a.ks.s[2] + d * a.ks.s[3]] : zero;
+                Vs[kr * LDK + d] = key < a.Lk ? vp[key * a.vs.s[2] + d * a.vs.s[3]] : zero;
+            }
+        }
+        sycl::group_barrier(it.get_group());
+#pragma unroll
+        for (int n = 0; n < BK / 16; ++n) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.f);
+#pragma unroll
+            for (int ks = 0; ks < KS; ++ks) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+                wmma::load_matrix_sync(kb, Ks + n * 16 * LDK + ks * 16, LDK);
+                wmma::mma_sync(acc, qa[ks], kb, acc);
+            }
+            wmma::store_matrix_sync(Ss + n * 16, acc, LDS, wmma::mem_row_major);
+        }
+        __syncwarp();
+        float x[HC];
+        float bm = kNegInf;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const int col = half * HC + c;
+            const int64_t j = j0 + col;
+            float s = Ss[r * LDS + col] * a.scale;
+            if (j >= a.Lk || qi >= a.Lq || (a.causal && j > qi)) {
+                s = kNegInf;
+            } else {
+                const int64_t mo = mrow + j * a.ms.s[3];
+                if (a.mb != nullptr && !a.mb[mo]) s = kNegInf;
+                if (a.mf != nullptr) s += static_cast<float>(a.mf[mo]);
+            }
+            x[c] = s;
+            bm = s > bm ? s : bm;
+        }
+        const float om = __shfl_xor_sync(0xffffffffu, bm, 1);
+        bm = om > bm ? om : bm;
+        const float m_new = m_i > bm ? m_i : bm;
+        const float alpha = m_i == kNegInf ? 0.f : __expf(m_i - m_new);
+        float rs = 0.f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const float p = x[c] == kNegInf ? 0.f : __expf(x[c] - m_new);
+            rs += p;
+            Ps[r * LDP + half * HC + c] = __float2half(p);
+        }
+        rs += __shfl_xor_sync(0xffffffffu, rs, 1);
+        l_i = l_i * alpha + rs;
+        m_i = m_new;
+        for (int d = half * (D / 2); d < (half + 1) * (D / 2); ++d) Os[r * LDO + d] *= alpha;
+        __syncwarp();
+#pragma unroll
+        for (int dt = 0; dt < KS; ++dt) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> o;
+            wmma::load_matrix_sync(o, Os + dt * 16, LDO, wmma::mem_row_major);
+#pragma unroll
+            for (int ks = 0; ks < BK / 16; ++ks) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb;
+                wmma::load_matrix_sync(pa, Ps + ks * 16, LDP);
+                wmma::load_matrix_sync(vb, Vs + ks * 16 * LDK + dt * 16, LDK);
+                wmma::mma_sync(o, pa, vb, o);
+            }
+            wmma::store_matrix_sync(Os + dt * 16, o, LDO, wmma::mem_row_major);
+        }
+        __syncwarp();
+        sycl::group_barrier(it.get_group());
+    }
+    if (qi < a.Lq) {
+        __half* op = reinterpret_cast<__half*>(a.o) + b * a.os.s[0] + h * a.os.s[1] + qi * a.os.s[2];
+        const float inv = l_i > 0.f ? 1.f / l_i : 0.f;
+        for (int d = half * (D / 2); d < (half + 1) * (D / 2); ++d)
+            op[d * a.os.s[3]] = __float2half(Os[r * LDO + d] * inv);
+        if (half == 0) a.lse[(b * a.H + h) * a.Lq + qi] = l_i > 0.f ? m_i + __logf(l_i) : kNegInf;
+    }
+#else
+    (void)a; (void)it; (void)smem;
+#endif
+}
+
+template <int D>
+void wmma_flash_attention(compat::Queue& queue, const FlashArgs<c10::Half>& args, int64_t groups) {
+    constexpr int threads = wmma_warps<D>() * 32;
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<unsigned char, 1> smem(sycl::range<1>(wmma_smem_bytes<D>()), cgh);
+        const FlashArgs<c10::Half> fa = args;
+        cgh.template parallel_for<WmmaFlashKernel<D>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * threads)),
+                              sycl::range<1>(static_cast<std::size_t>(threads))),
+            [=](sycl::nd_item<1> it) { wmma_flash_block<D>(fa, it, &smem[0]); });
+    });
+}
+#endif
+
 std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor,
            Tensor, Tensor>
 fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -1078,6 +1275,25 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
                 at::empty({}, lopts), at::empty({}, lopts), none};
     }
+#if PTSYCL_WMMA_FLASH
+    if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) && q.scalar_type() == c10::kHalf) {
+        FlashArgs<c10::Half> fa{};
+        fa.q = data_ptr<c10::Half>(q); fa.k = data_ptr<c10::Half>(k); fa.v = data_ptr<c10::Half>(v);
+        fa.o = data_ptr<c10::Half>(out); fa.lse = lse.data_ptr<float>();
+        fa.mf = has_mask && !bool_mask ? data_ptr<c10::Half>(mask) : nullptr;
+        fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
+        fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
+        fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
+        fa.scale = sc; fa.causal = is_causal;
+        const int64_t bq = 16 * (D == 64 ? wmma_warps<64>() : wmma_warps<128>());
+        fa.q_blocks = (Lq + bq - 1) / bq;
+        if (D == 64) wmma_flash_attention<64>(queue, fa, B * H * fa.q_blocks);
+        else wmma_flash_attention<128>(queue, fa, B * H * fa.q_blocks);
+        const Tensor none = Tensor();
+        return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
+                at::empty({}, lopts), at::empty({}, lopts), none};
+    }
+#endif
     if (Lq > kFusedMaxQuery && G > 1) {
         return fused_attention(q, k.repeat_interleave(G, 1), v.repeat_interleave(G, 1), attn_bias,
                                dropout_p, is_causal, return_debug_mask, scale);

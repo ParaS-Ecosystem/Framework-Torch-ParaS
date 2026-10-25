@@ -27,6 +27,7 @@
 #include "core/graphs.h"
 #include "ops/clap_dnn_adapter.h"
 #include "core/telemetry.h"
+#include "core/kernels.h"
 
 namespace py = pybind11;
 
@@ -52,6 +53,7 @@ PYBIND11_MODULE(_C, m) {
         d["wave_size"] = info.is_gpu ? info.wave_size : 1;
         d["mfma"] = info.is_gpu && info.mfma && !info.generic;
         d["generic"] = info.generic;
+        d["fp16_flash"] = info.is_gpu && ((info.mfma && !info.generic) || PTSYCL_WMMA_FLASH);
         return d;
     });
 

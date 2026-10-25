@@ -41,6 +41,13 @@
 #define PTSYCL_MFMA_DEVICE 0
 #endif
 
+#if defined(PTSYCL_BACKEND_SYCL) && defined(PARAS_CUDA_BACKEND) && PARAS_CUDA_BACKEND && \
+    defined(PTSYCL_CUDA_SM) && PTSYCL_CUDA_SM >= 70
+#define PTSYCL_WMMA_FLASH 1
+#else
+#define PTSYCL_WMMA_FLASH 0
+#endif
+
 namespace ptsycl {
 
 namespace compat {
