@@ -739,24 +739,24 @@ Tensor& tril_(Tensor& self, int64_t diagonal) {
 
 constexpr int64_t kNonzeroChunk = 256;
 
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
-constexpr int64_t kScanLanes = 64;
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
 constexpr int64_t kScanPerLane = 16;
-constexpr int64_t kScanBlock = kScanLanes * kScanPerLane;
 
-template <typename T> class ScanBlockTotals;
-template <typename T> class ScanAddOffsets;
-template <typename T> class NonzeroCount;
-template <typename T> class NonzeroWrite;
+template <typename T, int Lanes> class ScanBlockTotals;
+template <typename T, int Lanes> class ScanAddOffsets;
+template <typename T, int Lanes> class NonzeroCount;
+template <typename T, int Lanes> class NonzeroWrite;
 
+template <int Lanes>
 void exclusive_scan_device(compat::Queue& q, Tensor& v) {
+    constexpr int64_t kScanLanes = Lanes, kScanBlock = Lanes * kScanPerLane;
     const int64_t n = v.numel();
     if (n == 0) return;
     int64_t* pv = data_ptr<int64_t>(v);
     const int64_t blocks = (n + kScanBlock - 1) / kScanBlock;
     Tensor totals = at::empty({blocks}, v.options());
     int64_t* pt = data_ptr<int64_t>(totals);
-    q.sycl_queue().template parallel_for<ScanBlockTotals<int64_t>>(
+    q.sycl_queue().template parallel_for<ScanBlockTotals<int64_t, Lanes>>(
         sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
                           sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
         [=](sycl::nd_item<1> it) {
@@ -781,8 +781,8 @@ void exclusive_scan_device(compat::Queue& q, Tensor& v) {
             if (lane == kScanLanes - 1) pt[blk] = incl;
         });
     if (blocks == 1) return;
-    exclusive_scan_device(q, totals);
-    q.sycl_queue().template parallel_for<ScanAddOffsets<int64_t>>(
+    exclusive_scan_device<Lanes>(q, totals);
+    q.sycl_queue().template parallel_for<ScanAddOffsets<int64_t, Lanes>>(
         sycl::range<1>(static_cast<std::size_t>(n)), [=](sycl::id<1> i) {
             pv[i[0]] += pt[static_cast<int64_t>(i[0]) / kScanBlock];
         });
@@ -794,7 +794,9 @@ PTSYCL_HOST_DEVICE inline bool is_nonzero(scalar_t x) {
     else return static_cast<float>(x) != 0.0f;
 }
 
+template <int Lanes>
 void nonzero_gpu(compat::Queue& q, const Tensor& self, Tensor& out) {
+    constexpr int64_t kScanLanes = Lanes, kScanBlock = Lanes * kScanPerLane;
     const int64_t n = self.numel();
     const int ndim = static_cast<int>(self.dim());
     const int64_t blocks = (n + kScanBlock - 1) / kScanBlock;
@@ -806,7 +808,7 @@ void nonzero_gpu(compat::Queue& q, const Tensor& self, Tensor& out) {
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_nonzero_count", [&] {
             const scalar_t* p = data_ptr<scalar_t>(self);
-            q.sycl_queue().template parallel_for<NonzeroCount<scalar_t>>(
+            q.sycl_queue().template parallel_for<NonzeroCount<scalar_t, Lanes>>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
                                   sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
                 [=](sycl::nd_item<1> it) {
@@ -823,7 +825,7 @@ _Pragma("unroll")
                     if (blk == 0 && it.get_local_id(0) == 0) poff[blocks] = 0;
                 });
         });
-    exclusive_scan_device(q, offsets);
+    exclusive_scan_device<Lanes>(q, offsets);
     const int64_t total = offsets[blocks].item<int64_t>();
     out.resize_({total, ndim});
     if (total == 0 || ndim == 0) return;
@@ -833,7 +835,7 @@ _Pragma("unroll")
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_nonzero_write", [&] {
             const scalar_t* p = data_ptr<scalar_t>(self);
-            q.sycl_queue().template parallel_for<NonzeroWrite<scalar_t>>(
+            q.sycl_queue().template parallel_for<NonzeroWrite<scalar_t, Lanes>>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
                                   sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
                 [=](sycl::nd_item<1> it) {
@@ -880,9 +882,13 @@ Tensor& nonzero_out(const Tensor& self, Tensor& out) {
     }
 
     auto& q = queue_for(self);
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
     if (q.wave64()) {
-        nonzero_gpu(q, self, out);
+        nonzero_gpu<64>(q, self, out);
+        return out;
+    }
+    if (q.wave_size() == 32) {
+        nonzero_gpu<32>(q, self, out);
         return out;
     }
 #endif
