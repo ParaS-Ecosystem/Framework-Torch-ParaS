@@ -277,6 +277,7 @@ void rope_index_copy_kernel(compat::Queue& q, const Tensor& self, int64_t d, con
     const auto src_spec = make_spec(x);
     const auto self_spec = make_spec(self);
     const int64_t self_dim_stride = self.stride(d);
+    const int64_t self_dim_size = self.size(d);
     const int ndim = src_spec.ndim;
     const scalar_t* px = data_ptr<scalar_t>(x);
     const scalar_t* pc = data_ptr<scalar_t>(ce);
@@ -305,7 +306,9 @@ void rope_index_copy_kernel(compat::Queue& q, const Tensor& self, int64_t d, con
             if (dd == d) sel = c;
             else self_off += static_cast<int64_t>(c) * self_spec.strides[dd];
         }
-        pself[self_off + pidx[sel] * self_dim_stride] = static_cast<scalar_t>(a + b);
+        const int64_t i = pidx[sel];
+        if (i >= 0 && i < self_dim_size)
+            pself[self_off + i * self_dim_stride] = static_cast<scalar_t>(a + b);
     });
 }
 

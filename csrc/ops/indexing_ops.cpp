@@ -180,6 +180,7 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
     const auto self_spec = make_spec(self);
     const auto src_spec  = make_spec(source);
     const int64_t self_dim_stride = self.stride(d);
+    const int64_t self_dim_size = self.size(d);
     const int     ndim = src_spec.ndim;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -214,8 +215,9 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
                         else self_off += c * self_spec.strides[dd];
                     }
                 }
-                self_off += pidx[sel] * self_dim_stride;
-                pself[self_off] = psrc[src_off];
+                const int64_t i = pidx[sel];
+                if (i < 0 || i >= self_dim_size) return;
+                pself[self_off + i * self_dim_stride] = psrc[src_off];
             });
         });
     return self;
