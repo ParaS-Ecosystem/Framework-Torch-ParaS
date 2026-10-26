@@ -258,59 +258,139 @@ public:
     {
         at::AutoDispatchBelowADInplaceOrView g;
         c10::Device dev = input.device();
+        Tensor result;
+        bool used_device_clap = false;
 
-        Tensor cpu_x = to_cpu(input).contiguous();
-        Tensor cpu_w = to_cpu(weight).contiguous();
-        auto cpu_b = opt_to_cpu(bias);
+        if (is_paras_tensor(input) &&
+            is_paras_tensor(weight) &&
+            input.device() == weight.device() &&
+            input.dim() >= 1 &&
+            weight.dim() == 2 &&
+            weight.size(1) > 0 &&
+            input.size(-1) == weight.size(1) &&
+            input.scalar_type() == weight.scalar_type() &&
+            input.is_contiguous() &&
+            weight.is_contiguous() &&
+            clap_blas::supported_device_dtype(input)) {
 
-        Tensor cpu_out;
-        bool used_clap = false;
+            const int64_t fi = weight.size(1);
+            const int64_t fo = weight.size(0);
+            const int64_t batch = input.numel() / fi;
 
-        if (cpu_x.dim() >= 1 &&
-            cpu_w.dim() == 2 &&
-            cpu_w.size(1) > 0 &&
-            cpu_x.size(-1) == cpu_w.size(1) &&
-            cpu_x.scalar_type() == cpu_w.scalar_type() &&
-            clap_blas::supported_dtype(cpu_x)) {
+            const bool bias_ok =
+                !bias.has_value() ||
+                !bias->defined() ||
+                bias->numel() == 0 ||
+                (is_paras_tensor(*bias) &&
+                 bias->device() == input.device() &&
+                 bias->scalar_type() == input.scalar_type() &&
+                 bias->dim() == 1 &&
+                 bias->size(0) == fo);
 
-            const int64_t fi = cpu_w.size(1);
-            const int64_t fo = cpu_w.size(0);
-            const int64_t batch = cpu_x.numel() / fi;
+            if (bias_ok) {
+                Tensor input2 = input.view({batch, fi});
 
-            Tensor cpu_x2 = cpu_x.view({batch, fi});
+                const bool has_bias =
+                    bias.has_value() &&
+                    bias->defined() &&
+                    bias->numel() > 0;
 
-            Tensor cpu_out2 = at::empty(
-                {batch, fo},
-                at::TensorOptions()
-                    .dtype(cpu_x.scalar_type())
-                    .device(c10::kCPU));
+                const bool fuse_bf16_bias =
+                    has_bias &&
+                    input.scalar_type() == at::kBFloat16;
 
-            if (clap_blas::gemm_cpu(
-                    cpu_x2,
-                    cpu_w,
-                    cpu_out2,
-                    1.0,
-                    true)) {
-                PTSYCL_TRACE_OP("linear.clap_blas");
-                if (cpu_b.has_value() && cpu_b->defined() && cpu_b->numel() > 0)
-                    cpu_out2.add_(*cpu_b);
+                Tensor out2;
+                double beta = 0.0;
 
-                auto out_sizes = cpu_x.sizes().vec();
-                out_sizes.back() = fo;
-                cpu_out = cpu_out2.view(out_sizes);
-                used_clap = true;
+                if (fuse_bf16_bias) {
+                    out2 = bias->view({1, fo})
+                               .expand({batch, fo})
+                               .contiguous();
+                    beta = 1.0;
+                } else {
+                    out2 = at::empty(
+                        {batch, fo},
+                        input.options());
+                }
+
+                if (clap_blas::gemm_device(
+                        input2,
+                        weight,
+                        out2,
+                        1.0,
+                        true,
+                        beta)) {
+                    if (has_bias && !fuse_bf16_bias) {
+                        out2.add_(*bias);
+                    }
+
+                    auto out_sizes = input.sizes().vec();
+                    out_sizes.back() = fo;
+                    result = out2.view(out_sizes);
+
+                    PTSYCL_TRACE_OP("linear.clap_blas_device");
+                    used_device_clap = true;
+                }
             }
         }
 
-        if (!used_clap) {
-            PTSYCL_TRACE_OP("linear.fallback");
-            cpu_out = at::linear(
-                cpu_x,
-                cpu_w,
-                cpu_b.has_value() ? *cpu_b : Tensor{});
-        }
+        if (!used_device_clap) {
+            Tensor cpu_x = to_cpu(input).contiguous();
+            Tensor cpu_w = to_cpu(weight).contiguous();
+            auto cpu_b = opt_to_cpu(bias);
 
-        Tensor result = to_device(cpu_out.contiguous(), dev);
+            Tensor cpu_out;
+            bool used_clap = false;
+
+            if (cpu_x.dim() >= 1 &&
+                cpu_w.dim() == 2 &&
+                cpu_w.size(1) > 0 &&
+                cpu_x.size(-1) == cpu_w.size(1) &&
+                cpu_x.scalar_type() == cpu_w.scalar_type() &&
+                clap_blas::supported_dtype(cpu_x)) {
+
+                const int64_t fi = cpu_w.size(1);
+                const int64_t fo = cpu_w.size(0);
+                const int64_t batch = cpu_x.numel() / fi;
+
+                Tensor cpu_x2 = cpu_x.view({batch, fi});
+
+                Tensor cpu_out2 = at::empty(
+                    {batch, fo},
+                    at::TensorOptions()
+                        .dtype(cpu_x.scalar_type())
+                        .device(c10::kCPU));
+
+                if (clap_blas::gemm_cpu(
+                        cpu_x2,
+                        cpu_w,
+                        cpu_out2,
+                        1.0,
+                        true)) {
+                    PTSYCL_TRACE_OP("linear.clap_blas");
+                    if (cpu_b.has_value() &&
+                        cpu_b->defined() &&
+                        cpu_b->numel() > 0) {
+                        cpu_out2.add_(*cpu_b);
+                    }
+
+                    auto out_sizes = cpu_x.sizes().vec();
+                    out_sizes.back() = fo;
+                    cpu_out = cpu_out2.view(out_sizes);
+                    used_clap = true;
+                }
+            }
+
+            if (!used_clap) {
+                PTSYCL_TRACE_OP("linear.fallback");
+                cpu_out = at::linear(
+                    cpu_x,
+                    cpu_w,
+                    cpu_b.has_value() ? *cpu_b : Tensor{});
+            }
+
+            result = to_device(cpu_out.contiguous(), dev);
+        }
 
         ctx->save_for_backward({input.contiguous(), weight});
         ctx->saved_data["has_bias"] =
@@ -439,6 +519,11 @@ Tensor max_pool2d_autograd(
 Tensor& mm_out(const Tensor& self, const Tensor& mat2, Tensor& out)
 {
     PTSYCL_TRACE_OP("mm.out");
+
+    if (clap_blas::gemm_device(self, mat2, out)) {
+        PTSYCL_TRACE_OP("mm.out.clap_blas_device");
+        return out;
+    }
 
     Tensor cpu_a = to_cpu(self).contiguous();
     Tensor cpu_b = to_cpu(mat2).contiguous();

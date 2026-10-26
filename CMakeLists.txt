@@ -355,6 +355,16 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
 
         target_compile_definitions(
             torch_paras_C PRIVATE PTSYCL_USE_CLAP_BLAS)
+
+        if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
+            if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+                target_compile_definitions(
+                    torch_paras_C PRIVATE PTSYCL_CLAP_BLAS_CUDA)
+            elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+                target_compile_definitions(
+                    torch_paras_C PRIVATE PTSYCL_CLAP_BLAS_ROCM)
+            endif()
+        endif()
     endif()
 
     # Shared CLAP include/link setup for DNN and/or BLAS.
