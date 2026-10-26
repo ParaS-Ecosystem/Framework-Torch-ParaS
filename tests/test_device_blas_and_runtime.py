@@ -428,13 +428,15 @@ def test_log_softmax_long_rows_and_backward(device):
     import torch.nn.functional as F
     torch.manual_seed(0)
     for dtype, tol in ((torch.float32, 1e-5), (torch.bfloat16, 2e-2)):
-        x = (4 * torch.randn(3, 128008)).to(dtype).requires_grad_()
-        dx = x.detach().to(device).requires_grad_()
+        x = (4 * torch.randn(3, 128008)).to(dtype)
+        dx = x.to(device).requires_grad_()
         tgt = torch.randint(0, 128008, (3,))
-        F.cross_entropy(x.float(), tgt).backward()
+        xr = x.double().requires_grad_()
+        F.cross_entropy(xr, tgt).backward()
         F.cross_entropy(dx.float(), tgt.to(device)).backward()
-        torch.testing.assert_close(F.log_softmax(dx, -1).cpu().float(), F.log_softmax(x, -1).float(), atol=tol, rtol=tol)
-        torch.testing.assert_close(dx.grad.cpu().float(), x.grad.float(), atol=tol, rtol=tol)
+        ref = F.log_softmax(xr.detach(), -1).to(dtype).float()
+        torch.testing.assert_close(F.log_softmax(dx, -1).cpu().float(), ref, atol=tol, rtol=tol)
+        torch.testing.assert_close(dx.grad.cpu().float(), xr.grad.to(dtype).float(), atol=tol, rtol=tol)
     y = torch.randn(5, 40, 7)
     torch.testing.assert_close(F.log_softmax(y.to(device), 1).cpu(), F.log_softmax(y, 1), atol=1e-5, rtol=1e-5)
 
