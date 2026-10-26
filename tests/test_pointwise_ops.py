@@ -655,3 +655,23 @@ def test_vector_norm_of_0d_tensor(device):
         ref = torch.linalg.vector_norm(x, **kw)
         got = torch.linalg.vector_norm(x.to(device), **kw).cpu()
         assert got.shape == ref.shape and torch.allclose(got, ref), (kw, got, ref)
+
+
+def test_mean_16bit_no_overflow_of_the_sum(device):
+    for dt in (torch.float16, torch.bfloat16):
+        x = torch.full((100000,), 1000.0, dtype=dt)
+        got = x.to(device).mean().cpu()
+        assert torch.isfinite(got) and abs(float(got) - 1000.0) <= 8.0, (dt, got)
+        y = torch.randn(64, 4096).to(dt) * 10
+        torch.testing.assert_close(y.to(device).mean(-1).cpu().float(), y.float().mean(-1), atol=0.05, rtol=1e-2)
+
+
+def test_integer_div_rounding_modes_exact(device):
+    a = torch.tensor([2 ** 60 + 1, -7, 7, -7, 2 ** 62 - 3, -(2 ** 61) - 5], dtype=torch.int64)
+    b = torch.tensor([3, 2, -2, -2, 7, 3], dtype=torch.int64)
+    for mode in ("trunc", "floor"):
+        assert torch.equal(torch.div(a.to(device), b.to(device), rounding_mode=mode).cpu(),
+                           torch.div(a, b, rounding_mode=mode)), mode
+    x = torch.arange(-20, 20, dtype=torch.int32)
+    for mode in ("trunc", "floor"):
+        assert torch.equal(torch.div(x.to(device), 3, rounding_mode=mode).cpu(), torch.div(x, 3, rounding_mode=mode))

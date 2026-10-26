@@ -320,9 +320,16 @@ void reduce_dims_typed(compat::Queue& q, const in_t* in,
                     default: return (a != a || a > b) ? a : b;
                 }
             };
+            constexpr bool k16 = std::is_same_v<out_t, c10::Half> || std::is_same_v<out_t, c10::BFloat16>;
             const auto store = [=](int64_t o, acc_t acc) {
-                out_t v = static_cast<out_t>(acc);
-                if (post_scale != 1.0) v = static_cast<out_t>(static_cast<double>(v) * post_scale);
+                out_t v;
+                if constexpr (k16)
+                    v = static_cast<out_t>(post_scale != 1.0 ? static_cast<double>(acc) * post_scale
+                                                             : static_cast<double>(acc));
+                else {
+                    v = static_cast<out_t>(acc);
+                    if (post_scale != 1.0) v = static_cast<out_t>(static_cast<double>(v) * post_scale);
+                }
                 po[so.index(o)] = v;
             };
 #if defined(PTSYCL_BACKEND_SYCL)
@@ -1613,10 +1620,47 @@ PTSYCL_HOST_DEVICE inline double div_floor_d(double a, double b) {
     return fl;
 }
 
+template <typename T>
+class IntDivKernel;
+
+static void int_div_mode(const Tensor& self, const Tensor& other, Tensor& out, bool floor_mode) {
+    out.resize_(at::infer_size(self.sizes(), other.sizes()));
+    const Tensor a = to_compute(self, out.scalar_type(), out.device()).expand_as(out).contiguous();
+    const Tensor b = to_compute(other, out.scalar_type(), out.device()).expand_as(out).contiguous();
+    const bool direct = out.is_contiguous();
+    Tensor dst = direct ? out : at::empty(out.sizes(), out.options());
+    auto& q = queue_for(dst);
+    const int64_t n = dst.numel();
+    if (n > 0) {
+        AT_DISPATCH_INTEGRAL_TYPES(dst.scalar_type(), "ptsycl_int_div_mode", [&] {
+            const scalar_t* pa = data_ptr<scalar_t>(a);
+            const scalar_t* pb = data_ptr<scalar_t>(b);
+            scalar_t* po = data_ptr<scalar_t>(dst);
+            launch_flat(q, n, [=](std::size_t i) {
+                const scalar_t x = pa[i], y = pb[i];
+                if (y == 0) { po[i] = 0; return; }
+                if constexpr (std::is_signed_v<scalar_t>) {
+                    if (y == -1) { po[i] = static_cast<scalar_t>(-static_cast<std::make_unsigned_t<scalar_t>>(x)); return; }
+                }
+                scalar_t r = static_cast<scalar_t>(x / y);
+                if constexpr (std::is_signed_v<scalar_t>) {
+                    if (floor_mode && (x % y != 0) && ((x < 0) != (y < 0))) --r;
+                }
+                po[i] = r;
+            });
+        });
+    }
+    if (!direct) out.copy_(dst);
+}
+
 Tensor& div_mode_out(const Tensor& self, const Tensor& other, std::optional<c10::string_view> mode, Tensor& out) {
     PTSYCL_TRACE_OP("div.out_mode");
     if (!mode.has_value()) return div_out(self, other, out);
     const bool integral = c10::isIntegralType(out.scalar_type(), true);
+    if (integral && out.scalar_type() != c10::kBool && (*mode == "trunc" || *mode == "floor")) {
+        int_div_mode(self, other, out, *mode == "floor");
+        return out;
+    }
     if (*mode == "trunc") {
         binary_kernel(self, other, out, [](double a, double b) { return ::trunc(a / b); });
     } else {
