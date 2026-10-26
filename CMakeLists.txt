@@ -229,6 +229,7 @@ if(NOT PTSYCL_CLANG_RT_BUILTINS)
     endif()
     file(GLOB _ptsycl_rt_candidates
         "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
+        "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/linux/libclang_rt.builtins-${_ptsycl_rt_arch}.a"
         "/usr/lib/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
         "/usr/lib64/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
     )

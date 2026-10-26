@@ -440,7 +440,7 @@ def test_python_scalars_at_opmath_precision(device):
         x = torch.randn(4099).to(dt)
         d = x.to(device)
         f = lambda v: float(torch.tensor(v, dtype=torch.float32))
-        x64 = x.double()
+        x64 = x.float()
         cases = {
             "mul": (d * 0.9, x64 * f(0.9)),
             "add": (d + 0.1, x64 + f(0.1)),

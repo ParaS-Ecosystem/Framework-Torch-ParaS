@@ -1,5 +1,6 @@
 import ctypes
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -213,9 +214,16 @@ def test_clap_dnn_cpu_dtypes_and_unsupported_fp16(
             "dnnl_eltwise_forward_primitive_desc_create with the requested datatype/layout"
         )
 
-        for call in fp16_calls:
-            with pytest.raises(RuntimeError, match=expected_err):
-                call()
+        x16 = ref.to(torch.float16).float()
+        wants = [torch.sigmoid(x16).to(torch.float16)] * 3 + [F.silu(x16).to(torch.float16)] * 3
+        for call, want in zip(fp16_calls, wants):
+            try:
+                out = call()
+            except RuntimeError as exc:
+                assert re.search(expected_err, str(exc)), exc
+                continue
+            assert out.dtype == torch.float16
+            torch.testing.assert_close(out.cpu(), want, atol=2e-3, rtol=2e-3)
     finally:
         if saved_env is not None:
             os.environ["CLAP_BACKEND"] = saved_env
