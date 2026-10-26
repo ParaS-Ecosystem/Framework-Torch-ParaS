@@ -126,7 +126,7 @@ int vendor_visible_gpu_count() {
     const char* libs[] = {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"};
     const char* symbol = "hipGetDeviceCount";
 #else
-    const char* libs[] = {"libcudart.so", "libcudart.so.12", "libcudart.so.11.0"};
+    const char* libs[] = {"libcudart.so", "libcudart.so.13", "libcudart.so.12", "libcudart.so.11.0"};
     const char* symbol = "cudaGetDeviceCount";
 #endif
     void* handle = nullptr;
@@ -418,7 +418,7 @@ const EventApi& event_api() {
         const char* names[] = {"hipEventCreateWithFlags", "hipEventRecord", "hipStreamWaitEvent", "hipEventQuery",
                                "hipEventSynchronize", "hipEventElapsedTime", "hipEventDestroy", "hipStreamQuery"};
 #else
-        const char* libs[] = {"libcudart.so", "libcudart.so.12", "libcudart.so.11.0"};
+        const char* libs[] = {"libcudart.so", "libcudart.so.13", "libcudart.so.12", "libcudart.so.11.0"};
         const char* names[] = {"cudaEventCreateWithFlags", "cudaEventRecord", "cudaStreamWaitEvent", "cudaEventQuery",
                                "cudaEventSynchronize", "cudaEventElapsedTime", "cudaEventDestroy", "cudaStreamQuery"};
 #endif

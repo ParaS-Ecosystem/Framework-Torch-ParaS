@@ -9,6 +9,7 @@
 #endif
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
@@ -119,8 +120,8 @@ bool run_device_gemm(DeviceBackend& entry,
                 static_cast<float>(beta), c, ldc, stride_c, batch, elem(dtype), elem(c_dtype), stream);
         } catch (const std::invalid_argument&) {
             return false;
-        } catch (const std::exception&) {
-            entry.ex_unsupported = true;
+        } catch (const std::exception& e) {
+            if (std::strstr(e.what(), "unsupported by this backend") != nullptr) entry.ex_unsupported = true;
             return false;
         }
         return true;
