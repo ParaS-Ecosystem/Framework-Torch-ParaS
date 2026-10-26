@@ -627,7 +627,13 @@ std::tuple<Tensor&, Tensor&> max_pool2d_with_indices_out_device(
     at::IntArrayRef dilation, bool ceil_mode, Tensor& out, Tensor& indices) {
     PTSYCL_TRACE_OP("max_pool2d_with_indices.out");
     (void)ceil_mode;
-    if (out.numel() > 0) max_pool2d_fwd(self, pool_geom(self, out, kernel_size, stride, padding, dilation), out, indices);
+    if (out.numel() > 0) {
+        Tensor o = out.is_contiguous() ? out : at::empty(out.sizes(), out.options());
+        Tensor ix = indices.is_contiguous() ? indices : at::empty(indices.sizes(), indices.options());
+        max_pool2d_fwd(self, pool_geom(self, out, kernel_size, stride, padding, dilation), o, ix);
+        if (!o.is_same(out)) out.copy_(o);
+        if (!ix.is_same(indices)) indices.copy_(ix);
+    }
     return {out, indices};
 }
 
@@ -636,9 +642,12 @@ Tensor& max_pool2d_with_indices_backward_out_device(
     at::IntArrayRef padding, at::IntArrayRef dilation, bool ceil_mode, const Tensor& indices, Tensor& grad_input) {
     PTSYCL_TRACE_OP("max_pool2d_with_indices_backward.grad_input");
     (void)ceil_mode;
-    if (grad_input.numel() > 0)
-        max_pool2d_bwd(grad_output, indices, pool_geom(self, grad_output, kernel_size, stride, padding, dilation),
-                       grad_input);
+    if (grad_input.numel() > 0) {
+        Tensor gi = grad_input.is_contiguous() ? grad_input : at::empty(grad_input.sizes(), grad_input.options());
+        max_pool2d_bwd(grad_output.contiguous(), indices.contiguous(),
+                       pool_geom(self, grad_output, kernel_size, stride, padding, dilation), gi);
+        if (!gi.is_same(grad_input)) grad_input.copy_(gi);
+    }
     return grad_input;
 }
 
@@ -647,9 +656,12 @@ Tensor& avg_pool2d_out_device(const Tensor& self, at::IntArrayRef kernel_size, a
                               c10::optional<int64_t> divisor_override, Tensor& out) {
     PTSYCL_TRACE_OP("avg_pool2d.out");
     (void)ceil_mode;
-    if (out.numel() > 0)
+    if (out.numel() > 0) {
+        Tensor o = out.is_contiguous() ? out : at::empty(out.sizes(), out.options());
         avg_pool2d_fwd(self, pool_geom(self, out, kernel_size, stride, padding, {}), count_include_pad,
-                       divisor_override.value_or(0), out);
+                       divisor_override.value_or(0), o);
+        if (!o.is_same(out)) out.copy_(o);
+    }
     return out;
 }
 
@@ -659,9 +671,12 @@ Tensor& avg_pool2d_backward_out_device(const Tensor& grad_output, const Tensor& 
                                        Tensor& grad_input) {
     PTSYCL_TRACE_OP("avg_pool2d_backward.grad_input");
     (void)ceil_mode;
-    if (grad_input.numel() > 0)
-        avg_pool2d_bwd(grad_output, pool_geom(self, grad_output, kernel_size, stride, padding, {}),
-                       count_include_pad, divisor_override.value_or(0), grad_input);
+    if (grad_input.numel() > 0) {
+        Tensor gi = grad_input.is_contiguous() ? grad_input : at::empty(grad_input.sizes(), grad_input.options());
+        avg_pool2d_bwd(grad_output.contiguous(), pool_geom(self, grad_output, kernel_size, stride, padding, {}),
+                       count_include_pad, divisor_override.value_or(0), gi);
+        if (!gi.is_same(grad_input)) grad_input.copy_(gi);
+    }
     return grad_input;
 }
 

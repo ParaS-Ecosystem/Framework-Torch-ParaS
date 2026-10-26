@@ -160,3 +160,19 @@ def test_conv_transpose_output_padding_beyond_stride(device):
     x, w, b = torch.randn(2, 2, 4, 5), torch.randn(2, 2, 4, 4) * 0.3, torch.randn(4)
     _check(device, lambda x, w, b: F.conv_transpose2d(x, w, b, stride=(3, 2), padding=(1, 2), output_padding=(2, 3),
                                                       groups=2, dilation=(4, 4)), x, w, b, tol=2e-4, what="convT op>=s")
+
+
+def test_pooling_channels_last(device):
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 8, 8).to(memory_format=torch.channels_last)
+    for fn in (lambda t: F.max_pool2d(t, 2), lambda t: F.avg_pool2d(t, 3, stride=2, padding=1)):
+        xd = x.detach().clone().to(device).requires_grad_(True)
+        xc = x.detach().clone().requires_grad_(True)
+        yd, yc = fn(xd), fn(xc)
+        torch.testing.assert_close(yd.cpu(), yc)
+        g = torch.randn_like(yc)
+        yd.backward(g.to(device)); yc.backward(g)
+        torch.testing.assert_close(xd.grad.cpu(), xc.grad)
+    out, idx = F.max_pool2d(x.to(device), 2, return_indices=True)
+    out_c, idx_c = F.max_pool2d(x, 2, return_indices=True)
+    assert torch.equal(idx.cpu(), idx_c)
