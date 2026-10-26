@@ -72,10 +72,16 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
         if (!qq.is_gpu()) return false;
         const bool wmma = PTSYCL_WMMA_FLASH && dt == c10::kHalf && v.sym_size(3) == q.sym_size(3) &&
                           (q.sym_size(3) == 64 || q.sym_size(3) == 128);
+        auto offsets_fit = [](const Tensor& t) {
+            const auto l = t.sym_size(2).maybe_as_int(), d = t.sym_size(3).maybe_as_int();
+            const auto s2 = t.sym_stride(2).maybe_as_int(), s3 = t.sym_stride(3).maybe_as_int();
+            if (!l || !d || !s2 || !s3) return true;
+            const int64_t m = (*l - 1) * std::abs(*s2) + (*d - 1) * std::abs(*s3);
+            return *l < std::numeric_limits<int>::max() && m < std::numeric_limits<int>::max();
+        };
         const bool flash = wmma || (qq.mfma() && v.sym_size(3) == q.sym_size(3) &&
-                           ((dt == c10::kBFloat16 || dt == c10::kHalf)
-                                ? (q.sym_size(3) == 64 || q.sym_size(3) == 128)
-                                : (dt == c10::kFloat && q.sym_size(3) == 64)));
+                           (q.sym_size(3) == 64 || q.sym_size(3) == 128) &&
+                           (dt == c10::kFloat || (offsets_fit(k) && offsets_fit(v))));
         const int lanes = qq.wave_size();
         if (!flash && ((lanes != 32 && lanes != 64) || k.sym_size(2) > kRowKeys)) return false;
 #else

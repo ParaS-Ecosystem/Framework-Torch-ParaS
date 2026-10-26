@@ -532,3 +532,14 @@ def test_sdpa_fused_training_gradients(device):
             for name, d, r in zip("qkv", dev_in, ref_in):
                 torch.testing.assert_close(d.grad.cpu().double(), r.grad, atol=tol, rtol=tol,
                                            msg=lambda m: f"{name} {B, H, Hk, Lq, Lk, D, dt} {list(kw)}: {m}")
+
+
+def test_sdpa_fp32_head128_long_keys_fused(device):
+    torch.manual_seed(0)
+    B, H, L, D = 1, 2, 5000, 128
+    q, k, v = torch.randn(B, H, 64, D), torch.randn(B, H, L, D), torch.randn(B, H, L, D)
+    ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double()).float()
+    out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(q.to(device), k.to(device), v.to(device)))
+    fused = "_scaled_dot_product_fused_attention_overrideable" in ops
+    assert fused == fast_kernels(device), (fused, ops[:6])
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-5, rtol=2e-5)
