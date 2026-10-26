@@ -414,3 +414,24 @@ def test_moe_experts_grouped_gemm_graph_capture(device):
             g.replay()
             assert _rel(out, original(new_x, new_ids, new_w)) < 1e-2
     g.reset()
+
+
+def test_moe_experts_repeated_expert_in_a_row(device):
+    torch.manual_seed(0)
+    E, H, I = 4, 32, 16
+    x = torch.randn(3, H)
+    ids = torch.tensor([[-1, 0], [-1, -1], [2, 1]])
+    w = torch.tensor([[0.5, 0.5], [0.3, 0.7], [0.6, 0.4]])
+    wg, wu, wd = torch.randn(E, I, H) * 0.1, torch.randn(E, I, H) * 0.1, torch.randn(E, H, I) * 0.1
+    def ref():
+        out = torch.zeros(3, H)
+        for t in range(3):
+            for k in range(2):
+                e = int(ids[t, k])
+                if 0 <= e < E:
+                    h = torch.nn.functional.silu(x[t] @ wg[e].T) * (x[t] @ wu[e].T)
+                    out[t] += w[t, k] * (h @ wd[e].T)
+        return out
+    with torch.no_grad():
+        got = torch.ops.paras.moe_experts(*(t.to(device) for t in (x, ids, w, wg, wu, wd))).cpu()
+    torch.testing.assert_close(got, ref(), atol=1e-5, rtol=1e-4)

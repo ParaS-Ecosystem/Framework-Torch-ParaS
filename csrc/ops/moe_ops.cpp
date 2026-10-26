@@ -40,7 +40,7 @@ Tensor moe_experts_composite(const Tensor& x, const Tensor& ids, const Tensor& w
     const Tensor routed_ids = ids.masked_fill(valid.logical_not(), 0);
     const Tensor weights = w.masked_fill(valid.logical_not(), 0);
     const Tensor flat = routed_ids.reshape({-1});
-    const Tensor counts = at::zeros({T, E}, ids.options()).scatter_(1, routed_ids, 1).sum(0).to(c10::kCPU);
+    const Tensor counts = at::bincount(flat.to(c10::kCPU), {}, E);
     const Tensor idxs = flat.argsort();
     const Tensor sorted = x.index_select(0, at::floor_divide(idxs, K));
     const int64_t* cnt = counts.data_ptr<int64_t>();
@@ -361,12 +361,8 @@ PTSYCL_HOST_DEVICE inline void moe_gemm_block(const MoeGemmArgs<T>& a, const Ite
 
 template <typename T, bool GateUp> class MoeGemmKernel;
 
-struct MoeGemmOccupancy {
-    static constexpr int paras_max_work_group_size = kGmThreads;
-};
-
 template <typename T, bool GateUp>
-struct MoeGemmFunctor : MoeGemmOccupancy {
+struct MoeGemmFunctor {
     MoeGemmArgs<T> a;
     sycl::local_accessor<unsigned short, 1> lds;
     PTSYCL_HOST_DEVICE void operator()(sycl::nd_item<1> it) const { moe_gemm_block<T, GateUp>(a, it, &lds[0]); }
@@ -381,7 +377,7 @@ void moe_expert_gemm(compat::Queue& q, const int32_t* meta, int64_t S, int64_t R
     const MoeGemmArgs<T> args{meta, S, X, ldx, div, W0, es0, W1, es1, N, Kd, out, col_tiles};
     q.sycl_queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<unsigned short, 1> lds(sycl::range<1>(2 * kGmRows * kGmLd), cgh);
-        const MoeGemmFunctor<T, GateUp> f{{}, args, lds};
+        const MoeGemmFunctor<T, GateUp> f{args, lds};
         cgh.template parallel_for<MoeGemmKernel<T, GateUp>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(row_tiles * col_tiles * kGmThreads)),
                               sycl::range<1>(kGmThreads)),
