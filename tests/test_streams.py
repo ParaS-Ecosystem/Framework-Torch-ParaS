@@ -130,3 +130,11 @@ def test_many_new_streams_reuse_queues(device):
             x.mul_(1.0)
     torch_paras.synchronize()
     assert torch.equal(x.cpu(), torch.ones(1000))
+
+
+def test_stream_context_restores_the_current_device(device):
+    other = torch.device("paras", torch_paras.device_count() - 1)
+    before = torch.accelerator.current_device_index()
+    with torch_paras.stream(torch_paras.Stream(other)):
+        assert torch.accelerator.current_device_index() == other.index
+    assert torch.accelerator.current_device_index() == before

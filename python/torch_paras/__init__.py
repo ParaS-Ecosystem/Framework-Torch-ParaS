@@ -265,13 +265,16 @@ def set_stream(stream: torch.Stream) -> None:
 
 @contextlib.contextmanager
 def stream(s: torch.Stream):
-    """Makes `s` the current stream of its device inside the block."""
+    """Makes `s` the current stream of its device inside the block; the current device and its
+    stream are restored after it, as torch.cuda.stream does."""
+    prev_device = torch.accelerator.current_device_index()
     prev = torch.accelerator.current_stream(s.device)
     torch.accelerator.set_stream(s)
     try:
         yield s
     finally:
         torch.accelerator.set_stream(prev)
+        torch.accelerator.set_device_index(prev_device)
 
 
 def _register() -> None:
