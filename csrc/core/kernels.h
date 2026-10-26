@@ -47,6 +47,11 @@
 #else
 #define PTSYCL_WMMA_FLASH 0
 #endif
+#if PTSYCL_WMMA_FLASH && PTSYCL_CUDA_SM >= 80
+#define PTSYCL_WMMA_BF16 1
+#else
+#define PTSYCL_WMMA_BF16 0
+#endif
 
 namespace ptsycl {
 

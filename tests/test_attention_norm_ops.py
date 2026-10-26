@@ -326,8 +326,9 @@ def test_sdpa_long_keys(device):
     v = torch.randn(B, H, L, D)
     ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
     idx = torch.device(device).index or 0
-    fp16_flash = torch_paras.is_gpu_device(idx) and torch_paras.device_kernel_caps(idx).get("fp16_flash", False)
-    for dtype, tol, want in ((torch.bfloat16, 2.5e-2, gpu), (torch.float16, 4e-3, fp16_flash), (torch.float32, 1e-4, gpu)):
+    caps = torch_paras.device_kernel_caps(idx) if torch_paras.is_gpu_device(idx) else {}
+    fp16_flash, bf16_flash = caps.get("fp16_flash", False), caps.get("bf16_flash", False)
+    for dtype, tol, want in ((torch.bfloat16, 2.5e-2, bf16_flash), (torch.float16, 4e-3, fp16_flash), (torch.float32, 1e-4, gpu)):
         out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
             q.to(dtype).to(device), k.to(dtype).to(device), v.to(dtype).to(device), is_causal=True))
         fused = "_scaled_dot_product_fused_attention_overrideable" in ops
@@ -358,6 +359,30 @@ def test_sdpa_flash_fp16(device):
             assert ("_scaled_dot_product_fused_attention_overrideable" in ops) == gpu, (B, H, Lq, Lk, D, ops[:6])
             err = (out.cpu().double() - ref).abs().max().item()
             assert err < 4e-3, (B, H, Hk, Lq, Lk, D, list(kw), err)
+
+
+def test_sdpa_flash_bf16(device):
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    cases = ((1, 4, 4, 100, 100, 64), (2, 8, 2, 77, 130, 64), (1, 4, 4, 64, 200, 128), (1, 2, 1, 300, 300, 128))
+    for B, H, Hk, Lq, Lk, D in cases:
+        q = torch.randn(B, H, Lq, D).bfloat16()
+        k = torch.randn(B, Hk, Lk, D).bfloat16()
+        v = torch.randn(B, Hk, Lk, D).bfloat16()
+        bmask = torch.rand(B, 1, Lq, Lk) > 0.3
+        fmask = torch.randn(B, 1, Lq, Lk).bfloat16()
+        for kw in ({"is_causal": True}, {"attn_mask": bmask}, {"attn_mask": fmask}, {}):
+            if kw.get("is_causal") and Lq > Lk:
+                continue
+            ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double(), enable_gqa=True,
+                                                 **{n: (m.double() if m.dtype != torch.bool else m) if torch.is_tensor(m) else m
+                                                    for n, m in kw.items()})
+            dkw = {n: m.to(device) if torch.is_tensor(m) else m for n, m in kw.items()}
+            out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+                q.to(device), k.to(device), v.to(device), enable_gqa=True, **dkw))
+            assert ("_scaled_dot_product_fused_attention_overrideable" in ops) == gpu, (B, H, Lq, Lk, D, ops[:6])
+            err = (out.cpu().double() - ref).abs().max().item()
+            assert err < 2.5e-2, (B, H, Hk, Lq, Lk, D, list(kw), err)
 
 
 def test_sdpa_flash_fp32(device):

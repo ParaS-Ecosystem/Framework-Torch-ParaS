@@ -30,6 +30,7 @@
 #include "core/kernels.h"
 
 #if PTSYCL_WMMA_FLASH
+#include <cuda_bf16.h>
 #include <mma.h>
 #endif
 #include "ops/device_gemm.h"
@@ -70,7 +71,8 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
 #if PTSYCL_SDPA_GEMM_PATH
         auto& qq = queue_for(q);
         if (!qq.is_gpu()) return false;
-        const bool wmma = PTSYCL_WMMA_FLASH && dt == c10::kHalf && v.sym_size(3) == q.sym_size(3) &&
+        const bool wmma = PTSYCL_WMMA_FLASH && (dt == c10::kHalf || (PTSYCL_WMMA_BF16 && dt == c10::kBFloat16)) &&
+                          v.sym_size(3) == q.sym_size(3) &&
                           (q.sym_size(3) == 64 || q.sym_size(3) == 128);
         auto offsets_fit = [](const Tensor& t) {
             const auto l = t.sym_size(2).maybe_as_int(), d = t.sym_size(3).maybe_as_int();
@@ -1014,14 +1016,19 @@ constexpr int wmma_smem_bytes() {
     return tiles + wmma_warps<D>() * per_warp;
 }
 
-template <int D>
+template <typename T, int D>
 class WmmaFlashKernel;
 
-template <int D, typename Item>
-PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, const Item& it,
+template <typename T, int D, typename Item>
+PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<T>& a, const Item& it,
                                                 unsigned char* smem) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
+    using DT = std::conditional_t<std::is_same_v<T, c10::Half>, __half, __nv_bfloat16>;
+    auto to_dt = [](float x) -> DT {
+        if constexpr (std::is_same_v<DT, __half>) return __float2half(x);
+        else return __float2bfloat16(x);
+    };
     constexpr int W = wmma_warps<D>(), BQ = 16 * W, BK = wmma_keys<D>(), HC = BK / 2;
     constexpr int LDK = D + 8, LDS = BK + 4, LDO = D + 4, KS = D / 16;
     constexpr float kNegInf = -INFINITY;
@@ -1033,21 +1040,21 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
     const int64_t b = bh / a.H, h = bh % a.H, kh = h / a.kv_group;
     const int64_t q0 = qb * BQ, row0 = q0 + warp * 16;
 
-    __half* Ks = reinterpret_cast<__half*>(smem);
-    __half* Vs = Ks + BK * LDK;
+    DT* Ks = reinterpret_cast<DT*>(smem);
+    DT* Vs = Ks + BK * LDK;
     static_assert(BK <= D, "P reuses the Q rows");
     unsigned char* wbase = smem + 2 * BK * LDK * 2 + warp * (16 * LDK * 2 + 16 * LDS * 4 + 16 * LDO * 4);
-    __half* Qs = reinterpret_cast<__half*>(wbase);
+    DT* Qs = reinterpret_cast<DT*>(wbase);
     float* Ss = reinterpret_cast<float*>(wbase + 16 * LDK * 2);
     float* Os = Ss + 16 * LDS;
-    __half* Ps = Qs;
+    DT* Ps = Qs;
     constexpr int LDP = LDK;
 
-    const __half* qp = reinterpret_cast<const __half*>(a.q) + b * a.qs.s[0] + h * a.qs.s[1];
-    const __half* kp = reinterpret_cast<const __half*>(a.k) + b * a.ks.s[0] + kh * a.ks.s[1];
-    const __half* vp = reinterpret_cast<const __half*>(a.v) + b * a.vs.s[0] + kh * a.vs.s[1];
-    const __half zero = __float2half(0.f);
-    auto vec_ok = [](const __half* p, const Strides4& st) {
+    const DT* qp = reinterpret_cast<const DT*>(a.q) + b * a.qs.s[0] + h * a.qs.s[1];
+    const DT* kp = reinterpret_cast<const DT*>(a.k) + b * a.ks.s[0] + kh * a.ks.s[1];
+    const DT* vp = reinterpret_cast<const DT*>(a.v) + b * a.vs.s[0] + kh * a.vs.s[1];
+    const DT zero = to_dt(0.f);
+    auto vec_ok = [](const DT* p, const Strides4& st) {
         return st.s[3] == 1 && st.s[2] % 8 == 0 && reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
     };
     const bool qv = vec_ok(qp, a.qs), kv = vec_ok(kp, a.ks), vv = vec_ok(vp, a.vs);
@@ -1069,7 +1076,7 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
     }
     for (int e = lane; e < 16 * D; e += 32) Os[(e / D) * LDO + e % D] = 0.f;
     __syncwarp();
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qa[KS];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, DT, wmma::row_major> qa[KS];
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) wmma::load_matrix_sync(qa[ks], Qs + ks * 16, LDK);
     __syncwarp();
@@ -1106,7 +1113,7 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
             wmma::fill_fragment(acc, 0.f);
 #pragma unroll
             for (int ks = 0; ks < KS; ++ks) {
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kb;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, DT, wmma::col_major> kb;
                 wmma::load_matrix_sync(kb, Ks + n * 16 * LDK + ks * 16, LDK);
                 wmma::mma_sync(acc, qa[ks], kb, acc);
             }
@@ -1139,7 +1146,7 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
         for (int c = 0; c < HC; ++c) {
             const float p = x[c] == kNegInf ? 0.f : __expf(x[c] - m_new);
             rs += p;
-            Ps[r * LDP + half * HC + c] = __float2half(p);
+            Ps[r * LDP + half * HC + c] = to_dt(p);
         }
         rs += __shfl_xor_sync(0xffffffffu, rs, 1);
         l_i = l_i * alpha + rs;
@@ -1152,8 +1159,8 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
             wmma::load_matrix_sync(o, Os + dt * 16, LDO, wmma::mem_row_major);
 #pragma unroll
             for (int ks = 0; ks < BK / 16; ++ks) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pa;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, DT, wmma::row_major> pa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, DT, wmma::row_major> vb;
                 wmma::load_matrix_sync(pa, Ps + ks * 16, LDP);
                 wmma::load_matrix_sync(vb, Vs + ks * 16 * LDK + dt * 16, LDK);
                 wmma::mma_sync(o, pa, vb, o);
@@ -1164,10 +1171,10 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
         sycl::group_barrier(it.get_group());
     }
     if (qi < a.Lq) {
-        __half* op = reinterpret_cast<__half*>(a.o) + b * a.os.s[0] + h * a.os.s[1] + qi * a.os.s[2];
+        DT* op = reinterpret_cast<DT*>(a.o) + b * a.os.s[0] + h * a.os.s[1] + qi * a.os.s[2];
         const float inv = l_i > 0.f ? 1.f / l_i : 0.f;
         for (int d = half * (D / 2); d < (half + 1) * (D / 2); ++d)
-            op[d * a.os.s[3]] = __float2half(Os[r * LDO + d] * inv);
+            op[d * a.os.s[3]] = to_dt(Os[r * LDO + d] * inv);
         if (half == 0) a.lse[(b * a.H + h) * a.Lq + qi] = l_i > 0.f ? m_i + __logf(l_i) : kNegInf;
     }
 #else
@@ -1175,16 +1182,16 @@ PTSYCL_HOST_DEVICE inline void wmma_flash_block(const FlashArgs<c10::Half>& a, c
 #endif
 }
 
-template <int D>
-void wmma_flash_attention(compat::Queue& queue, const FlashArgs<c10::Half>& args, int64_t groups) {
+template <typename T, int D>
+void wmma_flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t groups) {
     constexpr int threads = wmma_warps<D>() * 32;
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<unsigned char, 1> smem(sycl::range<1>(wmma_smem_bytes<D>()), cgh);
-        const FlashArgs<c10::Half> fa = args;
-        cgh.template parallel_for<WmmaFlashKernel<D>>(
+        const FlashArgs<T> fa = args;
+        cgh.template parallel_for<WmmaFlashKernel<T, D>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * threads)),
                               sycl::range<1>(static_cast<std::size_t>(threads))),
-            [=](sycl::nd_item<1> it) { wmma_flash_block<D>(fa, it, &smem[0]); });
+            [=](sycl::nd_item<1> it) { wmma_flash_block<T, D>(fa, it, &smem[0]); });
     });
 }
 #endif
@@ -1282,19 +1289,29 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                 at::empty({}, lopts), at::empty({}, lopts), none};
     }
 #if PTSYCL_WMMA_FLASH
-    if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) && q.scalar_type() == c10::kHalf) {
-        FlashArgs<c10::Half> fa{};
-        fa.q = data_ptr<c10::Half>(q); fa.k = data_ptr<c10::Half>(k); fa.v = data_ptr<c10::Half>(v);
-        fa.o = data_ptr<c10::Half>(out); fa.lse = lse.data_ptr<float>();
-        fa.mf = has_mask && !bool_mask ? data_ptr<c10::Half>(mask) : nullptr;
-        fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
-        fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
-        fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
-        fa.scale = sc; fa.causal = is_causal;
-        const int64_t bq = 16 * (D == 64 ? wmma_warps<64>() : wmma_warps<128>());
-        fa.q_blocks = (Lq + bq - 1) / bq;
-        if (D == 64) wmma_flash_attention<64>(queue, fa, B * H * fa.q_blocks);
-        else wmma_flash_attention<128>(queue, fa, B * H * fa.q_blocks);
+    const bool wmma_dt = q.scalar_type() == c10::kHalf || (PTSYCL_WMMA_BF16 && q.scalar_type() == c10::kBFloat16);
+    if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) && wmma_dt) {
+        auto run = [&](auto tag) {
+            using T = decltype(tag);
+            FlashArgs<T> fa{};
+            fa.q = data_ptr<T>(q); fa.k = data_ptr<T>(k); fa.v = data_ptr<T>(v);
+            fa.o = data_ptr<T>(out); fa.lse = lse.data_ptr<float>();
+            fa.mf = has_mask && !bool_mask ? data_ptr<T>(mask) : nullptr;
+            fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
+            fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
+            fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
+            fa.scale = sc; fa.causal = is_causal;
+            const int64_t bq = 16 * (D == 64 ? wmma_warps<64>() : wmma_warps<128>());
+            fa.q_blocks = (Lq + bq - 1) / bq;
+            if (D == 64) wmma_flash_attention<T, 64>(queue, fa, B * H * fa.q_blocks);
+            else wmma_flash_attention<T, 128>(queue, fa, B * H * fa.q_blocks);
+        };
+#if PTSYCL_WMMA_BF16
+        if (q.scalar_type() == c10::kBFloat16) run(c10::BFloat16{});
+        else run(c10::Half{});
+#else
+        run(c10::Half{});
+#endif
         const Tensor none = Tensor();
         return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
                 at::empty({}, lopts), at::empty({}, lopts), none};

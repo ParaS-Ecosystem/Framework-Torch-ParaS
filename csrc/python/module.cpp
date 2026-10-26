@@ -54,6 +54,7 @@ PYBIND11_MODULE(_C, m) {
         d["mfma"] = info.is_gpu && info.mfma && !info.generic;
         d["generic"] = info.generic;
         d["fp16_flash"] = info.is_gpu && ((info.mfma && !info.generic) || PTSYCL_WMMA_FLASH);
+        d["bf16_flash"] = info.is_gpu && ((info.mfma && !info.generic) || PTSYCL_WMMA_BF16);
         return d;
     });
 
