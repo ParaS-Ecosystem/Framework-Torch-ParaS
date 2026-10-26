@@ -16,8 +16,11 @@
 # along with this library. If not, see <https://www.gnu.org/licenses/>.
 # -----------------------------------------------------------------------------
 
+import unittest
+
 import torch
 import torch.nn.functional as F
+import torch_paras
 
 from common import assert_close
 
@@ -35,6 +38,55 @@ def test_linear(device):
     bias = torch.randn(6, dtype=torch.float32)
     out = F.linear(x.to(device), weight.to(device), bias.to(device))
     assert_close(out, F.linear(x, weight, bias), "linear")
+
+
+def test_linear_bf16_bias_precision(device):
+    index = int(device.split(":")[1])
+    if not torch_paras.is_gpu_device(index):
+        raise unittest.SkipTest("requires a ParaS GPU device")
+
+    x = torch.tensor([[1.0, 1.0]], dtype=torch.bfloat16)
+
+    cases = [
+        (
+            torch.tensor(
+                [[1.0, 0.00390625]],
+                dtype=torch.bfloat16,
+            ),
+            torch.tensor([-1.0], dtype=torch.bfloat16),
+            0.00390625,
+        ),
+        (
+            torch.tensor(
+                [[torch.finfo(torch.bfloat16).max, 2.0**119]],
+                dtype=torch.bfloat16,
+            ),
+            torch.tensor(
+                [-torch.finfo(torch.bfloat16).max],
+                dtype=torch.bfloat16,
+            ),
+            2.0**119,
+        ),
+    ]
+
+    for weight, bias, expected_value in cases:
+        out = F.linear(
+            x.to(device),
+            weight.to(device),
+            bias.to(device),
+        ).cpu().float()
+
+        expected = torch.tensor(
+            [[expected_value]],
+            dtype=torch.float32,
+        )
+
+        torch.testing.assert_close(
+            out,
+            expected,
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_upsample_nearest2d(device):

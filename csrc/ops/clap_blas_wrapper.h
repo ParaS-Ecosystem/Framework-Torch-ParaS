@@ -22,5 +22,6 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
     bool is_double,
     bool is_bf16,
     double alpha,
+    double beta,
     void* stream,
     int backend_type) noexcept;

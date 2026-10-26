@@ -289,19 +289,38 @@ public:
 
             if (bias_ok) {
                 Tensor input2 = input.view({batch, fi});
-                Tensor out2 = at::empty(
-                    {batch, fo},
-                    input.options());
+
+                const bool has_bias =
+                    bias.has_value() &&
+                    bias->defined() &&
+                    bias->numel() > 0;
+
+                const bool fuse_bf16_bias =
+                    has_bias &&
+                    input.scalar_type() == at::kBFloat16;
+
+                Tensor out2;
+                double beta = 0.0;
+
+                if (fuse_bf16_bias) {
+                    out2 = bias->view({1, fo})
+                               .expand({batch, fo})
+                               .contiguous();
+                    beta = 1.0;
+                } else {
+                    out2 = at::empty(
+                        {batch, fo},
+                        input.options());
+                }
 
                 if (clap_blas::gemm_device(
                         input2,
                         weight,
                         out2,
                         1.0,
-                        true)) {
-                    if (bias.has_value() &&
-                        bias->defined() &&
-                        bias->numel() > 0) {
+                        true,
+                        beta)) {
+                    if (has_bias && !fuse_bf16_bias) {
                         out2.add_(*bias);
                     }
 

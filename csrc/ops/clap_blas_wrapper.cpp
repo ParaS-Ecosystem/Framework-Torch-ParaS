@@ -116,6 +116,7 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
     bool is_double,
     bool is_bf16,
     double alpha,
+    double beta,
     void* stream,
     int backend_type) noexcept
 {
@@ -148,7 +149,7 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
                 static_cast<float>(alpha),
                 b, lda,
                 a, ldb,
-                0.0f,
+                static_cast<float>(beta),
                 out, ldc,
                 stream);
         } else if (is_double) {
@@ -160,7 +161,7 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
                 alpha,
                 static_cast<const double*>(b), lda,
                 static_cast<const double*>(a), ldb,
-                0.0,
+                beta,
                 static_cast<double*>(out), ldc,
                 stream);
         } else {
@@ -172,7 +173,7 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
                 static_cast<float>(alpha),
                 static_cast<const float*>(b), lda,
                 static_cast<const float*>(a), ldb,
-                0.0f,
+                static_cast<float>(beta),
                 static_cast<float*>(out), ldc,
                 stream);
         }

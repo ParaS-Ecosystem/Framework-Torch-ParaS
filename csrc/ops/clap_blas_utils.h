@@ -27,7 +27,8 @@ inline bool gemm_device(
     const at::Tensor& b,
     at::Tensor& out,
     double alpha = 1.0,
-    bool transpose_b = false)
+    bool transpose_b = false,
+    double beta = 0.0)
 {
 #ifdef PTSYCL_USE_CLAP_BLAS
     if (!is_paras_tensor(a) ||
@@ -69,7 +70,11 @@ inline bool gemm_device(
         return true;
 
     if (k == 0) {
-        out.zero_();
+        if (beta == 0.0) {
+            out.zero_();
+        } else if (beta != 1.0) {
+            out.mul_(beta);
+        }
         return true;
     }
 
@@ -100,6 +105,7 @@ inline bool gemm_device(
                     is_double,
                     is_bf16,
                     alpha,
+                    beta,
                     reinterpret_cast<void*>(stream),
                     1),
                 "CLAP-BLAS CUDA device GEMM failed");
@@ -126,6 +132,7 @@ inline bool gemm_device(
                     is_double,
                     is_bf16,
                     alpha,
+                    beta,
                     reinterpret_cast<void*>(stream),
                     2),
                 "CLAP-BLAS ROCm device GEMM failed");
@@ -140,6 +147,7 @@ inline bool gemm_device(
     (void)out;
     (void)alpha;
     (void)transpose_b;
+    (void)beta;
     return false;
 #endif
 }
