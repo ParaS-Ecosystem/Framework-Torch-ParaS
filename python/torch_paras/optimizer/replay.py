@@ -101,6 +101,8 @@ class GraphMeta:
 
 
 def meta_from_aot(fw_metadata, random_ops) -> GraphMeta:
+    """GraphMeta for replay from AOTAutograd's forward metadata: static and mutated inputs,
+    metadata mutation, outputs aliasing inputs, and the graph's random operators."""
     from torch._functorch._aot_autograd.schemas import OutputType
 
     inputs = fw_metadata.input_info
@@ -145,6 +147,7 @@ def _symbols(value) -> set:
 
 
 def has_dynamic_shapes(example_inputs) -> bool:
+    """True when any example input has symbolic sizes (such graphs are not replayed)."""
     return any(_symbols(x) for x in example_inputs)
 
 

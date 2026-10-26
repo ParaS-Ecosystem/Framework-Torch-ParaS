@@ -84,6 +84,7 @@ def device_count() -> int:
 
 
 def is_available() -> bool:
+    """True when at least one paras device exists (the host CPU engine counts)."""
     return device_count() > 0
 
 
@@ -93,6 +94,8 @@ def backend_name() -> str:
 
 
 def device_name(device: int = 0) -> str:
+    """Name of paras device `device` as the vendor runtime reports it (e.g. the GPU's marketing
+    name, or the host CPU)."""
     return _C.device_name(device)
 
 
@@ -119,6 +122,8 @@ def synchronize(device: int | torch.device | None = None) -> None:
 
 
 def manual_seed(seed: int, device: int | None = None) -> None:
+    """Seeds the device random generators: every paras device, or only `device` when given
+    (torch.manual_seed seeds them too)."""
     if device is None:
         _C.manual_seed_all(seed)
     else:
@@ -158,6 +163,7 @@ def memory_reserved(device=None) -> int:
 
 
 def max_memory_reserved(device=None) -> int:
+    """Peak of memory_reserved() since start-up or reset_peak_memory_stats()."""
     return _C.memory_stats(_index(device))["reserved_bytes"][1]
 
 
@@ -167,10 +173,13 @@ def memory_cached(device=None) -> int:
 
 
 def reset_peak_memory_stats(device=None) -> None:
+    """Restarts the peaks reported by max_memory_allocated() / max_memory_reserved() at the
+    current values."""
     _C.reset_peak_stats(_index(device))
 
 
 def reset_accumulated_memory_stats(device=None) -> None:
+    """Zeroes the accumulated counters of memory_stats() (allocation and free counts, bytes)."""
     _C.reset_accumulated_stats(_index(device))
 
 
@@ -202,6 +211,8 @@ def runtime_stats() -> dict:
 
 
 def reset_runtime_stats() -> None:
+    """Zeroes the counters of runtime_stats() (CPU fallbacks, host-device copies and bytes,
+    scalar reads)."""
     _C.reset_runtime_stats()
 
 
@@ -212,6 +223,7 @@ def set_strict(enabled: bool = True) -> None:
 
 
 def is_strict() -> bool:
+    """True when CPU fallbacks raise instead of running (PTSYCL_STRICT, or set_strict(True))."""
     return _C.strict()
 
 
@@ -228,20 +240,26 @@ def Stream(device=None, priority: int = 0) -> torch.Stream:
 
 
 def Event(enable_timing: bool = False, device=None) -> torch.Event:
+    """A torch.Event on a paras device (`device`: index or torch.device; default the current
+    one); enable_timing for elapsed_time()."""
     return torch.Event(device=_dev(device), enable_timing=enable_timing)
 
 
 def current_stream(device=None) -> torch.Stream:
+    """The current torch.Stream of a paras device (default the current device)."""
     return torch.accelerator.current_stream(_dev(device))
 
 
 def default_stream(device=None) -> torch.Stream:
+    """The default stream (id 0) of a paras device: the queue work goes to unless another stream
+    is made current."""
     d = _dev(device)
     cur = torch.accelerator.current_stream(d)
     return torch.Stream(stream_id=0, device_index=d.index, device_type=cur.device_type)
 
 
 def set_stream(stream: torch.Stream) -> None:
+    """Makes `stream` the current stream of its device (as torch.accelerator.set_stream)."""
     torch.accelerator.set_stream(stream)
 
 

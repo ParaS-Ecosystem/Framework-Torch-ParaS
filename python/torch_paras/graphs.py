@@ -72,6 +72,8 @@ def _index(device) -> int:
 
 
 def is_capturing(device=None) -> bool:
+    """True while a graph capture is in progress on paras device `device` (default the current
+    one)."""
     return bool(_C._graph_capturing(_index(device)))
 
 
@@ -90,6 +92,9 @@ class Graph:
         self._owns_pool = False
 
     def capture_begin(self, device=None, pool: int | None = None) -> None:
+        """Starts recording the work queued on `device`; allocations made while capturing come
+        from `pool` (a new private pool when None) so that replays find their
+        buffers. Raises if this Graph is already captured."""
         if self._handle is not None or self._device is not None:
             raise RuntimeError("this Graph is already captured; reset() it first")
         self._device = _index(device)
@@ -103,6 +108,7 @@ class Graph:
             raise
 
     def capture_end(self) -> None:
+        """Ends the recording started by capture_begin() and makes the graph replayable."""
         if self._device is None or self._handle is not None:
             raise RuntimeError("capture_end without capture_begin")
         try:
@@ -113,6 +119,8 @@ class Graph:
             raise
 
     def replay(self) -> None:
+        """Launches the recorded work again, on the buffers of the capture (refill inputs in
+        place before replaying)."""
         if self._handle is None:
             raise RuntimeError("replay of a Graph that was not captured")
         _C._graph_replay(self._handle)
@@ -125,6 +133,8 @@ class Graph:
         _C._graph_replay(self._handle, False)
 
     def pool(self) -> int | None:
+        """Id of the memory pool the capture allocated from (pass it to another capture to share
+        buffers), or None before capture_begin()."""
         return self._pool
 
     def reset(self) -> None:

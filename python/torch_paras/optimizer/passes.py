@@ -269,6 +269,8 @@ def _match_rms_norm(out):
 
 
 def fuse_rms_norm(gm: fx.GraphModule) -> int:
+    """Replaces the decomposed RMSNorm (x * rsqrt(mean(x^2) + eps) * weight, in transformers'
+    forms) by paras::rms_norm; returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         match = _match_rms_norm(node)
@@ -315,6 +317,8 @@ def _eager_silu_is_paras(value) -> bool:
 
 
 def fuse_swiglu(gm: fx.GraphModule) -> int:
+    """Replaces silu(gate) * up of equal shapes and dtype by paras::swiglu; returns the number
+    of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "mul" or _operands(node) is None:
@@ -360,6 +364,8 @@ def _half_slice(node, x_expected=None):
 
 
 def fuse_rotate_half(gm: fx.GraphModule) -> int:
+    """Replaces cat(-x[..., h:], x[..., :h]) (rotary embeddings' rotate_half) by
+    paras::rotate_half; returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "cat":
@@ -447,6 +453,9 @@ def _plain_contiguous(node) -> bool:
 
 
 def fuse_gqa_attention(gm: fx.GraphModule) -> int:
+    """Lets scaled_dot_product_attention read grouped key/value heads directly: drops the
+    repeat_interleave (and the .contiguous() copy) of the keys and values and sets
+    enable_gqa; returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target is not F.scaled_dot_product_attention:
@@ -507,6 +516,8 @@ def _rope_parts(add):
 
 
 def fuse_rope(gm: fx.GraphModule) -> int:
+    """Replaces x * cos + rotate_half(x) * sin by paras::rope; returns the number of
+    substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "add" or node.kwargs:
@@ -544,6 +555,8 @@ def fuse_rope(gm: fx.GraphModule) -> int:
 
 
 def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
+    """Folds the residual add before paras::rms_norm into paras::add_rms_norm (sum and norm in
+    one kernel); returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target is not torch.ops.paras.rms_norm.default:
@@ -595,6 +608,9 @@ _SDPA_KWARGS = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
 
 
 def fuse_sdpa_bool_mask(gm: fx.GraphModule) -> int:
+    """Inference only: replaces scaled_dot_product_attention with a boolean mask (4-D
+    tensors on a paras device, no dropout) by paras::sdpa, which reads the boolean mask
+    directly (grouped key/value heads included); returns the number of substitutions."""
     if torch.is_grad_enabled():
         return 0
     count = 0
@@ -635,6 +651,9 @@ def fuse_sdpa_bool_mask(gm: fx.GraphModule) -> int:
 
 
 def fuse_rope_index_copy(gm: fx.GraphModule) -> int:
+    """Replaces a RoPE whose result is written into a static KV cache with index_copy_ by
+    paras::rope_index_copy_ (rotate and store in one kernel); returns the number of
+    substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if node.op != "call_method" or node.target != "index_copy_" or node.kwargs or len(node.args) != 4:

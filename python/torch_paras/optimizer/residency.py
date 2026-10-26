@@ -76,6 +76,8 @@ def _out_variant(op: torch._ops.OpOverload):
 
 @lru_cache(maxsize=None)
 def classify(op: torch._ops.OpOverload) -> str:
+    """Where `op` runs on a paras device: 'paras' (a ParaS kernel), 'composite' (decomposed into
+    other operators), 'constant' (no device work) or 'cpu' (the CPU fallback)."""
     name = _qualified(op)
     if op._schema.name in _CONSTANT_OPS:
         return "constant"
