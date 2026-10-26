@@ -97,7 +97,7 @@ void unary_kernel(const Tensor& a, Tensor& out, Fn fn) {
     auto& q = queue_for(out);
     const int64_t n = out.numel();
     if (n == 0) return;
-    Tensor ae = a.expand_as(out);
+    Tensor ae = (a.scalar_type() == out.scalar_type() ? a : a.to(out.scalar_type())).expand_as(out);
     const bool vec = vec_ok(q, out, {&ae});
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -570,8 +570,14 @@ Tensor& sigmoid_out(const Tensor& self, Tensor& out) {
     unary_opmath(self, out, [](auto v) { return decltype(v)(1) / (decltype(v)(1) + opmath_exp(-v)); });
     return out;
 }
+static Tensor float_result_like(const Tensor& self) {
+    return c10::isIntegralType(self.scalar_type(), true)
+               ? at::empty_like(self, self.options().dtype(c10::typeMetaToScalarType(at::get_default_dtype())))
+               : at::empty_like(self);
+}
+
 Tensor sigmoid(const Tensor& self) {
-    Tensor out = at::empty_like(self);
+    Tensor out = float_result_like(self);
     return ptsycl::sigmoid_out(self, out);
 }
 Tensor& sigmoid_(Tensor& self) { return ptsycl::sigmoid_out(self, self); }
@@ -587,7 +593,7 @@ Tensor& tanh_out(const Tensor& self, Tensor& out) {
     return out;
 }
 Tensor tanh(const Tensor& self) {
-    Tensor out = at::empty_like(self);
+    Tensor out = float_result_like(self);
     return ptsycl::tanh_out(self, out);
 }
 Tensor& tanh_(Tensor& self) { return ptsycl::tanh_out(self, self); }
@@ -2315,6 +2321,12 @@ Tensor& linalg_vector_norm_out(const Tensor& self, const c10::Scalar& ord,
                                at::OptionalIntArrayRef dim, bool keepdim,
                                std::optional<c10::ScalarType> dtype, Tensor& out) {
     PTSYCL_TRACE_OP("linalg_vector_norm.out");
+    if (self.dim() == 0) {
+        if (dim.has_value())
+            for (int64_t d : *dim) (void)c10::maybe_wrap_dim(d, 0);
+        const std::vector<int64_t> d0{0};
+        return linalg_vector_norm_out(self.reshape({1}), ord, at::IntArrayRef(d0), false, dtype, out);
+    }
     c10::ScalarType acc = dtype.value_or(self.scalar_type());
     if (acc == c10::kHalf || acc == c10::kBFloat16) acc = c10::kFloat;
     TORCH_CHECK(c10::isFloatingType(acc), "paras vector_norm: floating input required");

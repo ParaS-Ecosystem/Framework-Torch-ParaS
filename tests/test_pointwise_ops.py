@@ -634,3 +634,24 @@ def test_softmax_rows_lengths(device):
     x[0] = float("-inf")
     assert torch.isnan(torch.softmax(x.to(device), -1).cpu()[0]).all()
     assert torch.equal(torch.ops.aten._safe_softmax(x.to(device), -1, None).cpu()[0], torch.zeros(4096))
+
+
+def test_float_unary_ops_of_integer_inputs(device):
+    x_int = torch.tensor([0, 1, 2, -3, 7])
+    x_bool = torch.tensor([True, False, True, True, False])
+    for f in (torch.exp, torch.exp2, torch.expm1, torch.log, torch.log1p, torch.log2, torch.sqrt, torch.rsqrt,
+              torch.reciprocal, torch.sin, torch.cos, torch.tan, torch.tanh, torch.sigmoid, torch.atan,
+              torch.erf, torch.erfc):
+        for x in (x_int, x_bool):
+            ref = f(x)
+            got = f(x.to(device)).cpu()
+            assert got.dtype == ref.dtype, (f.__name__, x.dtype, got.dtype)
+            assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5, equal_nan=True), (f.__name__, x.dtype, got, ref)
+
+
+def test_vector_norm_of_0d_tensor(device):
+    x = torch.tensor(-3.0)
+    for kw in ({}, {"dim": 0}, {"dim": -1, "keepdim": True}, {"dim": 0, "ord": 1}):
+        ref = torch.linalg.vector_norm(x, **kw)
+        got = torch.linalg.vector_norm(x.to(device), **kw).cpu()
+        assert got.shape == ref.shape and torch.allclose(got, ref), (kw, got, ref)
