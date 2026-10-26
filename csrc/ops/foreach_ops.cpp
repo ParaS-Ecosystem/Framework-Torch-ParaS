@@ -271,7 +271,11 @@ void amp_foreach_non_finite_check_and_unscale_(at::TensorList self, at::Tensor& 
     for (const at::Tensor& t : self) {
         if (!t.defined() || t.numel() == 0) continue;
         found_inf.masked_fill_(t.isfinite().logical_not_().any().view(found_inf.sizes()), 1.0);
-        const_cast<at::Tensor&>(t).mul_(inv_scale.to(t.scalar_type()));
+        auto& g = const_cast<at::Tensor&>(t);
+        if (g.scalar_type() == c10::kHalf || g.scalar_type() == c10::kBFloat16)
+            g.copy_(g.to(c10::kFloat).mul_(inv_scale.to(c10::kFloat)));
+        else
+            g.mul_(inv_scale.to(g.scalar_type()));
     }
 }
 

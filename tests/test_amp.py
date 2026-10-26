@@ -58,3 +58,13 @@ def test_fp16_and_mixed_gemm(device):
         got = torch.bmm(x.to(device), y.to(device)).cpu().float()
         ref = torch.bmm(x.float(), y.float())
         assert (got - ref).abs().max() / ref.abs().max() < 1e-2, dt
+
+
+def test_amp_unscale_fp16_gradients_at_large_scales(device):
+    g = (torch.randn(1000) * 2.0 ** 25).half()
+    inv = torch.tensor(2.0 ** -25)
+    found = torch.zeros(1)
+    gd = g.to(device)
+    torch._amp_foreach_non_finite_check_and_unscale_([gd], found.to(device), inv.to(device))
+    ref = (g.float() * inv).half()
+    assert torch.equal(gd.cpu(), ref) and float(gd.cpu().abs().max()) > 0
