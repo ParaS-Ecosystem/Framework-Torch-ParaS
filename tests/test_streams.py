@@ -120,3 +120,13 @@ def test_streams_on_host_device(device):
     e.synchronize()
     assert e.query()
     assert_close(y, torch.arange(10.0) * 3, "host stream")
+
+
+def test_many_new_streams_reuse_queues(device):
+    streams = [torch.Stream(device=device) for _ in range(200)]
+    x = torch.ones(1000, device=device)
+    for s in streams[::37]:
+        with s:
+            x.mul_(1.0)
+    torch_paras.synchronize()
+    assert torch.equal(x.cpu(), torch.ones(1000))

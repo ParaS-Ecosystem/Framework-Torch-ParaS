@@ -34,7 +34,7 @@ namespace ptsycl {
 class MemoryPool; // allocator.h
 
 constexpr int kMaxStreams = 64;
-constexpr int kPoolStreams = 8;
+[[maybe_unused]] constexpr int kPoolStreams = 8;
 
 struct DeviceState {
     compat::DeviceInfo          info;
@@ -44,6 +44,7 @@ struct DeviceState {
     std::mutex                  streams_mutex;
     int                         created_streams = 1;
     std::atomic<int>            next_pool_stream{0};
+    int                         next_new_stream = 0;
     std::unique_ptr<MemoryPool> pool;
     std::mutex                  rng_mutex;
     std::uint64_t               rng_seed     = 0x5deece66dULL;

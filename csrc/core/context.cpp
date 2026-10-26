@@ -108,9 +108,9 @@ int Context::new_stream(int index) {
     int id;
     {
         std::lock_guard<std::mutex> g(d.streams_mutex);
-        id = d.created_streams > kPoolStreams ? d.created_streams : kPoolStreams + 1;
-        TORCH_CHECK(id < kMaxStreams, "paras: more than ", kMaxStreams, " streams on device ", index);
-        d.created_streams = id + 1;
+        constexpr int first = kPoolStreams + 1, count = kMaxStreams - kPoolStreams - 1;
+        id = first + d.next_new_stream++ % count;
+        if (id + 1 > d.created_streams) d.created_streams = id + 1;
     }
     stream_queue(index, id);
     return id;
