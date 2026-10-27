@@ -187,9 +187,15 @@ _staged: dict = {}
 _held: dict = {}
 
 
+def _version(t: torch.Tensor):
+    """The version counter of `t`, or None for an inference tensor (which has
+    none, so its contents can never be known unchanged)."""
+    return None if t.is_inference() else t._version
+
+
 def _holds(buf, src) -> bool:
     held = _held.get(id(buf))
-    return held is not None and held[0]() is src and held[1] == src._version
+    return held is not None and held[1] is not None and held[0]() is src and held[1] == _version(src)
 
 
 def _load(buf, src):
@@ -197,7 +203,7 @@ def _load(buf, src):
         stats["inputs already loaded"] += 1
         return
     buf.copy_(src)
-    _held[id(buf)] = (weakref.ref(src), src._version)
+    _held[id(buf)] = (weakref.ref(src), _version(src))
 
 
 def _input_buffer(t: torch.Tensor) -> torch.Tensor:
@@ -206,13 +212,13 @@ def _input_buffer(t: torch.Tensor) -> torch.Tensor:
     entry = _staged.get(id(t))
     if entry is not None:
         ref, version, buf = entry
-        if (ref() is t and version == t._version and buf.shape == t.shape
+        if (ref() is t and version == _version(t) and buf.shape == t.shape
                 and buf.stride() == t.stride() and buf.dtype == t.dtype and buf.device == t.device):
             return buf
     for k in [k for k, (r, _, _) in _staged.items() if r() is None]:
         del _staged[k]
     buf = _buffer_like(t)
-    _staged[id(t)] = (weakref.ref(t), t._version, buf)
+    _staged[id(t)] = (weakref.ref(t), _version(t), buf)
     return buf
 
 

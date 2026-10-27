@@ -148,6 +148,23 @@ def test_compiled_replay_matches_eager(device):
     assert _replay_reports() == ["replayed"], _replay_reports()
 
 
+def test_compiled_replay_under_inference_mode(device):
+    _require_graphs(device)
+    _reset()
+    torch.manual_seed(0)
+    m = _Mlp().to(device).eval()
+    c = torch_paras.compile(m, graphs=True)
+    with torch.inference_mode():
+        x = torch.randn(2, 64, device=device)
+        for _ in range(4):
+            assert torch.equal(c(x).cpu(), m(x).cpu())
+            x.mul_(1.5)
+        for _ in range(2):
+            y = torch.randn(2, 64, device=device)
+            assert torch.equal(c(y).cpu(), m(y).cpu())
+    assert _replay_reports() == ["replayed"], _replay_reports()
+
+
 def test_compiled_replay_copies_mutated_inputs_back(device):
     _require_graphs(device)
     _reset()

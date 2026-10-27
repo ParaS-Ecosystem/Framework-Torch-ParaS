@@ -109,6 +109,7 @@ Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
     const int     ndim = idx_spec.ndim;
     const int64_t n    = idx.numel();
     const int64_t out_dim_stride = out.stride(d);
+    const int64_t out_dim_size = out.size(d);
     if (n == 0) return out;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -132,6 +133,7 @@ Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
                     if (dd != d) out_off += c * out_spec.strides[dd];
                 }
                 const int64_t sel = pidx[idx_off];
+                if (sel < 0 || sel >= out_dim_size) return;
                 out_off += sel * out_dim_stride;
                 pout[out_off] = psrc[src_off];
             });
@@ -159,6 +161,7 @@ Tensor& scatter_value_out(const Tensor& self, int64_t dim, const Tensor& index,
     const int     ndim = idx_spec.ndim;
     const int64_t n    = idx.numel();
     const int64_t out_dim_stride = out.stride(d);
+    const int64_t out_dim_size = out.size(d);
     if (n == 0) return out;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -180,6 +183,7 @@ Tensor& scatter_value_out(const Tensor& self, int64_t dim, const Tensor& index,
                     if (dd != d) out_off += c * out_spec.strides[dd];
                 }
                 const int64_t sel = pidx[idx_off];
+                if (sel < 0 || sel >= out_dim_size) return;
                 out_off += sel * out_dim_stride;
                 pout[out_off] = v;
             });
@@ -254,6 +258,7 @@ Tensor& scatter_add_out(const Tensor& self, int64_t dim, const Tensor& index,
     const auto src_spec = make_spec(s);
     const int     ndim = idx_spec.ndim;
     const int64_t acc_dim_stride = acc.stride(d);
+    const int64_t acc_dim_size = acc.size(d);
 
     auto run = [&](auto tag) {
         using scalar_t = decltype(tag);
@@ -274,7 +279,9 @@ Tensor& scatter_add_out(const Tensor& self, int64_t dim, const Tensor& index,
                 src_off += c * src_spec.strides[dd];
                 if (dd != d) acc_off += c * acc_spec.strides[dd];
             }
-            acc_off += pidx[idx_off] * acc_dim_stride;
+            const int64_t sel = pidx[idx_off];
+            if (sel < 0 || sel >= acc_dim_size) return;
+            acc_off += sel * acc_dim_stride;
             atomic_add(&pacc[acc_off], psrc[src_off]);
         });
     };
@@ -340,6 +347,7 @@ Tensor& index_add_out(const Tensor& self, int64_t dim, const Tensor& index,
     const auto src_spec = make_spec(src);
     const int     ndim  = src_spec.ndim;
     const int64_t*  pidx = data_ptr<int64_t>(idx);
+    const int64_t acc_dim_size = acc.dim() == 0 ? 1 : acc.size(d);
 
     auto run = [&](auto tag) {
         using scalar_t = decltype(tag);
@@ -355,7 +363,9 @@ Tensor& index_add_out(const Tensor& self, int64_t dim, const Tensor& index,
                 const int64_t c = rem % src_spec.sizes[dd];
                 rem /= src_spec.sizes[dd];
                 src_off += c * src_spec.strides[dd];
-                acc_off += (dd == d ? pidx[c] : c) * acc_spec.strides[dd];
+                const int64_t i = dd == d ? pidx[c] : c;
+                if (dd == d && (i < 0 || i >= acc_dim_size)) return;
+                acc_off += i * acc_spec.strides[dd];
             }
             if (ndim == 0) acc_off = 0;
             atomic_add(&pacc[acc_off], static_cast<scalar_t>(a * psrc[src_off]));

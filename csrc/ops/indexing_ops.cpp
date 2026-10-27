@@ -255,7 +255,7 @@ struct AdvancedIndexInfo {
     int num_indexed = 0;
     const int64_t* pidx[kMaxDims]{};
 
-    PTSYCL_HOST_DEVICE inline int64_t compute_self_offset(int64_t flat) const {
+    PTSYCL_HOST_DEVICE inline int64_t compute_self_offset(int64_t flat, bool* in_range = nullptr) const {
         int64_t rem = flat;
         int64_t out_coord[kMaxDims];
         for (int d = out_ndim - 1; d >= 0; --d) {
@@ -278,6 +278,7 @@ struct AdvancedIndexInfo {
                 int idx_i = idx_map[d];
                 int64_t raw_val = pidx[idx_i][b_offset];
                 if (raw_val < 0) raw_val += self_sizes[d];
+                if (in_range && (raw_val < 0 || raw_val >= self_sizes[d])) *in_range = false;
                 coord_d = raw_val;
             } else {
                 int out_d = unindexed_out_dim[d];
@@ -446,7 +447,7 @@ void copy_index_rows(compat::Queue& q, const char* src, char* dst, const int64_t
         int64_t j = idx[r];
         if (j < 0) j += dim0;
         if (gather) d[r * words + w] = s[j * words + w];
-        else        d[j * words + w] = s[r * words + w];
+        else if (j >= 0 && j < dim0) d[j * words + w] = s[r * words + w];
     });
 }
 
@@ -563,8 +564,9 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
 
                 launch_flat(q, n, [=](std::size_t flat_) {
                     const int64_t flat = static_cast<int64_t>(flat_);
-                    const int64_t self_off = info.compute_self_offset(flat);
-                    pself[self_off] = pval[flat];
+                    bool in_range = true;
+                    const int64_t self_off = info.compute_self_offset(flat, &in_range);
+                    if (in_range) pself[self_off] = pval[flat];
                 });
             });
         return self;
@@ -584,8 +586,9 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
         const T* pval  = data_ptr<T>(v);                                    \
         launch_flat(q, n, [=](std::size_t flat_) {                          \
             const int64_t flat = static_cast<int64_t>(flat_);               \
-            const int64_t self_off = info.compute_self_offset(flat);        \
-            atomic_add(&pself[self_off], pval[flat]);                       \
+            bool in_range = true;                                           \
+            const int64_t self_off = info.compute_self_offset(flat, &in_range); \
+            if (in_range) atomic_add(&pself[self_off], pval[flat]);         \
         });                                                                 \
         break;                                                              \
     }
