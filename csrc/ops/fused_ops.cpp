@@ -31,6 +31,7 @@
 // autograd for training, since AutogradPrivateUse1 is registered as a plain
 // fallthrough elsewhere in this codebase. swiglu and rotate_half have no
 // aten:: identity at all. All three are exposed with an explicit backward
+// counterpart.
 
 namespace ptsycl {
 namespace {

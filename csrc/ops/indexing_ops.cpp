@@ -518,6 +518,7 @@ Tensor index_tensor(const Tensor& self,
 // -----------------------------------------------------------------------------
 // Split into two dispatches rather than one: the plain-store path
 // (accumulate=false) never touches atomic_add and keeps the full
+// AT_DISPATCH_ALL_TYPES_AND3 range.
 Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
                    const Tensor& values, bool accumulate) {
     PTSYCL_TRACE_OP("index_put_");
