@@ -9,6 +9,7 @@
 #endif
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
@@ -31,6 +32,7 @@ struct DeviceBackend {
     std::unique_ptr<clap::IBlasBackend> backend;
     bool unavailable = false;
     bool bf16_unsupported = false;
+    bool ex_unsupported = false;
 };
 
 thread_local std::unordered_map<int, DeviceBackend> device_backends;
@@ -104,7 +106,42 @@ bool run_device_gemm(DeviceBackend& entry,
 {
     constexpr auto kRow = clap::Layout::RowMajor;
     clap::IBlasBackend* backend = entry.backend.get();
-    if (dtype != c_dtype)
+#if defined(PTSYCL_CLAP_HAS_GEMM_EX)
+    const auto elem = [](int t) {
+        return t == PTSYCL_CLAP_F16 ? clap::GemmElem::F16
+             : t == PTSYCL_CLAP_BF16 ? clap::GemmElem::BF16 : clap::GemmElem::F32;
+    };
+    if ((dtype == PTSYCL_CLAP_F16 && (c_dtype == PTSYCL_CLAP_F16 || c_dtype == PTSYCL_CLAP_F32)) ||
+        (dtype == PTSYCL_CLAP_BF16 && c_dtype == PTSYCL_CLAP_F32)) {
+        if (entry.ex_unsupported) return false;
+        try {
+            backend->gemm_ex_strided_batched_device(
+                kRow, ta, tb, m, n, k, static_cast<float>(alpha), a, lda, stride_a, b, ldb, stride_b,
+                static_cast<float>(beta), c, ldc, stride_c, batch, elem(dtype), elem(c_dtype), stream);
+        } catch (const std::invalid_argument&) {
+            return false;
+        } catch (const std::exception& e) {
+            if (std::strstr(e.what(), "unsupported by this backend") != nullptr) entry.ex_unsupported = true;
+            return false;
+        }
+        return true;
+    }
+#endif
+#if defined(PTSYCL_CLAP_HAS_INT8)
+    if (dtype == PTSYCL_CLAP_I8 || c_dtype == PTSYCL_CLAP_I32) {
+        if (dtype != PTSYCL_CLAP_I8 || c_dtype != PTSYCL_CLAP_I32) return false;
+        try {
+            backend->gemm_ex_strided_batched_device(
+                kRow, ta, tb, m, n, k, static_cast<float>(alpha), a, lda, stride_a, b, ldb, stride_b,
+                static_cast<float>(beta), c, ldc, stride_c, batch, clap::GemmElem::I8, clap::GemmElem::I32,
+                stream);
+        } catch (const std::exception&) {
+            return false;
+        }
+        return true;
+    }
+#endif
+    if (dtype != c_dtype || dtype > PTSYCL_CLAP_BF16)
         return false;
     switch (dtype) {
     case PTSYCL_CLAP_F32:
@@ -274,6 +311,47 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
     (void)k; (void)alpha; (void)a; (void)lda; (void)stride_a; (void)b;
     (void)ldb; (void)stride_b; (void)beta; (void)c; (void)ldc;
     (void)stride_c; (void)batch; (void)dtype; (void)c_dtype; (void)stream;
+    return false;
+#endif
+}
+
+extern "C" bool ptsycl_clap_blas_gemm_scaled_raw(
+    int device_index, bool trans_a, bool trans_b, int m, int n, int k,
+    const void* a, int lda, const void* b, int ldb, void* c, int ldc,
+    int a_dtype, int b_dtype, int c_dtype, const void* scale_a, const void* scale_b,
+    void* stream) noexcept
+{
+#if (defined(PTSYCL_CLAP_DEVICE_BACKEND_AMD) || defined(PTSYCL_CLAP_DEVICE_BACKEND_CUDA)) && \
+    defined(PTSYCL_CLAP_HAS_GEMM_SCALED)
+    try {
+        const StreamDeviceGuard device_guard(stream);
+        DeviceBackend* backend = get_device_backend(device_index);
+        if (backend == nullptr) return false;
+        const auto elem = [](int t, clap::GemmElem& e) {
+            switch (t) {
+            case PTSYCL_CLAP_F32: e = clap::GemmElem::F32; return true;
+            case PTSYCL_CLAP_F16: e = clap::GemmElem::F16; return true;
+            case PTSYCL_CLAP_BF16: e = clap::GemmElem::BF16; return true;
+            case PTSYCL_CLAP_F8E4M3: e = clap::GemmElem::F8E4M3; return true;
+            case PTSYCL_CLAP_F8E5M2: e = clap::GemmElem::F8E5M2; return true;
+            case PTSYCL_CLAP_F8E4M3FNUZ: e = clap::GemmElem::F8E4M3FNUZ; return true;
+            case PTSYCL_CLAP_F8E5M2FNUZ: e = clap::GemmElem::F8E5M2FNUZ; return true;
+            default: return false;
+            }
+        };
+        clap::GemmElem ea, eb, ec;
+        if (!elem(a_dtype, ea) || !elem(b_dtype, eb) || !elem(c_dtype, ec)) return false;
+        return backend->backend->gemm_scaled_device(
+            clap::Layout::RowMajor, trans_a ? clap::Transpose::Trans : clap::Transpose::NoTrans,
+            trans_b ? clap::Transpose::Trans : clap::Transpose::NoTrans, m, n, k, a, lda, b, ldb, c, ldc,
+            ea, eb, ec, scale_a, scale_b, stream);
+    } catch (...) {
+        return false;
+    }
+#else
+    (void)device_index; (void)trans_a; (void)trans_b; (void)m; (void)n; (void)k; (void)a; (void)lda;
+    (void)b; (void)ldb; (void)c; (void)ldc; (void)a_dtype; (void)b_dtype; (void)c_dtype;
+    (void)scale_a; (void)scale_b; (void)stream;
     return false;
 #endif
 }

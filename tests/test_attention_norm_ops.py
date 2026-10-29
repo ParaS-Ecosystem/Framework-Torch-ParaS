@@ -2,8 +2,9 @@ import math
 
 import torch
 import torch.nn.functional as F
+import torch_paras
 
-from common import assert_close
+from common import assert_close, fast_kernels
 
 
 def _qkv(device, B=2, H=4, Lq=8, Lk=8, E=16, dtype=torch.float32):
@@ -257,17 +258,20 @@ def test_sdpa_fused_decode_path(device):
                 torch.testing.assert_close(out.cpu().float(), ref, atol=tol, rtol=tol)
 
 
-def test_sdpa_training_and_long_query_use_math(device):
+def test_sdpa_training_uses_fused_path(device):
     q = torch.randn(1, 2, 3, 8, requires_grad=True)
     k = torch.randn(1, 2, 6, 8, requires_grad=True)
     v = torch.randn(1, 2, 6, 8, requires_grad=True)
     dq, dk, dv = (t.detach().to(device).requires_grad_() for t in (q, k, v))
     out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(dq, dk, dv, is_causal=True))
-    assert "_scaled_dot_product_fused_attention_overrideable" not in ops
+    assert "_scaled_dot_product_fused_attention_overrideable" in ops, ops
     F.scaled_dot_product_attention(q, k, v, is_causal=True).sum().backward()
     out.sum().backward()
     for a, b in ((dq, q), (dk, k), (dv, v)):
         torch.testing.assert_close(a.grad.cpu(), b.grad, atol=1e-5, rtol=1e-4)
+    mask = torch.randn(1, 1, 3, 6, device=device, requires_grad=True)
+    _, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(dq, dk, dv, attn_mask=mask))
+    assert "_scaled_dot_product_fused_attention_overrideable" not in ops
 
 
 def test_sdpa_fused_prefill_path(device):
@@ -315,13 +319,16 @@ def test_sdpa_fused_precision_matches_math(device):
 def test_sdpa_long_keys(device):
     import torch_paras
     torch.manual_seed(0)
-    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    gpu = fast_kernels(device)
     B, H, L, D = 1, 2, 5000, 64
     q = torch.randn(B, L, H, D).transpose(1, 2)
     k = torch.randn(B, H, L, D)
     v = torch.randn(B, H, L, D)
     ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    for dtype, tol, want in ((torch.bfloat16, 2.5e-2, gpu), (torch.float16, 4e-3, gpu), (torch.float32, 1e-4, gpu)):
+    idx = torch.device(device).index or 0
+    caps = torch_paras.device_kernel_caps(idx) if torch_paras.is_gpu_device(idx) else {}
+    fp16_flash, bf16_flash = caps.get("fp16_flash", False), caps.get("bf16_flash", False)
+    for dtype, tol, want in ((torch.bfloat16, 2.5e-2, bf16_flash), (torch.float16, 4e-3, fp16_flash), (torch.float32, 1e-4, gpu)):
         out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
             q.to(dtype).to(device), k.to(dtype).to(device), v.to(dtype).to(device), is_causal=True))
         fused = "_scaled_dot_product_fused_attention_overrideable" in ops
@@ -329,15 +336,65 @@ def test_sdpa_long_keys(device):
         torch.testing.assert_close(out.cpu().float(), ref, atol=tol, rtol=tol)
 
 
+def test_sdpa_flash_fp16(device):
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    cases = ((1, 4, 4, 100, 100, 64), (2, 8, 2, 77, 130, 64), (1, 4, 4, 64, 200, 128), (1, 2, 1, 300, 300, 128))
+    for B, H, Hk, Lq, Lk, D in cases:
+        q = torch.randn(B, H, Lq, D)
+        k = torch.randn(B, Hk, Lk, D)
+        v = torch.randn(B, Hk, Lk, D)
+        bmask = torch.rand(B, 1, Lq, Lk) > 0.3
+        fmask = torch.randn(B, 1, Lq, Lk)
+        for kw in ({"is_causal": True}, {"attn_mask": bmask}, {"attn_mask": fmask}, {}):
+            if kw.get("is_causal") and Lq > Lk:
+                continue
+            ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double(), enable_gqa=True,
+                                                 **{n: (m.double() if m.dtype != torch.bool else m) if torch.is_tensor(m) else m
+                                                    for n, m in kw.items()})
+            dkw = {n: (m.half().to(device) if m.dtype != torch.bool else m.to(device)) if torch.is_tensor(m) else m
+                   for n, m in kw.items()}
+            out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+                q.half().to(device), k.half().to(device), v.half().to(device), enable_gqa=True, **dkw))
+            assert ("_scaled_dot_product_fused_attention_overrideable" in ops) == gpu, (B, H, Lq, Lk, D, ops[:6])
+            err = (out.cpu().double() - ref).abs().max().item()
+            assert err < 4e-3, (B, H, Hk, Lq, Lk, D, list(kw), err)
+
+
+def test_sdpa_flash_bf16(device):
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    cases = ((1, 4, 4, 100, 100, 64), (2, 8, 2, 77, 130, 64), (1, 4, 4, 64, 200, 128), (1, 2, 1, 300, 300, 128))
+    for B, H, Hk, Lq, Lk, D in cases:
+        q = torch.randn(B, H, Lq, D).bfloat16()
+        k = torch.randn(B, Hk, Lk, D).bfloat16()
+        v = torch.randn(B, Hk, Lk, D).bfloat16()
+        bmask = torch.rand(B, 1, Lq, Lk) > 0.3
+        fmask = torch.randn(B, 1, Lq, Lk).bfloat16()
+        for kw in ({"is_causal": True}, {"attn_mask": bmask}, {"attn_mask": fmask}, {}):
+            if kw.get("is_causal") and Lq > Lk:
+                continue
+            ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double(), enable_gqa=True,
+                                                 **{n: (m.double() if m.dtype != torch.bool else m) if torch.is_tensor(m) else m
+                                                    for n, m in kw.items()})
+            dkw = {n: m.to(device) if torch.is_tensor(m) else m for n, m in kw.items()}
+            out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+                q.to(device), k.to(device), v.to(device), enable_gqa=True, **dkw))
+            assert ("_scaled_dot_product_fused_attention_overrideable" in ops) == gpu, (B, H, Lq, Lk, D, ops[:6])
+            err = (out.cpu().double() - ref).abs().max().item()
+            assert err < 2.5e-2, (B, H, Hk, Lq, Lk, D, list(kw), err)
+
+
 def test_sdpa_flash_fp32(device):
     import torch_paras
     torch.manual_seed(0)
     gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
-    cases = [(2, 3, 3, 130, 130), (1, 2, 2, 70, 200), (1, 4, 4, 257, 257), (1, 8, 2, 300, 300)]
-    for B, H, Hk, Lq, Lk in cases:
-        q = torch.randn(B, Lq, H, 64).transpose(1, 2)
-        k = torch.randn(B, Hk, Lk, 64)
-        v = torch.randn(B, Hk, Lk, 64)
+    cases = [(2, 3, 3, 130, 130, 64), (1, 2, 2, 70, 200, 64), (1, 4, 4, 257, 257, 64), (1, 8, 2, 300, 300, 64),
+             (1, 2, 2, 130, 130, 128), (1, 4, 2, 70, 211, 128)]
+    for B, H, Hk, Lq, Lk, D in cases:
+        q = torch.randn(B, Lq, H, D).transpose(1, 2)
+        k = torch.randn(B, Hk, Lk, D)
+        v = torch.randn(B, Hk, Lk, D)
         bmask = torch.rand(B, 1, Lq, Lk) > 0.3
         bmask[..., 0] = True
         fmask = torch.randn(B, 1, Lq, Lk)
@@ -467,3 +524,47 @@ def test_reductions_around_work_group_rows(device):
         _near(torch.log_softmax(xd, -1), torch.log_softmax(x, -1), f"log_softmax {cols}", tol=1e-4)
         xb = x.bfloat16()
         _near(xb.to(device).float().pow(2).mean(-1), xb.float().pow(2).mean(-1), f"bf16 mean {cols}", tol=1e-4)
+
+
+def test_sdpa_fused_training_gradients(device):
+    import torch_paras
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    cases = [(2, 4, 4, 70, 70, 64, torch.float32), (1, 8, 2, 130, 130, 64, torch.float32),
+             (1, 4, 4, 40, 90, 64, torch.float32), (1, 4, 2, 66, 66, 128, torch.bfloat16)]
+    for B, H, Hk, Lq, Lk, D, dt in cases:
+        q = torch.randn(B, H, Lq, D) * 0.5
+        k = torch.randn(B, Hk, Lk, D) * 0.5
+        v = torch.randn(B, Hk, Lk, D)
+        g = torch.randn(B, H, Lq, D)
+        bmask = torch.rand(B, 1, Lq, Lk) > 0.3
+        bmask[..., 0] = True
+        gqa = {"enable_gqa": True} if H != Hk else {}
+        for kw in ({"is_causal": True}, {"attn_mask": bmask}, {"attn_mask": torch.randn(B, 1, Lq, Lk)}, {}):
+            if kw.get("is_causal") and Lq > Lk:
+                continue
+            ref_in = [t.double().requires_grad_() for t in (q, k, v)]
+            ref = F.scaled_dot_product_attention(
+                *ref_in, **{a: (b.double() if a == "attn_mask" and b.dtype != torch.bool else b) for a, b in kw.items()}, **gqa)
+            ref.backward(g.double())
+            dev_in = [t.to(device, dt).requires_grad_() for t in (q, k, v)]
+            dkw = {a: (b.to(device) if torch.is_tensor(b) and b.dtype == torch.bool else
+                       (b.to(device, dt) if torch.is_tensor(b) else b)) for a, b in kw.items()}
+            out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(*dev_in, **dkw, **gqa))
+            assert ("_scaled_dot_product_fused_attention_overrideable" in ops) == gpu or Lq <= 16, ops[:6]
+            out.backward(g.to(device, dt))
+            tol = 2e-4 if dt == torch.float32 else 4e-2
+            for name, d, r in zip("qkv", dev_in, ref_in):
+                torch.testing.assert_close(d.grad.cpu().double(), r.grad, atol=tol, rtol=tol,
+                                           msg=lambda m: f"{name} {B, H, Hk, Lq, Lk, D, dt} {list(kw)}: {m}")
+
+
+def test_sdpa_fp32_head128_long_keys_fused(device):
+    torch.manual_seed(0)
+    B, H, L, D = 1, 2, 5000, 128
+    q, k, v = torch.randn(B, H, 64, D), torch.randn(B, H, L, D), torch.randn(B, H, L, D)
+    ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double()).float()
+    out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(q.to(device), k.to(device), v.to(device)))
+    fused = "_scaled_dot_product_fused_attention_overrideable" in ops
+    assert fused == fast_kernels(device), (fused, ops[:6])
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-5, rtol=2e-5)

@@ -37,6 +37,12 @@ MODULES = [
     "test_optimizer",
     "test_graphs",
     "test_moe_ops",
+    "test_nn_device_ops",
+    "test_streams",
+    "test_amp",
+    "test_more_ops",
+    "test_profiler",
+    "test_quant_ops",
 ]
 
 

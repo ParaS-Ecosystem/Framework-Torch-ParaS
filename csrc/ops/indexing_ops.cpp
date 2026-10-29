@@ -101,6 +101,12 @@ Tensor& index_select_out(const Tensor& self, int64_t dim, const Tensor& index,
     PTSYCL_TRACE_OP("index_select.out");
     TORCH_CHECK(index.dim() <= 1,
                 "paras index_select: index must be 0-D or 1-D");
+    if (self.dim() == 0) {
+        c10::maybe_wrap_dim(dim, 0);
+        Tensor o = out.view({1});
+        ptsycl::index_select_out(self.view({1}), 0, index, o);
+        return out;
+    }
     TORCH_CHECK(spec_supported(self) && spec_supported(out),
                 "paras index_select: rank exceeds kernel limit");
 
@@ -145,6 +151,10 @@ Tensor& index_select_out(const Tensor& self, int64_t dim, const Tensor& index,
 
 Tensor index_select(const Tensor& self, int64_t dim, const Tensor& index) {
     PTSYCL_TRACE_OP("index_select");
+    if (self.dim() == 0) {
+        Tensor out = at::empty({}, self.options());
+        return ptsycl::index_select_out(self, dim, index, out);
+    }
     const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
     auto sizes = self.sizes().vec();
     sizes[d] = index.dim() == 0 ? 1 : index.numel();
@@ -170,6 +180,7 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
     const auto self_spec = make_spec(self);
     const auto src_spec  = make_spec(source);
     const int64_t self_dim_stride = self.stride(d);
+    const int64_t self_dim_size = self.size(d);
     const int     ndim = src_spec.ndim;
 
     AT_DISPATCH_ALL_TYPES_AND3(
@@ -179,21 +190,34 @@ Tensor& index_copy_(Tensor& self, int64_t dim, const Tensor& index,
             const scalar_t* psrc  = data_ptr<scalar_t>(source);
             const int64_t*  pidx  = data_ptr<int64_t>(idx);
 
+            const bool narrow = n <= int64_t{0x7fffffff};
             launch_flat(q, n, [=](std::size_t flat_) {
                 const int64_t flat    = static_cast<int64_t>(flat_);
                 const int64_t src_off = src_spec.index(flat);
 
-                int64_t rem = flat;
                 int64_t self_off = 0;
                 int64_t sel = 0;
-                for (int dd = ndim - 1; dd >= 0; --dd) {
-                    const int64_t c = rem % src_spec.sizes[dd];
-                    rem /= src_spec.sizes[dd];
-                    if (dd == d) sel = c;
-                    else self_off += c * self_spec.strides[dd];
+                if (narrow) {
+                    uint32_t rem = static_cast<uint32_t>(flat);
+                    for (int dd = ndim - 1; dd >= 0; --dd) {
+                        const uint32_t sz = static_cast<uint32_t>(src_spec.sizes[dd]);
+                        const uint32_t c = rem % sz;
+                        rem /= sz;
+                        if (dd == d) sel = c;
+                        else self_off += static_cast<int64_t>(c) * self_spec.strides[dd];
+                    }
+                } else {
+                    int64_t rem = flat;
+                    for (int dd = ndim - 1; dd >= 0; --dd) {
+                        const int64_t c = rem % src_spec.sizes[dd];
+                        rem /= src_spec.sizes[dd];
+                        if (dd == d) sel = c;
+                        else self_off += c * self_spec.strides[dd];
+                    }
                 }
-                self_off += pidx[sel] * self_dim_stride;
-                pself[self_off] = psrc[src_off];
+                const int64_t i = pidx[sel];
+                if (i < 0 || i >= self_dim_size) return;
+                pself[self_off + i * self_dim_stride] = psrc[src_off];
             });
         });
     return self;
@@ -231,7 +255,7 @@ struct AdvancedIndexInfo {
     int num_indexed = 0;
     const int64_t* pidx[kMaxDims]{};
 
-    PTSYCL_HOST_DEVICE inline int64_t compute_self_offset(int64_t flat) const {
+    PTSYCL_HOST_DEVICE inline int64_t compute_self_offset(int64_t flat, bool* in_range = nullptr) const {
         int64_t rem = flat;
         int64_t out_coord[kMaxDims];
         for (int d = out_ndim - 1; d >= 0; --d) {
@@ -254,6 +278,7 @@ struct AdvancedIndexInfo {
                 int idx_i = idx_map[d];
                 int64_t raw_val = pidx[idx_i][b_offset];
                 if (raw_val < 0) raw_val += self_sizes[d];
+                if (in_range && (raw_val < 0 || raw_val >= self_sizes[d])) *in_range = false;
                 coord_d = raw_val;
             } else {
                 int out_d = unindexed_out_dim[d];
@@ -422,7 +447,7 @@ void copy_index_rows(compat::Queue& q, const char* src, char* dst, const int64_t
         int64_t j = idx[r];
         if (j < 0) j += dim0;
         if (gather) d[r * words + w] = s[j * words + w];
-        else        d[j * words + w] = s[r * words + w];
+        else if (j >= 0 && j < dim0) d[j * words + w] = s[r * words + w];
     });
 }
 
@@ -493,6 +518,7 @@ Tensor index_tensor(const Tensor& self,
 // -----------------------------------------------------------------------------
 // Split into two dispatches rather than one: the plain-store path
 // (accumulate=false) never touches atomic_add and keeps the full
+// AT_DISPATCH_ALL_TYPES_AND3 range.
 Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices,
                    const Tensor& values, bool accumulate) {
     PTSYCL_TRACE_OP("index_put_");
@@ -539,8 +565,9 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
 
                 launch_flat(q, n, [=](std::size_t flat_) {
                     const int64_t flat = static_cast<int64_t>(flat_);
-                    const int64_t self_off = info.compute_self_offset(flat);
-                    pself[self_off] = pval[flat];
+                    bool in_range = true;
+                    const int64_t self_off = info.compute_self_offset(flat, &in_range);
+                    if (in_range) pself[self_off] = pval[flat];
                 });
             });
         return self;
@@ -560,8 +587,9 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
         const T* pval  = data_ptr<T>(v);                                    \
         launch_flat(q, n, [=](std::size_t flat_) {                          \
             const int64_t flat = static_cast<int64_t>(flat_);               \
-            const int64_t self_off = info.compute_self_offset(flat);        \
-            atomic_add(&pself[self_off], pval[flat]);                       \
+            bool in_range = true;                                           \
+            const int64_t self_off = info.compute_self_offset(flat, &in_range); \
+            if (in_range) atomic_add(&pself[self_off], pval[flat]);         \
         });                                                                 \
         break;                                                              \
     }
@@ -717,24 +745,24 @@ Tensor& tril_(Tensor& self, int64_t diagonal) {
 
 constexpr int64_t kNonzeroChunk = 256;
 
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
-constexpr int64_t kScanLanes = 64;
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
 constexpr int64_t kScanPerLane = 16;
-constexpr int64_t kScanBlock = kScanLanes * kScanPerLane;
 
-template <typename T> class ScanBlockTotals;
-template <typename T> class ScanAddOffsets;
-template <typename T> class NonzeroCount;
-template <typename T> class NonzeroWrite;
+template <typename T, int Lanes> class ScanBlockTotals;
+template <typename T, int Lanes> class ScanAddOffsets;
+template <typename T, int Lanes> class NonzeroCount;
+template <typename T, int Lanes> class NonzeroWrite;
 
+template <int Lanes>
 void exclusive_scan_device(compat::Queue& q, Tensor& v) {
+    constexpr int64_t kScanLanes = Lanes, kScanBlock = Lanes * kScanPerLane;
     const int64_t n = v.numel();
     if (n == 0) return;
     int64_t* pv = data_ptr<int64_t>(v);
     const int64_t blocks = (n + kScanBlock - 1) / kScanBlock;
     Tensor totals = at::empty({blocks}, v.options());
     int64_t* pt = data_ptr<int64_t>(totals);
-    q.sycl_queue().template parallel_for<ScanBlockTotals<int64_t>>(
+    q.sycl_queue().template parallel_for<ScanBlockTotals<int64_t, Lanes>>(
         sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
                           sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
         [=](sycl::nd_item<1> it) {
@@ -759,8 +787,8 @@ void exclusive_scan_device(compat::Queue& q, Tensor& v) {
             if (lane == kScanLanes - 1) pt[blk] = incl;
         });
     if (blocks == 1) return;
-    exclusive_scan_device(q, totals);
-    q.sycl_queue().template parallel_for<ScanAddOffsets<int64_t>>(
+    exclusive_scan_device<Lanes>(q, totals);
+    q.sycl_queue().template parallel_for<ScanAddOffsets<int64_t, Lanes>>(
         sycl::range<1>(static_cast<std::size_t>(n)), [=](sycl::id<1> i) {
             pv[i[0]] += pt[static_cast<int64_t>(i[0]) / kScanBlock];
         });
@@ -772,7 +800,9 @@ PTSYCL_HOST_DEVICE inline bool is_nonzero(scalar_t x) {
     else return static_cast<float>(x) != 0.0f;
 }
 
+template <int Lanes>
 void nonzero_gpu(compat::Queue& q, const Tensor& self, Tensor& out) {
+    constexpr int64_t kScanLanes = Lanes, kScanBlock = Lanes * kScanPerLane;
     const int64_t n = self.numel();
     const int ndim = static_cast<int>(self.dim());
     const int64_t blocks = (n + kScanBlock - 1) / kScanBlock;
@@ -784,7 +814,7 @@ void nonzero_gpu(compat::Queue& q, const Tensor& self, Tensor& out) {
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_nonzero_count", [&] {
             const scalar_t* p = data_ptr<scalar_t>(self);
-            q.sycl_queue().template parallel_for<NonzeroCount<scalar_t>>(
+            q.sycl_queue().template parallel_for<NonzeroCount<scalar_t, Lanes>>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
                                   sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
                 [=](sycl::nd_item<1> it) {
@@ -801,7 +831,7 @@ _Pragma("unroll")
                     if (blk == 0 && it.get_local_id(0) == 0) poff[blocks] = 0;
                 });
         });
-    exclusive_scan_device(q, offsets);
+    exclusive_scan_device<Lanes>(q, offsets);
     const int64_t total = offsets[blocks].item<int64_t>();
     out.resize_({total, ndim});
     if (total == 0 || ndim == 0) return;
@@ -811,7 +841,7 @@ _Pragma("unroll")
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_nonzero_write", [&] {
             const scalar_t* p = data_ptr<scalar_t>(self);
-            q.sycl_queue().template parallel_for<NonzeroWrite<scalar_t>>(
+            q.sycl_queue().template parallel_for<NonzeroWrite<scalar_t, Lanes>>(
                 sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(blocks * kScanLanes)),
                                   sycl::range<1>(static_cast<std::size_t>(kScanLanes))),
                 [=](sycl::nd_item<1> it) {
@@ -858,9 +888,13 @@ Tensor& nonzero_out(const Tensor& self, Tensor& out) {
     }
 
     auto& q = queue_for(self);
-#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
-    if (q.is_gpu()) {
-        nonzero_gpu(q, self, out);
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
+    if (q.wave64()) {
+        nonzero_gpu<64>(q, self, out);
+        return out;
+    }
+    if (q.wave_size() == 32) {
+        nonzero_gpu<32>(q, self, out);
         return out;
     }
 #endif

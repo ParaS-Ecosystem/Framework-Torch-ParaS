@@ -17,6 +17,7 @@
 // -----------------------------------------------------------------------------
 
 #if defined(PTSYCL_BACKEND_SYCL)
+#include <cctype>
 #include <sycl/sycl.hpp>
 #endif
 #include "compat/paras_compat.h"
@@ -125,7 +126,7 @@ int vendor_visible_gpu_count() {
     const char* libs[] = {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"};
     const char* symbol = "hipGetDeviceCount";
 #else
-    const char* libs[] = {"libcudart.so", "libcudart.so.12", "libcudart.so.11.0"};
+    const char* libs[] = {"libcudart.so", "libcudart.so.13", "libcudart.so.12", "libcudart.so.11.0"};
     const char* symbol = "cudaGetDeviceCount";
 #endif
     void* handle = nullptr;
@@ -160,6 +161,9 @@ void Queue::init(const DeviceInfo& dev) {
     if (initialized_) fail("Queue::init called twice");
     is_gpu_ = dev.is_gpu;
     native_id_ = dev.native_id;
+    wave_size_ = dev.wave_size;
+    mfma_ = dev.mfma;
+    generic_ = dev.generic;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
         ::setenv("PARAS_ASYNC_KERNELS", "1", 0);
@@ -189,6 +193,32 @@ sycl::queue& Queue::sycl_queue() const {
 }
 #endif
 
+#if defined(PTSYCL_BACKEND_SYCL)
+namespace {
+unsigned gfx_number(const std::string& version) {
+    const auto p = version.find("gfx");
+    if (p == std::string::npos) return 0;
+    unsigned v = 0;
+    for (std::size_t i = p + 3; i < version.size() && std::isxdigit(static_cast<unsigned char>(version[i])); ++i)
+        v = v * 16 + static_cast<unsigned>(std::stoi(std::string(1, version[i]), nullptr, 16));
+    return v;
+}
+
+void gpu_kernel_caps(const sycl::device& d, DeviceInfo& info) {
+    const auto sizes = d.get_info<sycl::info::device::sub_group_sizes>();
+    info.wave_size = sizes.empty() ? 64 : static_cast<int>(sizes.front());
+#if PARAS_HIP_BACKEND
+    const unsigned gfx = gfx_number(d.get_info<sycl::info::device::version>());
+    info.mfma = info.wave_size == 64 && (gfx == 0x90a || (gfx >= 0x940 && gfx <= 0x95f));
+#else
+    info.mfma = false;
+#endif
+    const char* generic = std::getenv("PTSYCL_GENERIC_KERNELS");
+    info.generic = generic != nullptr && std::string(generic) == "1";
+}
+}
+#endif
+
 std::vector<DeviceInfo> enumerate_devices() {
 
     std::vector<DeviceInfo> out;
@@ -208,6 +238,7 @@ std::vector<DeviceInfo> enumerate_devices() {
         gpu.compute_units = static_cast<int>(gpus[i].get_info<sycl::info::device::max_compute_units>());
         gpu.global_mem    = gpus[i].get_info<sycl::info::device::global_mem_size>();
         gpu.fp64          = true;
+        gpu_kernel_caps(gpus[i], gpu);
 
         table.push_back(gpus[i]);
         out.push_back(std::move(gpu));
@@ -364,6 +395,120 @@ bool Queue::run_native(const std::function<void(void* native_stream)>& fn) {
     (void)fn;
     return false;
 #endif
+}
+
+namespace {
+struct EventApi {
+    int (*create)(void** event, unsigned flags) = nullptr;
+    int (*record)(void* event, void* stream) = nullptr;
+    int (*wait)(void* stream, void* event, unsigned flags) = nullptr;
+    int (*query)(void* event) = nullptr;
+    int (*synchronize)(void* event) = nullptr;
+    int (*elapsed)(float* ms, void* start, void* end) = nullptr;
+    int (*destroy)(void* event) = nullptr;
+    int (*stream_query)(void* stream) = nullptr;
+};
+
+const EventApi& event_api() {
+    static const EventApi api = [] {
+        EventApi a;
+#if PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND
+#if PARAS_HIP_BACKEND
+        const char* libs[] = {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"};
+        const char* names[] = {"hipEventCreateWithFlags", "hipEventRecord", "hipStreamWaitEvent", "hipEventQuery",
+                               "hipEventSynchronize", "hipEventElapsedTime", "hipEventDestroy", "hipStreamQuery"};
+#else
+        const char* libs[] = {"libcudart.so", "libcudart.so.13", "libcudart.so.12", "libcudart.so.11.0"};
+        const char* names[] = {"cudaEventCreateWithFlags", "cudaEventRecord", "cudaStreamWaitEvent", "cudaEventQuery",
+                               "cudaEventSynchronize", "cudaEventElapsedTime", "cudaEventDestroy", "cudaStreamQuery"};
+#endif
+        void* handle = nullptr;
+        for (const char* lib : libs)
+            if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+        for (const char* lib : libs)
+            if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
+        if (handle != nullptr) {
+            a.create = reinterpret_cast<decltype(a.create)>(dlsym(handle, names[0]));
+            a.record = reinterpret_cast<decltype(a.record)>(dlsym(handle, names[1]));
+            a.wait = reinterpret_cast<decltype(a.wait)>(dlsym(handle, names[2]));
+            a.query = reinterpret_cast<decltype(a.query)>(dlsym(handle, names[3]));
+            a.synchronize = reinterpret_cast<decltype(a.synchronize)>(dlsym(handle, names[4]));
+            a.elapsed = reinterpret_cast<decltype(a.elapsed)>(dlsym(handle, names[5]));
+            a.destroy = reinterpret_cast<decltype(a.destroy)>(dlsym(handle, names[6]));
+            a.stream_query = reinterpret_cast<decltype(a.stream_query)>(dlsym(handle, names[7]));
+        }
+#endif
+        return a;
+    }();
+    return api;
+}
+
+const EventApi& require_events() {
+    const EventApi& a = event_api();
+    if (!a.create || !a.record || !a.wait || !a.query || !a.synchronize || !a.elapsed || !a.destroy ||
+        !a.stream_query)
+        fail("paras events: the HIP / CUDA runtime's event API was not found");
+    return a;
+}
+
+void check_event(int rc, const char* what) {
+    if (rc != 0) {
+        std::ostringstream os;
+        os << "paras events: " << what << " failed with error " << rc;
+        fail(os.str());
+    }
+}
+}
+
+void Queue::record_event(void** event, bool timing) {
+    if (!is_gpu_) return;
+    const EventApi& api = require_events();
+    const bool ran = run_native([&](void* stream) {
+        if (*event == nullptr) check_event(api.create(event, timing ? 0u : 2u ), "event create");
+        check_event(api.record(*event, stream), "event record");
+    });
+    if (!ran) fail("paras events: the queue has no native stream");
+}
+
+void Queue::wait_event(void* event) {
+    if (!is_gpu_ || event == nullptr) return;
+    const EventApi& api = require_events();
+    run_native([&](void* stream) { check_event(api.wait(stream, event, 0), "stream wait"); });
+}
+
+bool Queue::query() {
+    if (!is_gpu_) return true;
+    const EventApi& api = require_events();
+    int rc = 0;
+    run_native([&](void* stream) { rc = api.stream_query(stream); });
+    if (rc == 600) return false;
+    check_event(rc, "stream query");
+    return true;
+}
+
+bool Queue::event_query(void* event) {
+    if (event == nullptr) return true;
+    const int rc = require_events().query(event);
+    if (rc == 600) return false;
+    check_event(rc, "event query");
+    return true;
+}
+
+void Queue::event_synchronize(void* event) {
+    if (event != nullptr) check_event(require_events().synchronize(event), "event synchronize");
+}
+
+float Queue::event_elapsed_ms(void* start, void* end) {
+    if (start == nullptr || end == nullptr) fail("paras events: elapsed time of an event that was never recorded");
+    float ms = 0.f;
+    check_event(require_events().elapsed(&ms, start, end), "event elapsed time (both events need timing)");
+    return ms;
+}
+
+void Queue::event_destroy(void* event) noexcept {
+    if (event == nullptr) return;
+    const EventApi& api = event_api();
+    if (api.destroy != nullptr) api.destroy(event);
 }
 
 bool Queue::graphs_supported() {

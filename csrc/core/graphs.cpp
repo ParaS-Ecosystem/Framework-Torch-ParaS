@@ -53,7 +53,7 @@ std::map<std::int64_t, Recorded>& registry() {
 
 bool supported() { return compat::Queue::graphs_supported(); }
 
-bool capturing(int device) { return Context::instance().queue(device).capturing(); }
+bool capturing(int device) { return Context::instance().current_queue(device).capturing(); }
 
 std::uint64_t new_pool() {
     static std::atomic<std::uint64_t> next{1};
@@ -62,11 +62,12 @@ std::uint64_t new_pool() {
 
 void capture_begin(int device, std::uint64_t pool) {
     auto& state = Context::instance().device(device);
-    TORCH_CHECK(state.queue.is_gpu(), "graph capture needs a GPU paras device");
-    state.queue.synchronize();
+    auto& queue = Context::instance().current_queue(device);
+    TORCH_CHECK(queue.is_gpu(), "graph capture needs a GPU paras device");
+    Context::instance().synchronize(device);
     state.pool->begin_private(pool);
     try {
-        state.queue.begin_capture();
+        queue.begin_capture();
     } catch (...) {
         state.pool->end_private();
         throw;
@@ -77,7 +78,7 @@ std::int64_t capture_end(int device) {
     auto& state = Context::instance().device(device);
     std::shared_ptr<compat::Graph> graph;
     try {
-        graph = state.queue.end_capture();
+        graph = Context::instance().current_queue(device).end_capture();
     } catch (...) {
         state.pool->end_private();
         throw;
@@ -108,7 +109,7 @@ void replay(std::int64_t graph, bool advance_epoch) {
         TORCH_CHECK(it != registry().end(), "paras graph ", graph, " does not exist");
         rec = it->second;
     }
-    Context::instance().queue(rec.device).replay(*rec.graph);
+    Context::instance().current_queue(rec.device).replay(*rec.graph);
 }
 
 void release(std::int64_t graph) {

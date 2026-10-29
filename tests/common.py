@@ -59,9 +59,19 @@ def run_module(module, device: str) -> tuple[int, int, int]:
         except unittest.SkipTest as exc:
             skipped += 1
             print(f"  SKIP  {name}: {exc}")
-        except Exception:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
             failed += 1
             print(f"  FAIL  {name}")
             traceback.print_exc(limit=4, file=sys.stdout)
 
     return passed, failed, skipped
+
+
+def fast_kernels(device) -> bool:
+    """The device runs the hand-written matrix-core / 64-lane kernels (AMD
+    CDNA); elsewhere the generic kernels and vendor libraries do."""
+    import torch_paras
+    index = torch.device(device).index or 0
+    return torch_paras.is_gpu_device(index) and torch_paras.device_kernel_caps(index)["mfma"]

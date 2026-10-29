@@ -126,7 +126,11 @@ Tensor as_strided(const Tensor& self, c10::IntArrayRef size,
     _(double, c10::kDouble)                                                   \
     _(bool, c10::kBool)                                                       \
     _(c10::Half, c10::kHalf)                                                  \
-    _(c10::BFloat16, c10::kBFloat16)
+    _(c10::BFloat16, c10::kBFloat16)                                          \
+    _(c10::Float8_e4m3fn, c10::kFloat8_e4m3fn)                                \
+    _(c10::Float8_e5m2, c10::kFloat8_e5m2)                                    \
+    _(c10::Float8_e4m3fnuz, c10::kFloat8_e4m3fnuz)                            \
+    _(c10::Float8_e5m2fnuz, c10::kFloat8_e5m2fnuz)
 
 // Gathers a strided tensor into a contiguous buffer (same dtype).
 void device_gather_contiguous(compat::Queue& q, const Tensor& src, void* dst) {
@@ -173,16 +177,44 @@ void device_scatter_strided(compat::Queue& q, const void* src, Tensor& dst) {
 }
 
 
+template <typename T, int V>
+struct alignas(sizeof(T) * V) ConvertChunk {
+    T v[V];
+};
+
+template <typename T, typename SrcT>
+void convert_contiguous(compat::Queue& q, const SrcT* s, T* d, int64_t n) {
+    constexpr int V = 4;
+    const bool vec = q.is_gpu() && n >= 4096 &&
+                     reinterpret_cast<std::uintptr_t>(s) % (sizeof(SrcT) * V) == 0 &&
+                     reinterpret_cast<std::uintptr_t>(d) % (sizeof(T) * V) == 0;
+    if (!vec) {
+        launch_flat(q, n, [=](std::size_t i) { d[i] = static_cast<T>(s[i]); });
+        return;
+    }
+    using In = ConvertChunk<SrcT, V>;
+    using Out = ConvertChunk<T, V>;
+    launch_flat(q, (n + V - 1) / V, [=](std::size_t c) {
+        const int64_t i0 = static_cast<int64_t>(c) * V;
+        if (i0 + V <= n) {
+            const In x = reinterpret_cast<const In*>(s)[c];
+            Out y;
+#pragma unroll
+            for (int e = 0; e < V; ++e) y.v[e] = static_cast<T>(x.v[e]);
+            reinterpret_cast<Out*>(d)[c] = y;
+        } else {
+            for (int64_t i = i0; i < n; ++i) d[i] = static_cast<T>(s[i]);
+        }
+    });
+}
+
 template <typename SrcT>
 void device_convert_from(compat::Queue& q, const SrcT* s, Tensor& dst,
                          int64_t n) {
     switch (dst.scalar_type()) {
 #define CASE(T, ST)                                                           \
     case ST: {                                                                \
-        T* d = data_ptr<T>(dst);                                              \
-        launch_flat(q, n, [=](std::size_t i) {                                \
-            d[i] = static_cast<T>(s[i]);                                      \
-        });                                                                   \
+        convert_contiguous<T>(q, s, data_ptr<T>(dst), n);                     \
         break;                                                                \
     }
         PTSYCL_COPY_TYPES(CASE)
@@ -223,6 +255,10 @@ void device_to_device_copy(const Tensor& src, Tensor& dst) {
         q.copy(dst.data_ptr(), src.data_ptr(),
                static_cast<std::size_t>(n) * src.element_size(),
                /*blocking=*/false);
+        return;
+    }
+    if (same_type && dst_contig && !dst.storage().is_alias_of(src.storage())) {
+        device_gather_contiguous(q, src, dst.data_ptr());
         return;
     }
 
@@ -583,7 +619,7 @@ Tensor transpose(const Tensor& self, int64_t dim0, int64_t dim1) {
     const int64_t ndim = self.dim();
     const int64_t d0 = c10::maybe_wrap_dim(dim0, ndim);
     const int64_t d1 = c10::maybe_wrap_dim(dim1, ndim);
-    if (d0 == d1) return self;
+    if (d0 == d1) return at::alias(self);
     auto sizes = self.sizes().vec();
     auto strides = self.strides().vec();
     std::swap(sizes[d0], sizes[d1]);
@@ -740,7 +776,7 @@ Tensor squeeze_dim(const Tensor& self, int64_t dim) {
         }
         return ptsycl::as_strided(self, new_sizes, new_strides, self.storage_offset());
     }
-    return self;
+    return at::alias(self);
 }
 
 Tensor squeeze_dims(const Tensor& self, c10::IntArrayRef dims) {
@@ -749,7 +785,7 @@ Tensor squeeze_dims(const Tensor& self, c10::IntArrayRef dims) {
     std::vector<bool> to_squeeze(ndim, false);
     for (auto d : dims) {
         const int64_t wrapped = c10::maybe_wrap_dim(d, ndim);
-        if (self.size(wrapped) == 1) {
+        if (ndim > 0 && self.size(wrapped) == 1) {
             to_squeeze[wrapped] = true;
         }
     }

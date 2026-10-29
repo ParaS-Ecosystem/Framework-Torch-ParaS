@@ -8,6 +8,8 @@ import unittest
 import torch
 from torch import nn
 import torch_paras
+
+from common import fast_kernels
 from torch_paras import graphs
 from torch_paras.optimizer import fuse_moe_experts
 
@@ -144,6 +146,15 @@ def test_fuse_moe_experts_keeps_parameters(device):
     assert fuse_moe_experts(m) == 0
 
 
+def test_fuse_moe_experts_releases_former_weights(device):
+    m = _model(device, torch.float32, hidden=256, inter=512, experts=16)
+    allocated = torch_paras.memory_allocated(torch.device(device))
+    fuse_moe_experts(m)
+    assert torch_paras.memory_allocated(torch.device(device)) <= allocated
+    cached = torch_paras.memory_reserved(torch.device(device)) - torch_paras.memory_allocated(torch.device(device))
+    assert cached < 3 * 16 * 512 * 256 * 4, cached
+
+
 def test_fuse_moe_experts_skips_other_layers(device):
     m = _model(device, torch.float32)
     m.experts[2].act_fn = nn.GELU()
@@ -181,9 +192,17 @@ def test_moe_experts_needs_no_grad(device):
         raise AssertionError("expected an error with weights that require grad")
 
 
+def _device_path(device) -> bool:
+    """paras::moe_experts' device path (no host read, capturable): GPUs with
+    64-lane (CDNA) or 32-lane (NVIDIA) wavefronts, generic kernels not forced."""
+    index = torch.device(device).index or 0
+    caps = torch_paras.device_kernel_caps(index)
+    return torch_paras.is_gpu_device(index) and not caps["generic"] and caps["wave_size"] in (32, 64)
+
+
 def test_moe_experts_graph_capture(device):
-    if not torch_paras.is_gpu_device(torch.device(device).index or 0):
-        raise unittest.SkipTest("graphs capture GPU devices")
+    if not _device_path(device):
+        raise unittest.SkipTest("the device path (capturable) needs 32- or 64-lane wavefronts")
     if not graphs.is_supported():
         raise unittest.SkipTest("ParaS without record-and-replay command graphs")
     m = _model(device, torch.bfloat16)
@@ -345,3 +364,74 @@ def test_transformers_moe_models_without_graph_break(device):
         torch._dynamo.reset()
         assert _rel(got, ref) < 1e-4, (name, _rel(got, ref))
         assert ex.graph_break_count == 0, (name, [str(b.reason).splitlines()[0] for b in ex.break_reasons])
+
+
+def test_moe_experts_grouped_gemm(device):
+    if not fast_kernels(device):
+        raise unittest.SkipTest("the grouped GEMM runs on AMD matrix cores")
+    for dtype in (torch.bfloat16, torch.float16):
+        m = _model(device, dtype, hidden=256, inter=128, experts=8, k=2)
+        original = m.moe_infer
+        fuse_moe_experts(m)
+        for tokens, skew in ((400, False), (1000, False), (700, True)):
+            ids, w = _routing(tokens, 8, 2, device)
+            if skew:
+                bias = torch.zeros(8)
+                bias[5], bias[3] = 2.0, -float("inf")
+                ids = (torch.rand(tokens, 8) + bias).topk(2, dim=-1).indices.to(device)
+            x = torch.randn(tokens, 256).to(device, dtype)
+            with torch.no_grad():
+                torch_paras.reset_runtime_stats()
+                got = m.moe_infer(x, ids, w)
+                reads = torch_paras.runtime_stats().get("device_to_host_copies", 0)
+                ref = original(x, ids, w)
+            assert reads == 0, (dtype, tokens, "host reads", reads)
+            err = _rel(got, ref)
+            assert err < 1e-2, f"{dtype} tokens={tokens} skew={skew}: relative error {err}"
+
+
+def test_moe_experts_grouped_gemm_graph_capture(device):
+    if not fast_kernels(device):
+        raise unittest.SkipTest("the grouped GEMM runs on AMD matrix cores")
+    if not graphs.is_supported():
+        raise unittest.SkipTest("ParaS without record-and-replay command graphs")
+    m = _model(device, torch.bfloat16, hidden=256, inter=128, experts=8, k=2)
+    original = m.moe_infer
+    fuse_moe_experts(m)
+    ids, w = _routing(600, 8, 2, device)
+    x = torch.randn(600, 256).to(device, torch.bfloat16)
+    with torch.no_grad():
+        m.moe_infer(x, ids, w)
+        g = graphs.Graph()
+        with graphs.graph(g, device=device):
+            out = m.moe_infer(x, ids, w)
+        for _ in range(2):
+            new_ids, new_w = _routing(600, 8, 2, device)
+            new_x = torch.randn(600, 256).to(device, torch.bfloat16)
+            ids.copy_(new_ids)
+            w.copy_(new_w)
+            x.copy_(new_x)
+            g.replay()
+            assert _rel(out, original(new_x, new_ids, new_w)) < 1e-2
+    g.reset()
+
+
+def test_moe_experts_repeated_expert_in_a_row(device):
+    torch.manual_seed(0)
+    E, H, I = 4, 32, 16
+    x = torch.randn(3, H)
+    ids = torch.tensor([[-1, 0], [-1, -1], [2, 1]])
+    w = torch.tensor([[0.5, 0.5], [0.3, 0.7], [0.6, 0.4]])
+    wg, wu, wd = torch.randn(E, I, H) * 0.1, torch.randn(E, I, H) * 0.1, torch.randn(E, H, I) * 0.1
+    def ref():
+        out = torch.zeros(3, H)
+        for t in range(3):
+            for k in range(2):
+                e = int(ids[t, k])
+                if 0 <= e < E:
+                    h = torch.nn.functional.silu(x[t] @ wg[e].T) * (x[t] @ wu[e].T)
+                    out[t] += w[t, k] * (h @ wd[e].T)
+        return out
+    with torch.no_grad():
+        got = torch.ops.paras.moe_experts(*(t.to(device) for t in (x, ids, w, wg, wu, wd))).cpu()
+    torch.testing.assert_close(got, ref(), atol=1e-5, rtol=1e-4)

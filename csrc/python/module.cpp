@@ -27,6 +27,7 @@
 #include "core/graphs.h"
 #include "ops/clap_dnn_adapter.h"
 #include "core/telemetry.h"
+#include "core/kernels.h"
 
 namespace py = pybind11;
 
@@ -44,6 +45,17 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("is_gpu_device", [](int index) {
         return ptsycl::Context::instance().device(index).info.is_gpu;
+    });
+
+    m.def("device_kernel_caps", [](int index) {
+        const auto& info = ptsycl::Context::instance().device(index).info;
+        py::dict d;
+        d["wave_size"] = info.is_gpu ? info.wave_size : 1;
+        d["mfma"] = info.is_gpu && info.mfma && !info.generic;
+        d["generic"] = info.generic;
+        d["fp16_flash"] = info.is_gpu && ((info.mfma && !info.generic) || PTSYCL_WMMA_FLASH);
+        d["bf16_flash"] = info.is_gpu && ((info.mfma && !info.generic) || PTSYCL_WMMA_BF16);
+        return d;
     });
 
     m.def("synchronize", [](int index) {

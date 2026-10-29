@@ -23,6 +23,8 @@
 
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/util/Exception.h>
+#include <ATen/core/Tensor.h>
+#include <torch/library.h>
 
 #include "compat/paras_compat.h"
 #include "core/context.h"
@@ -48,7 +50,10 @@ MemoryPool::MemoryPool(compat::Queue& queue, int device_index)
       caching_enabled_(!env_flag("PTSYCL_NO_CACHE")),
       debug_(env_flag("PTSYCL_DEBUG_ALLOC")) {}
 
-MemoryPool::~MemoryPool() { clear(); }
+MemoryPool::~MemoryPool() {
+    teardown_ = true;
+    clear();
+}
 
 std::size_t MemoryPool::round_size(std::size_t v) {
     constexpr std::size_t kMin = 256;
@@ -58,13 +63,13 @@ std::size_t MemoryPool::round_size(std::size_t v) {
     return r;
 }
 
-void* MemoryPool::acquire(std::size_t nbytes) {
+void* MemoryPool::acquire(std::size_t nbytes, int stream) {
     const std::size_t rounded = round_size(nbytes);
     std::uint64_t pool = 0;
     {
         std::lock_guard<std::mutex> g(mutex_);
         pool = active_private_;
-        auto& lists = pool ? private_[pool].free_lists : free_lists_;
+        auto& lists = pool ? private_[pool].free_lists : free_lists_[stream];
         auto it = lists.find(rounded);
         if (it != lists.end() && !it->second.empty()) {
             void* p = it->second.front();
@@ -74,7 +79,7 @@ void* MemoryPool::acquire(std::size_t nbytes) {
             } else {
                 cached_ -= rounded;
             }
-            live_[p] = Live{rounded, pool};
+            live_[p] = Live{rounded, pool, stream};
             live_bytes_.increase(rounded);
             live_blocks_.increase(1);
             if (debug_)
@@ -82,10 +87,17 @@ void* MemoryPool::acquire(std::size_t nbytes) {
             return p;
         }
     }
-    void* p = queue_.alloc(rounded);
+    void* p = nullptr;
+    try {
+        p = queue_.alloc(rounded);
+    } catch (const std::exception&) {
+        if (capturing()) throw;
+        clear();
+        p = queue_.alloc(rounded);
+    }
     {
         std::lock_guard<std::mutex> g(mutex_);
-        live_[p] = Live{rounded, pool};
+        live_[p] = Live{rounded, pool, stream};
         if (pool) ++private_[pool].live;
         allocated_ += rounded;
         live_bytes_.increase(rounded);
@@ -98,10 +110,18 @@ void* MemoryPool::acquire(std::size_t nbytes) {
     return p;
 }
 
+bool MemoryPool::capturing() const {
+    if (teardown_) return queue_.capturing();
+    for (auto& s : Context::instance().device(device_index_).streams)
+        if (compat::Queue* q = s.load(std::memory_order_acquire); q != nullptr && q->capturing()) return true;
+    return false;
+}
+
 void MemoryPool::sync_before_free() noexcept {
-    if (queue_.capturing()) return;
     try {
-        queue_.synchronize();
+        if (capturing()) return;
+        if (teardown_) queue_.synchronize();
+        else Context::instance().synchronize(device_index_);
     } catch (const std::exception& e) {
         PTSYCL_WARN("pool[%d] synchronize before free failed: %s", device_index_, e.what());
     }
@@ -110,6 +130,7 @@ void MemoryPool::sync_before_free() noexcept {
 void MemoryPool::release(void* ptr) {
     if (ptr == nullptr) return;
     std::size_t rounded = 0;
+    bool shared = false;
     {
         std::lock_guard<std::mutex> g(mutex_);
         auto it = live_.find(ptr);
@@ -117,6 +138,8 @@ void MemoryPool::release(void* ptr) {
                     "paras allocator: release of unknown pointer");
         rounded = it->second.rounded;
         const std::uint64_t pool = it->second.pool;
+        const int stream = it->second.stream;
+        shared = it->second.shared;
         live_.erase(it);
         live_bytes_.decrease(rounded);
         live_blocks_.decrease(1);
@@ -129,21 +152,34 @@ void MemoryPool::release(void* ptr) {
                 return;
             }
             if (pr.live == 0) private_.erase(pit);
-        } else if (caching_enabled_) {
-            free_lists_[rounded].push_back(ptr);
+        } else if (caching_enabled_ && !shared) {
+            free_lists_[stream][rounded].push_back(ptr);
             cached_ += rounded;
             if (debug_)
                 PTSYCL_WARN("pool[%d] cache %zu bytes @%p", device_index_, rounded, ptr);
             return;
         }
     }
+    if (shared && caching_enabled_) {
+        sync_before_free();
+        std::lock_guard<std::mutex> g(mutex_);
+        free_lists_[0][rounded].push_back(ptr);
+        cached_ += rounded;
+        return;
+    }
     if (debug_)
         PTSYCL_WARN("pool[%d] free %zu bytes @%p", device_index_, rounded, ptr);
     release_memory(ptr, rounded);
 }
 
+void MemoryPool::record_stream(void* ptr, int stream) {
+    std::lock_guard<std::mutex> g(mutex_);
+    auto it = live_.find(ptr);
+    if (it != live_.end() && it->second.stream != stream) it->second.shared = true;
+}
+
 void MemoryPool::dealloc_locked(void* ptr, std::size_t rounded) {
-    if (queue_.capturing()) {
+    if (capturing()) {
         deferred_.emplace_back(ptr, rounded);
         return;
     }
@@ -157,7 +193,7 @@ void MemoryPool::release_memory(void* ptr, std::size_t rounded) {
     sync_before_free();
     std::lock_guard<std::mutex> g(mutex_);
     dealloc_locked(ptr, rounded);
-    if (!queue_.capturing() && !deferred_.empty()) {
+    if (!capturing() && !deferred_.empty()) {
         std::vector<std::pair<void*, std::size_t>> blocks;
         blocks.swap(deferred_);
         for (auto [p, n] : blocks) dealloc_locked(p, n);
@@ -169,8 +205,9 @@ void MemoryPool::clear() {
     if (!free_lists_.empty() || !deferred_.empty()) sync_before_free();
     std::vector<std::pair<void*, std::size_t>> blocks;
     blocks.swap(deferred_);
-    for (auto& [size, list] : free_lists_)
-        for (void* p : list) blocks.emplace_back(p, size);
+    for (auto& [stream, lists] : free_lists_)
+        for (auto& [size, list] : lists)
+            for (void* p : list) blocks.emplace_back(p, size);
     for (auto [p, n] : blocks) dealloc_locked(p, n);
     free_lists_.clear();
     cached_ = 0;
@@ -256,7 +293,7 @@ int current_device_index() {
 c10::DataPtr ParasAllocator::allocate(size_t nbytes) {
     const int dev = current_device_index();
     auto& state = Context::instance().device(dev);
-    void* p = state.pool->acquire(nbytes);
+    void* p = state.pool->acquire(nbytes, Context::current_stream(dev));
     auto* rec = new AllocRecord{p, dev};
     return c10::DataPtr(p, rec, &delete_alloc_record,
                         c10::Device(kParasDevice, dev));
@@ -295,4 +332,16 @@ ParasAllocator& allocator_instance() {
 
 REGISTER_ALLOCATOR(kParasDevice, &allocator_instance());
 
+namespace {
+void record_stream(at::Tensor& self, c10::Stream s) {
+    void* base = self.storage().data_ptr().get();
+    if (base != nullptr && s.device_type() == kParasDevice)
+        Context::instance().device(static_cast<int>(self.device().index())).pool->record_stream(base, static_cast<int>(s.id()));
+}
+}
+
 } // namespace ptsycl
+
+TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+    m.impl("record_stream", &ptsycl::record_stream);
+}

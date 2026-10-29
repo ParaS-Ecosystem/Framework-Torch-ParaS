@@ -28,6 +28,7 @@
 
 
 #include "clap_blas_utils.h"
+#include "ops/conv_pool_ops.h"
 
 namespace ptsycl {
 namespace {
@@ -79,6 +80,10 @@ Tensor convolution_overrideable(
     int64_t groups)
 {
     PTSYCL_TRACE_OP("convolution_overrideable");
+    if (conv_device_supported(input, weight, transposed))
+        return transposed
+                   ? conv_transposed_forward_device(input, weight, bias, stride, padding, output_padding, dilation, groups)
+                   : conv_forward_device(input, weight, bias, stride, padding, dilation, groups);
     c10::Device dev = input.device();
 
     Tensor cpu_in = to_cpu(input);
@@ -107,6 +112,11 @@ Tensor convolution_overrideable(
     ::std::array<bool, 3> output_mask)
 {
     PTSYCL_TRACE_OP("convolution_backward_overrideable");
+    if (conv_device_supported(input, weight, transposed))
+        return transposed ? conv_transposed_backward_device(grad_output, input, weight, stride, padding,
+                                                            output_padding, dilation, groups, output_mask)
+                          : conv_backward_device(grad_output, input, weight, stride, padding, dilation, groups,
+                                                 output_mask);
     c10::Device dev = input.device();
 
     Tensor cpu_dy = to_cpu(grad_output);
@@ -134,82 +144,13 @@ Tensor convolution_overrideable(
 Tensor _adaptive_avg_pool2d(const Tensor& self, IntArrayRef output_size)
 {
     PTSYCL_TRACE_OP("_adaptive_avg_pool2d");
-    Tensor self_c = self.contiguous();
-    int64_t N = self_c.size(0), C = self_c.size(1);
-    int64_t H = self_c.size(2), W = self_c.size(3);
-    int64_t oh = output_size[0], ow = output_size[1];
-
-    TORCH_CHECK(
-        (oh == 1 && ow == 1) || (oh == H && ow == W),
-        "Only global pooling (1×1) or identity (same size) supported");
-
-    c10::Device dev = self.device();
-    auto& q = queue_for(self);
-
-    if (oh == H && ow == W) {
-        Tensor result = at::empty(self_c.sizes(), at::device(dev).dtype(self_c.scalar_type()));
-        q.copy(result.data_ptr(), self_c.data_ptr(),
-               static_cast<std::size_t>(self_c.nbytes()), false);
-        return result;
-    }
-
-    Tensor result = at::empty({N, C, 1, 1}, at::device(dev).dtype(self_c.scalar_type()));
-
-    AT_DISPATCH_FLOATING_TYPES(self_c.scalar_type(), "adaptive_avg_pool", [&] {
-        const scalar_t* X = data_ptr<scalar_t>(self_c);
-        scalar_t*       Y = data_ptr<scalar_t>(result);
-        int64_t hw = H * W;
-        float   inv_hw = 1.0f / static_cast<float>(hw);
-        launch_flat(q, N * C, [=](std::size_t i) {
-            int64_t nc   = static_cast<int64_t>(i);
-            const scalar_t* src = X + nc * hw;
-            float acc = 0.0f;
-            for (int64_t j = 0; j < hw; j++)
-                acc += static_cast<float>(src[j]);
-            Y[nc] = static_cast<scalar_t>(acc * inv_hw);
-        });
-    });
-
-    return result;
+    return adaptive_avg_pool2d_device(self, output_size);
 }
 
-Tensor _adaptive_avg_pool2d_backward(
-    const Tensor& grad_output, const Tensor& self)
+Tensor _adaptive_avg_pool2d_backward(const Tensor& grad_output, const Tensor& self)
 {
     PTSYCL_TRACE_OP("_adaptive_avg_pool2d_backward");
-    Tensor self_c      = self.contiguous();
-    Tensor grad_out_c  = grad_output.contiguous();
-    int64_t N = self_c.size(0), C = self_c.size(1);
-    int64_t H = self_c.size(2), W = self_c.size(3);
-    int64_t oh = grad_out_c.size(2), ow = grad_out_c.size(3);
-
-    TORCH_CHECK(
-        (oh == 1 && ow == 1) || (grad_out_c.sizes() == self_c.sizes()),
-        "Only global or identity adaptive avg pool backward supported");
-
-    c10::Device dev = self.device();
-    auto& q = queue_for(self);
-    Tensor result = at::empty(self_c.sizes(), at::device(dev).dtype(self_c.scalar_type()));
-
-    if (oh == H && ow == W) {
-        q.copy(result.data_ptr(), grad_out_c.data_ptr(),
-               static_cast<std::size_t>(grad_out_c.nbytes()), false);
-        return result;
-    }
-
-    AT_DISPATCH_FLOATING_TYPES(self_c.scalar_type(), "adaptive_avg_pool_bwd", [&] {
-        const scalar_t* dY = data_ptr<scalar_t>(grad_out_c);
-        scalar_t*       dX = data_ptr<scalar_t>(result);
-        int64_t hw = H * W;
-        float   inv_hw = 1.0f / static_cast<float>(hw);
-        launch_flat(q, N * C * H * W, [=](std::size_t i) {
-            int64_t idx  = static_cast<int64_t>(i);
-            int64_t nc   = idx / hw;
-            dX[idx] = static_cast<scalar_t>(static_cast<float>(dY[nc]) * inv_hw);
-        });
-    });
-
-    return result;
+    return adaptive_avg_pool2d_backward_device(grad_output, self);
 }
 
 Tensor& avg_pool2d_out(
@@ -222,15 +163,8 @@ Tensor& avg_pool2d_out(
     c10::optional<int64_t> divisor_override,
     Tensor& out)
 {
-    PTSYCL_TRACE_OP("avg_pool2d.out");
-    TORCH_CHECK(!divisor_override, "Divisor override is not implemented");
-    Tensor cpu_in = to_cpu(self);
-    IntArrayRef eff_stride = stride.empty() ? kernel_size : stride;
-    Tensor cpu_out = at::avg_pool2d(cpu_in, kernel_size, eff_stride,
-                                     padding, ceil_mode, count_include_pad,
-                                     divisor_override);
-    upload(cpu_out, out);
-    return out;
+    return avg_pool2d_out_device(self, kernel_size, stride, padding, ceil_mode, count_include_pad,
+                                 divisor_override, out);
 }
 
 Tensor& avg_pool2d_backward_out(
@@ -244,27 +178,16 @@ Tensor& avg_pool2d_backward_out(
     c10::optional<int64_t> divisor_override,
     Tensor& grad_input)
 {
-    PTSYCL_TRACE_OP("avg_pool2d_backward.grad_input");
-    TORCH_CHECK(!divisor_override, "Divisor override is not implemented");
-    Tensor cpu_dy = to_cpu(grad_output);
-    Tensor cpu_x  = to_cpu(self);
-    IntArrayRef eff_stride = stride.empty() ? kernel_size : stride;
-    Tensor cpu_dx = at::avg_pool2d_backward(
-        cpu_dy, cpu_x, kernel_size, eff_stride, padding,
-        ceil_mode, count_include_pad, divisor_override);
-    upload(cpu_dx, grad_input);
-    return grad_input;
+    return avg_pool2d_backward_out_device(grad_output, self, kernel_size, stride, padding, ceil_mode,
+                                          count_include_pad, divisor_override, grad_input);
 }
 
 std::tuple<Tensor&, Tensor&> max_pool2d_with_indices_out(
     const Tensor& self, IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
     IntArrayRef dilation, bool ceil_mode, Tensor& out, Tensor& indices)
 {
-    PTSYCL_TRACE_OP("max_pool2d_with_indices.out");
-    auto res = at::max_pool2d_with_indices(to_cpu(self), kernel_size, stride, padding, dilation, ceil_mode);
-    upload(std::get<0>(res), out);
-    upload(std::get<1>(res), indices);
-    return {out, indices};
+    return max_pool2d_with_indices_out_device(self, kernel_size, stride, padding, dilation, ceil_mode,
+                                              out, indices);
 }
 
 Tensor& max_pool2d_with_indices_backward_out(
@@ -272,12 +195,8 @@ Tensor& max_pool2d_with_indices_backward_out(
     IntArrayRef padding, IntArrayRef dilation, bool ceil_mode, const Tensor& indices,
     Tensor& grad_input)
 {
-    PTSYCL_TRACE_OP("max_pool2d_with_indices_backward.grad_input");
-    Tensor cpu_dx = at::max_pool2d_with_indices_backward(
-        to_cpu(grad_output), to_cpu(self), kernel_size, stride, padding, dilation, ceil_mode,
-        to_cpu(indices));
-    upload(cpu_dx, grad_input);
-    return grad_input;
+    return max_pool2d_with_indices_backward_out_device(grad_output, self, kernel_size, stride, padding,
+                                                       dilation, ceil_mode, indices, grad_input);
 }
 
 struct GemmOperand {
@@ -511,7 +430,7 @@ bool try_small_m_gemm(const Tensor& a, const Tensor& b, Tensor& out, double alph
         return false;
     auto& q = queue_for(out);
     if (!q.is_gpu()) return false;
-#define GEMV_ROWS(MM) (std::is_same_v<scalar_t, float> \
+#define GEMV_ROWS(MM) (std::is_same_v<scalar_t, float> || !q.wave64() \
                            ? small_m_gemm<scalar_t, MM>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be) \
                            : small_m_gemm_wave<scalar_t, MM>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be))
     AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, st, "ptsycl_small_m_gemm", [&] {
@@ -864,29 +783,6 @@ std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv(
     return {q_k_v_s[0], q_k_v_s[1], q_k_v_s[2]};
 }
 
-static Tensor& upsample_fwd_cpu(
-    const Tensor& self,
-    c10::SymIntArrayRef /*output_size*/,
-    Tensor& out,
-    std::function<Tensor(const Tensor&)> cpu_fn)
-{
-    Tensor cpu_in  = to_cpu(self);
-    Tensor cpu_out = cpu_fn(cpu_in);
-    upload(cpu_out, out);
-    return out;
-}
-
-static Tensor& upsample_bwd_cpu(
-    const Tensor& grad_output,
-    Tensor& grad_input,
-    std::function<Tensor(const Tensor&)> cpu_fn)
-{
-    Tensor cpu_dy  = to_cpu(grad_output);
-    Tensor cpu_dx  = cpu_fn(cpu_dy);
-    upload(cpu_dx, grad_input);
-    return grad_input;
-}
-
 Tensor& upsample_nearest2d_out(
     const Tensor& self,
     c10::SymIntArrayRef output_size,
@@ -895,11 +791,7 @@ Tensor& upsample_nearest2d_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("upsample_nearest2d.out");
-    std::vector<int64_t> os;
-    for (auto v : output_size) os.push_back(v.expect_int());
-    return upsample_fwd_cpu(self, output_size, out, [&](const Tensor& x) {
-        return at::upsample_nearest2d(x, c10::IntArrayRef(os), scales_h, scales_w);
-    });
+    return upsample_nearest2d_device(self, output_size[0].expect_int(), output_size[1].expect_int(), scales_h, scales_w, false, out);
 }
 
 Tensor& upsample_nearest2d_backward_out(
@@ -911,13 +803,10 @@ Tensor& upsample_nearest2d_backward_out(
     Tensor& grad_input)
 {
     PTSYCL_TRACE_OP("upsample_nearest2d_backward.grad_input");
-    std::vector<int64_t> os, is;
-    for (auto v : output_size) os.push_back(v.expect_int());
-    for (auto v : input_size)  is.push_back(v.expect_int());
-    return upsample_bwd_cpu(grad_output, grad_input, [&](const Tensor& dy) {
-        return at::upsample_nearest2d_backward(dy,
-            c10::IntArrayRef(os), c10::IntArrayRef(is), scales_h, scales_w);
-    });
+    std::vector<int64_t> is;
+    for (auto v : input_size) is.push_back(v.expect_int());
+    (void)output_size;
+    return upsample_nearest2d_backward_device(grad_output, is, scales_h, scales_w, false, grad_input);
 }
 
 Tensor& _upsample_nearest_exact2d_out(
@@ -928,12 +817,7 @@ Tensor& _upsample_nearest_exact2d_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("_upsample_nearest_exact2d.out");
-    std::vector<int64_t> os;
-    for (auto v : output_size) os.push_back(v.expect_int());
-    return upsample_fwd_cpu(self, output_size, out, [&](const Tensor& x) {
-        return at::_upsample_nearest_exact2d(x, c10::IntArrayRef(os),
-                                              scales_h, scales_w);
-    });
+    return upsample_nearest2d_device(self, output_size[0].expect_int(), output_size[1].expect_int(), scales_h, scales_w, true, out);
 }
 
 Tensor& _upsample_nearest_exact2d_backward_out(
@@ -945,13 +829,10 @@ Tensor& _upsample_nearest_exact2d_backward_out(
     Tensor& grad_input)
 {
     PTSYCL_TRACE_OP("_upsample_nearest_exact2d_backward.grad_input");
-    std::vector<int64_t> os, is;
-    for (auto v : output_size) os.push_back(v.expect_int());
-    for (auto v : input_size)  is.push_back(v.expect_int());
-    return upsample_bwd_cpu(grad_output, grad_input, [&](const Tensor& dy) {
-        return at::_upsample_nearest_exact2d_backward(dy,
-            c10::IntArrayRef(os), c10::IntArrayRef(is), scales_h, scales_w);
-    });
+    std::vector<int64_t> is;
+    for (auto v : input_size) is.push_back(v.expect_int());
+    (void)output_size;
+    return upsample_nearest2d_backward_device(grad_output, is, scales_h, scales_w, true, grad_input);
 }
 
 Tensor& upsample_bilinear2d_out(
@@ -963,12 +844,7 @@ Tensor& upsample_bilinear2d_out(
     Tensor& out)
 {
     PTSYCL_TRACE_OP("upsample_bilinear2d.out");
-    std::vector<int64_t> os;
-    for (auto v : output_size) os.push_back(v.expect_int());
-    return upsample_fwd_cpu(self, output_size, out, [&](const Tensor& x) {
-        return at::upsample_bilinear2d(x, c10::IntArrayRef(os),
-                                        align_corners, scales_h, scales_w);
-    });
+    return upsample_bilinear2d_device(self, output_size[0].expect_int(), output_size[1].expect_int(), align_corners, scales_h, scales_w, out);
 }
 
 Tensor& upsample_bilinear2d_backward_out(
@@ -981,14 +857,10 @@ Tensor& upsample_bilinear2d_backward_out(
     Tensor& grad_input)
 {
     PTSYCL_TRACE_OP("upsample_bilinear2d_backward.grad_input");
-    std::vector<int64_t> os, is;
-    for (auto v : output_size) os.push_back(v.expect_int());
-    for (auto v : input_size)  is.push_back(v.expect_int());
-    return upsample_bwd_cpu(grad_output, grad_input, [&](const Tensor& dy) {
-        return at::upsample_bilinear2d_backward(dy,
-            c10::IntArrayRef(os), c10::IntArrayRef(is),
-            align_corners, scales_h, scales_w);
-    });
+    std::vector<int64_t> is;
+    for (auto v : input_size) is.push_back(v.expect_int());
+    (void)output_size;
+    return upsample_bilinear2d_backward_device(grad_output, is, align_corners, scales_h, scales_w, grad_input);
 }
 
 } // namespace

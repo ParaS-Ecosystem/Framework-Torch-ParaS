@@ -165,3 +165,27 @@ def test_index_rows_dim0(device):
     idx = torch.tensor([5, 0, -1, 2])
     assert torch.equal(x.to(device).t()[idx.to(device)].cpu(), x.t()[idx])
     assert torch.equal(x.to(device)[:, idx.to(device)].cpu(), x[:, idx])
+
+
+def test_index_writes_skip_out_of_range_indices(device):
+    import torch_paras
+    i = lambda *xs: torch.tensor(xs, device=device)
+    rows = torch.tensor([[4] * 8, [1] * 8], device=device)
+    ones = lambda *shape: torch.ones(*shape, device=device)
+    writes = {
+        "scatter_": lambda t: t.scatter_(0, rows, ones(2, 8)),
+        "scatter_value": lambda t: t.scatter_(0, rows, 5.0),
+        "scatter_add_": lambda t: t.scatter_add_(0, rows, ones(2, 8)),
+        "index_add_": lambda t: t.index_add_(0, i(4, 1), ones(2, 8)),
+        "index_put_rows": lambda t: t.__setitem__(i(4, 1), ones(2, 8)),
+        "index_put_points": lambda t: t.__setitem__((i(4, 1), i(0, 2)), ones(2)),
+        "index_put_accumulate": lambda t: t.index_put_((i(4, 1), i(0, 2)), ones(2), accumulate=True),
+    }
+    for name, write in writes.items():
+        store = torch.zeros(2, 4, 8, device=device)
+        write(store[0])
+        torch_paras.synchronize()
+        got = store.cpu()
+        assert torch.equal(got[1], torch.zeros(4, 8)), f"{name} wrote outside the tensor"
+        assert got[0][1].abs().sum() > 0, f"{name} dropped the in-range index"
+        assert torch.equal(got[0][[0, 2, 3]], torch.zeros(3, 8)), f"{name} wrote to another row"

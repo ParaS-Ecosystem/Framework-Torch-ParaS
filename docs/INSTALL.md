@@ -17,9 +17,10 @@ work but I have not tried them.
   `gfx942` for MI300-class, `gfx90a` for MI200-class). Set
   `PTSYCL_HIP_ARCH=hip:gfxXXX` explicitly to override auto-detection, or
   if you have multiple GPU architectures visible and need to pick one.
-  The HIP kernels need AMD CDNA GPUs (64-lane wavefronts and MFMA
-  instructions: MI200 gfx90a, MI300 gfx94x, MI350 gfx950); RDNA GPUs
-  (gfx10xx-gfx12xx) are not supported and the build stops for them.
+  The fastest HIP kernels (64-lane wavefronts and MFMA instructions) run
+  on AMD CDNA GPUs (MI200 gfx90a, MI300 gfx94x, MI350 gfx950); RDNA GPUs
+  (gfx10xx-gfx12xx) build and use generic kernels and the vendor libraries
+  instead (`torch_paras.device_kernel_caps(i)` shows which).
   A single build targets CUDA or HIP, not both.
 
 ## 2. Toolchain

@@ -35,6 +35,7 @@ and device N maps to the host CPU engine. In CPU-only builds, device 0 maps
 to the host CPU.
 """
 
+import contextlib
 import types
 
 import torch
@@ -60,6 +61,12 @@ __all__ = [
     "device_name",
     "backend_name",
     "get_amp_supported_dtype",
+    "Stream",
+    "Event",
+    "current_stream",
+    "default_stream",
+    "set_stream",
+    "stream",
     "runtime_stats",
     "reset_runtime_stats",
     "set_strict",
@@ -77,6 +84,7 @@ def device_count() -> int:
 
 
 def is_available() -> bool:
+    """True when at least one paras device exists (the host CPU engine counts)."""
     return device_count() > 0
 
 
@@ -86,11 +94,21 @@ def backend_name() -> str:
 
 
 def device_name(device: int = 0) -> str:
+    """Name of paras device `device` as the vendor runtime reports it (e.g. the GPU's marketing
+    name, or the host CPU)."""
     return _C.device_name(device)
 
 
 def is_gpu_device(device: int) -> bool:
     return _C.is_gpu_device(device)
+
+
+def device_kernel_caps(device: int) -> dict:
+    """What the device's hand-written kernels may use: ``wave_size`` (64 on
+    AMD GCN / CDNA, 32 on RDNA and NVIDIA, 1 for the host engine) and ``mfma``
+    (AMD matrix-core instructions, CDNA 2 and later). Devices without them
+    run the generic kernels and the vendor libraries instead."""
+    return dict(_C.device_kernel_caps(device))
 
 
 def synchronize(device: int | torch.device | None = None) -> None:
@@ -104,6 +122,8 @@ def synchronize(device: int | torch.device | None = None) -> None:
 
 
 def manual_seed(seed: int, device: int | None = None) -> None:
+    """Seeds the device random generators: every paras device, or only `device` when given
+    (torch.manual_seed seeds them too)."""
     if device is None:
         _C.manual_seed_all(seed)
     else:
@@ -143,6 +163,7 @@ def memory_reserved(device=None) -> int:
 
 
 def max_memory_reserved(device=None) -> int:
+    """Peak of memory_reserved() since start-up or reset_peak_memory_stats()."""
     return _C.memory_stats(_index(device))["reserved_bytes"][1]
 
 
@@ -152,10 +173,13 @@ def memory_cached(device=None) -> int:
 
 
 def reset_peak_memory_stats(device=None) -> None:
+    """Restarts the peaks reported by max_memory_allocated() / max_memory_reserved() at the
+    current values."""
     _C.reset_peak_stats(_index(device))
 
 
 def reset_accumulated_memory_stats(device=None) -> None:
+    """Zeroes the accumulated counters of memory_stats() (allocation and free counts, bytes)."""
     _C.reset_accumulated_stats(_index(device))
 
 
@@ -169,7 +193,9 @@ def memory_stats(device=None) -> dict:
 
 
 def get_amp_supported_dtype() -> list[torch.dtype]:
-    return [torch.float16, torch.float32]
+    """Dtypes torch.autocast(device_type="paras") accepts (the policy is
+    registered in csrc/core/autocast.cpp)."""
+    return [torch.float16, torch.bfloat16, torch.float32]
 
 
 def runtime_stats() -> dict:
@@ -185,6 +211,8 @@ def runtime_stats() -> dict:
 
 
 def reset_runtime_stats() -> None:
+    """Zeroes the counters of runtime_stats() (CPU fallbacks, host-device copies and bytes,
+    scalar reads)."""
     _C.reset_runtime_stats()
 
 
@@ -195,7 +223,58 @@ def set_strict(enabled: bool = True) -> None:
 
 
 def is_strict() -> bool:
+    """True when CPU fallbacks raise instead of running (PTSYCL_STRICT, or set_strict(True))."""
     return _C.strict()
+
+
+def _dev(device=None) -> torch.device:
+    if device is None:
+        return torch.device("paras", torch.accelerator.current_device_index())
+    d = torch.device(device) if not isinstance(device, int) else torch.device("paras", device)
+    return d if d.index is not None else torch.device("paras", 0)
+
+
+def Stream(device=None, priority: int = 0) -> torch.Stream:
+    """A new stream of a paras device (from the device's pool of streams)."""
+    return torch.Stream(device=_dev(device), priority=priority)
+
+
+def Event(enable_timing: bool = False, device=None) -> torch.Event:
+    """A torch.Event on a paras device (`device`: index or torch.device; default the current
+    one); enable_timing for elapsed_time()."""
+    return torch.Event(device=_dev(device), enable_timing=enable_timing)
+
+
+def current_stream(device=None) -> torch.Stream:
+    """The current torch.Stream of a paras device (default the current device)."""
+    return torch.accelerator.current_stream(_dev(device))
+
+
+def default_stream(device=None) -> torch.Stream:
+    """The default stream (id 0) of a paras device: the queue work goes to unless another stream
+    is made current."""
+    d = _dev(device)
+    cur = torch.accelerator.current_stream(d)
+    return torch.Stream(stream_id=0, device_index=d.index, device_type=cur.device_type)
+
+
+def set_stream(stream: torch.Stream) -> None:
+    """Makes `stream` the current stream of its device (as torch.accelerator.set_stream)."""
+    torch.accelerator.set_stream(stream)
+
+
+@contextlib.contextmanager
+def stream(s: torch.Stream):
+    """Makes `s` the current stream of its device inside the block; the current device and its
+    stream are restored after it, as torch.cuda.stream does."""
+    prev_device = torch.accelerator.current_device_index()
+    prev = torch.accelerator.current_stream(s.device)
+    torch.accelerator.set_stream(s)
+    try:
+        yield s
+    finally:
+        torch.accelerator.set_stream(prev)
+        torch.accelerator.set_device_index(prev_device)
 
 
 def _register() -> None:
@@ -215,6 +294,8 @@ def _register() -> None:
     mod.is_bad_fork = _C.is_bad_fork
     mod._is_in_bad_fork = _C.is_bad_fork
     mod.get_amp_supported_dtype = get_amp_supported_dtype
+    for fn in (Stream, Event, current_stream, default_stream, set_stream, stream):
+        setattr(mod, fn.__name__, fn)
     torch._register_device_module("paras", mod)
 
     # tensor.paras() / module.paras() / tensor.is_paras

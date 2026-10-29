@@ -101,6 +101,8 @@ class GraphMeta:
 
 
 def meta_from_aot(fw_metadata, random_ops) -> GraphMeta:
+    """GraphMeta for replay from AOTAutograd's forward metadata: static and mutated inputs,
+    metadata mutation, outputs aliasing inputs, and the graph's random operators."""
     from torch._functorch._aot_autograd.schemas import OutputType
 
     inputs = fw_metadata.input_info
@@ -145,6 +147,7 @@ def _symbols(value) -> set:
 
 
 def has_dynamic_shapes(example_inputs) -> bool:
+    """True when any example input has symbolic sizes (such graphs are not replayed)."""
     return any(_symbols(x) for x in example_inputs)
 
 
@@ -184,9 +187,15 @@ _staged: dict = {}
 _held: dict = {}
 
 
+def _version(t: torch.Tensor):
+    """The version counter of `t`, or None for an inference tensor (which has
+    none, so its contents can never be known unchanged)."""
+    return None if t.is_inference() else t._version
+
+
 def _holds(buf, src) -> bool:
     held = _held.get(id(buf))
-    return held is not None and held[0]() is src and held[1] == src._version
+    return held is not None and held[1] is not None and held[0]() is src and held[1] == _version(src)
 
 
 def _load(buf, src):
@@ -194,7 +203,7 @@ def _load(buf, src):
         stats["inputs already loaded"] += 1
         return
     buf.copy_(src)
-    _held[id(buf)] = (weakref.ref(src), src._version)
+    _held[id(buf)] = (weakref.ref(src), _version(src))
 
 
 def _input_buffer(t: torch.Tensor) -> torch.Tensor:
@@ -203,14 +212,17 @@ def _input_buffer(t: torch.Tensor) -> torch.Tensor:
     entry = _staged.get(id(t))
     if entry is not None:
         ref, version, buf = entry
-        if (ref() is t and version == t._version and buf.shape == t.shape
+        if (ref() is t and version == _version(t) and buf.shape == t.shape
                 and buf.stride() == t.stride() and buf.dtype == t.dtype and buf.device == t.device):
             return buf
     for k in [k for k, (r, _, _) in _staged.items() if r() is None]:
         del _staged[k]
     buf = _buffer_like(t)
-    _staged[id(t)] = (weakref.ref(t), t._version, buf)
+    _staged[id(t)] = (weakref.ref(t), _version(t), buf)
     return buf
+
+
+_ptrs_equal = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
 
 
 def _shape_key(args):
@@ -238,6 +250,10 @@ class _Capture:
         self.captured = captured
         self.static_ptrs = tuple((i, args[i].data_ptr()) for i in sorted(static | in_place)
                                  if isinstance(args[i], torch.Tensor))
+        self._ptr_idx = [i for i, _ in self.static_ptrs]
+        self._ptrs = [None] * len(args)
+        for i, ptr in self.static_ptrs:
+            self._ptrs[i] = ptr
         top = {i: buf for i, j, buf in buffers if j is None}
         self.copy_back = tuple((i, top[i]) for i in meta.mutated_inputs if i in top)
         self.single = not isinstance(outputs, (tuple, list))
@@ -255,6 +271,8 @@ class _Capture:
                 _output_ptrs.add(o.data_ptr())
 
     def inputs_in_place(self, args) -> bool:
+        if _ptrs_equal is not None:
+            return _ptrs_equal(list(args), self._ptrs, self._ptr_idx)
         return all(args[i].data_ptr() == ptr for i, ptr in self.static_ptrs)
 
     def run(self, args):
@@ -281,11 +299,12 @@ class Replayed:
     """Callable running `forward` through captures, one per input shape;
     see the module docstring."""
 
-    def __init__(self, forward, meta: GraphMeta, report, piece=False):
+    def __init__(self, forward, meta: GraphMeta, report, piece=False, layouts_guarded=False):
         self.forward = forward
         self.meta = meta
         self.report = report
         self.piece = piece
+        self.layouts_guarded = layouts_guarded
         self.captures = {}
         self.seen = collections.Counter()
         self.failed = False
@@ -293,7 +312,7 @@ class Replayed:
     def __call__(self, *args):
         if self.failed:
             return self.forward(*args)
-        key = _shape_key(args)
+        key = () if self.layouts_guarded else _shape_key(args)
         capture = self.captures.get(key)
         if capture is not None:
             if not capture.inputs_in_place(args):

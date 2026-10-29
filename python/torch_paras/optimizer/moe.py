@@ -42,8 +42,8 @@ be captured for graph replay. Recognised forms:
 SwiGLU MLPs are ``gate_proj``, ``up_proj``, ``down_proj`` (or Mixtral's
 ``w1``, ``w3``, ``w2``) without bias, with SiLU. Their weights are stacked once
 per layer ([E, I, H] and [E, H, I]) and every expert's ``nn.Linear`` weight
-becomes a view of the stack, so no memory is added and training sees the same
-parameters. While a block is in training mode or autograd needs its
+becomes a view of the stack, so no memory is added (the former weights' blocks
+are released from the cache) and training sees the same parameters. While a block is in training mode or autograd needs its
 gradients, the original method runs.
 
 A layer is substituted only if its weights are on a paras device with one
@@ -215,6 +215,7 @@ def fuse_moe_experts(model: nn.Module) -> int:
     layers substituted."""
     ops.register()
     done = 0
+    stacked = False
     for name, module in model.named_modules():
         if hasattr(module, _ATTR) or getattr(module, "ep_size", 1) != 1:
             continue
@@ -226,6 +227,7 @@ def fuse_moe_experts(model: nn.Module) -> int:
             w = module.gate_up_proj
         else:
             _stack(module, _swiglu_experts(module.experts))
+            stacked = True
             w = module._paras_moe_gate
         original = getattr(module, method)
         setattr(module, _ATTR, original)
@@ -238,4 +240,7 @@ def fuse_moe_experts(model: nn.Module) -> int:
             continue
         setattr(module, method, bound)
         done += 1
+    if stacked:
+        from .. import empty_cache
+        empty_cache()
     return done

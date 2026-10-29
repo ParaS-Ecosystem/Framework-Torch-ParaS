@@ -34,7 +34,7 @@ namespace ptsycl {
 constexpr c10::DeviceType kParasDevice = c10::DeviceType::PrivateUse1;
 
 inline compat::Queue& queue_for(const c10::Device& dev) {
-    return Context::instance().queue(static_cast<int>(dev.index()));
+    return Context::instance().current_queue(static_cast<int>(dev.index()));
 }
 
 inline compat::Queue& queue_for(const at::Tensor& t) {

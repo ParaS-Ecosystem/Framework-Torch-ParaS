@@ -46,6 +46,7 @@ Context::Context() {
         auto state = std::make_unique<DeviceState>();
         state->info = info;
         state->queue.init(info);
+        state->streams[0].store(&state->queue);
         state->pool = std::make_unique<MemoryPool>(
             state->queue, static_cast<int>(devices_.size()));
         PTSYCL_INFO("device %zu: %s%s", devices_.size(), info.name.c_str(),
@@ -66,10 +67,69 @@ DeviceState& Context::device(int index) {
     return *devices_[index];
 }
 
-void Context::synchronize(int index) { device(index).queue.synchronize(); }
+namespace {
+thread_local std::array<std::int16_t, 256> tl_current_stream{};
+}
+
+int Context::current_stream(int index) {
+    return index >= 0 && index < static_cast<int>(tl_current_stream.size()) ? tl_current_stream[index] : 0;
+}
+
+void Context::set_current_stream(int index, int id) {
+    TORCH_CHECK(index >= 0 && index < static_cast<int>(tl_current_stream.size()) && id >= 0 && id < kMaxStreams,
+                "paras: invalid stream ", id, " of device ", index);
+    tl_current_stream[index] = static_cast<std::int16_t>(id);
+}
+
+compat::Queue& Context::stream_queue(int index, int id) {
+    auto& d = device(index);
+    TORCH_CHECK(id >= 0 && id < kMaxStreams, "paras: invalid stream id ", id);
+    if (compat::Queue* q = d.streams[id].load(std::memory_order_acquire)) return *q;
+    std::lock_guard<std::mutex> g(d.streams_mutex);
+    if (compat::Queue* q = d.streams[id].load(std::memory_order_acquire)) return *q;
+    auto q = std::make_unique<compat::Queue>();
+    q->init(d.info);
+    compat::Queue* raw = q.get();
+    d.owned[id] = std::move(q);
+    d.streams[id].store(raw, std::memory_order_release);
+    if (id + 1 > d.created_streams) d.created_streams = id + 1;
+    return *raw;
+}
+
+int Context::pool_stream(int index) {
+    auto& d = device(index);
+    const int id = 1 + d.next_pool_stream.fetch_add(1) % kPoolStreams;
+    stream_queue(index, id);
+    return id;
+}
+
+int Context::new_stream(int index) {
+    auto& d = device(index);
+    int id;
+    {
+        std::lock_guard<std::mutex> g(d.streams_mutex);
+        constexpr int first = kPoolStreams + 1, count = kMaxStreams - kPoolStreams - 1;
+        id = first + d.next_new_stream++ % count;
+        if (id + 1 > d.created_streams) d.created_streams = id + 1;
+    }
+    stream_queue(index, id);
+    return id;
+}
+
+int Context::stream_count(int index) {
+    auto& d = device(index);
+    std::lock_guard<std::mutex> g(d.streams_mutex);
+    return d.created_streams;
+}
+
+void Context::synchronize(int index) {
+    auto& d = device(index);
+    for (auto& s : d.streams)
+        if (compat::Queue* q = s.load(std::memory_order_acquire)) q->synchronize();
+}
 
 void Context::synchronize_all() {
-    for (auto& d : devices_) d->queue.synchronize();
+    for (int i = 0; i < device_count(); ++i) synchronize(i);
 }
 
 std::pair<std::uint64_t, std::uint64_t>
@@ -95,7 +155,7 @@ void Context::set_seed_all(std::uint64_t seed) {
 
 void Context::empty_cache(int index) {
     auto& d = device(index);
-    d.queue.synchronize();
+    synchronize(index);
     d.pool->clear();
 }
 

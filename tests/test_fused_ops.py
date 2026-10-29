@@ -68,3 +68,23 @@ def test_rotate_half_backward(device):
     paras_nn.rotate_half(xd).sum().backward()
 
     assert_close(xd.grad, x.grad, "rotate_half.grad")
+
+
+def test_index_copy_out_of_range_index_does_not_write_past_the_tensor(device):
+    import torch_paras
+    torch.manual_seed(0)
+    store = torch.zeros(2, 8, 16, device=device)
+    cache = store[0]
+    src = torch.randn(1, 16)
+    cache.index_copy_(0, torch.tensor([8], device=device), src.to(device))
+    torch_paras.synchronize()
+    assert torch.equal(store.cpu(), torch.zeros(2, 8, 16)), "index_copy_ wrote outside the cache"
+    cache.index_copy_(0, torch.tensor([3], device=device), src.to(device))
+    assert torch.equal(cache.cpu()[3], src[0])
+    x = torch.randn(1, 2, 1, 16)
+    cos, sin = torch.randn(1, 1, 1, 16), torch.randn(1, 1, 1, 16)
+    kv = torch.zeros(1, 2, 8, 16, device=device)
+    guard = torch.zeros(1, 2, 8, 16, device=device)
+    torch.ops.paras.rope_index_copy_(kv, 2, torch.tensor([8], device=device), x.to(device), cos.to(device), sin.to(device))
+    torch_paras.synchronize()
+    assert torch.equal(kv.cpu(), torch.zeros(1, 2, 8, 16)) and torch.equal(guard.cpu(), torch.zeros(1, 2, 8, 16))

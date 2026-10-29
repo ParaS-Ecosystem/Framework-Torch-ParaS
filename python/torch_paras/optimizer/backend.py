@@ -74,7 +74,8 @@ ALL_FUSIONS = tuple(passes.PASSES)
 
 
 class ParasCompileError(RuntimeError):
-    pass
+    """Raised by the paras backend in strict mode when a graph contains operators that would run
+    on the CPU fallback."""
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,8 @@ class Options:
              min_dynamic_graph_ops: int | None = None,
              eager_at_recompile_limit: bool | None = None,
              graphs: bool = False) -> "Options":
+        """Options with checked values: `fusions` (None = all) must be names in ALL_FUSIONS,
+        min_dynamic_graph_ops >= 0; None keeps a field's default."""
         chosen = ALL_FUSIONS if fusions is None else tuple(fusions)
         unknown = set(chosen) - set(ALL_FUSIONS)
         if unknown:
@@ -131,9 +134,12 @@ class GraphReport:
 
     @property
     def fully_on_paras(self) -> bool:
+        """True when no operator of the graph runs on the CPU fallback."""
         return not self.cpu_fallback_ops
 
     def summary(self) -> str:
+        """One line: the graph's fusions, operator residency per stage, CPU-fallback operators,
+        eager execution and replay state."""
         parts = [f"graph {self.graph_id}" + (f" [{self.frame}]" if self.frame else "")]
         if self.fusions:
             parts.append("fused " + ", ".join(f"{k} x{v}" for k, v in sorted(self.fusions.items())))
@@ -160,6 +166,7 @@ def reports() -> list[GraphReport]:
 
 
 def reset_reports() -> None:
+    """Clears the list returned by reports()."""
     with _lock:
         _reports.clear()
 
@@ -304,7 +311,7 @@ def _replayed(gm, run, example_inputs, meta, report):
     if replay.has_dynamic_shapes(example_inputs):
         replayed = replay.Split(gm, run, example_inputs, meta, report)
     else:
-        replayed = replay.Replayed(run, meta, report)
+        replayed = replay.Replayed(run, meta, report, layouts_guarded=True)
         report.replay = "replayed"
 
     def call(*args):

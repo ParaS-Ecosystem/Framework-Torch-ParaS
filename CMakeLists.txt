@@ -52,11 +52,13 @@ if(PTSYCL_DEVICE STREQUAL "cpu")
 elseif(PTSYCL_DEVICE MATCHES "^sycl:(cuda:sm_[0-9]+|hip:gfx[0-9a-zA-Z]+)$")
     set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_SYCL)
     set(PTSYCL_PARASDEVICE_TARGET "${CMAKE_MATCH_1}")
-    if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:gfx1[0-9]")
-        message(FATAL_ERROR "PTSYCL_DEVICE=${PTSYCL_DEVICE}: RDNA GPUs are not supported (the HIP kernels "
-                            "need 64-lane wavefronts and MFMA: AMD CDNA, e.g. sycl:hip:gfx942)")
-    endif()
     set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_PARASDEVICE_TARGET}")
+    if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+        list(APPEND PTSYCL_DEVICE_FLAGS "-ffp-contract=fast-honor-pragmas")
+    endif()
+    if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:sm_([0-9]+)")
+        add_compile_definitions(PTSYCL_CUDA_SM=${CMAKE_MATCH_1})
+    endif()
 else()
     message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu', 'sycl:cuda:sm_XX', or "
                          "'sycl:hip:gfxXXX', got '${PTSYCL_DEVICE}'")
@@ -100,6 +102,8 @@ set(PTSYCL_SOURCES
     csrc/core/graphs.cpp
     csrc/core/registration.cpp
     csrc/core/telemetry.cpp
+    csrc/core/autocast.cpp
+    csrc/core/profiler.cpp
     csrc/ops/tensor_ops.cpp
     # Python exposes CLAP status/stats even in fast builds and with CLAP disabled.
     csrc/ops/clap_dnn_adapter.cpp
@@ -121,6 +125,9 @@ if(NOT PTSYCL_FAST_BUILD)
     csrc/ops/sdpa_ops.cpp
     csrc/ops/foreach_ops.cpp
     csrc/ops/moe_ops.cpp
+    csrc/ops/conv_pool_ops.cpp
+    csrc/ops/shape_select_ops.cpp
+    csrc/ops/quant_ops.cpp
     )
 else()
     message(STATUS "Fast build: only tensor_ops.cpp; other operator registrations are omitted")
@@ -147,7 +154,7 @@ if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/sdpa_ops.cpp"
         "${CMAKE_BINARY_DIR}/paras_sources/csrc/ops/sdpa_ops.cpp"
-        PROPERTIES COMPILE_OPTIONS "--gpu-max-threads-per-block=256")
+        PROPERTIES COMPILE_OPTIONS "--gpu-max-threads-per-block=512")
 endif()
 
 add_library(torch_paras_C SHARED ${PTSYCL_SOURCES})
@@ -222,6 +229,7 @@ if(NOT PTSYCL_CLANG_RT_BUILTINS)
     endif()
     file(GLOB _ptsycl_rt_candidates
         "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
+        "${PTSYCL_LLVM_DIR}/lib/clang/*/lib/linux/libclang_rt.builtins-${_ptsycl_rt_arch}.a"
         "/usr/lib/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
         "/usr/lib64/clang/*/lib/${_ptsycl_rt_arch}/libclang_rt.builtins*.a"
     )
@@ -348,6 +356,15 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
         file(READ "${PTSYCL_CLAP_INCLUDE_DIR}/clap/blas_factory.hpp" _ptsycl_clap_blas_api)
         if(_ptsycl_clap_blas_api MATCHES "gemm_strided_batched_bf16_device")
             list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_BF16_BATCHED")
+        endif()
+        if(_ptsycl_clap_blas_api MATCHES "gemm_ex_strided_batched_device")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_GEMM_EX")
+        endif()
+        if(_ptsycl_clap_blas_api MATCHES "BF16, I8, I32")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_INT8")
+        endif()
+        if(_ptsycl_clap_blas_api MATCHES "gemm_scaled_device")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_GEMM_SCALED")
         endif()
         message(STATUS "CLAP device GEMM: ${PTSYCL_CLAP_WRAPPER_DEFS}")
 

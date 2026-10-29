@@ -1,4 +1,5 @@
 import torch
+import torch_paras
 import torch.nn.functional as F
 
 from common import check_op, assert_close
@@ -439,7 +440,7 @@ def test_python_scalars_at_opmath_precision(device):
         x = torch.randn(4099).to(dt)
         d = x.to(device)
         f = lambda v: float(torch.tensor(v, dtype=torch.float32))
-        x64 = x.double()
+        x64 = x.float()
         cases = {
             "mul": (d * 0.9, x64 * f(0.9)),
             "add": (d + 0.1, x64 + f(0.1)),
@@ -596,3 +597,85 @@ def test_safe_softmax_masked_rows_dtype_and_grad(device):
     (torch.ops.aten._safe_softmax(xs, -1, None) * w).sum().backward()
     (torch.ops.aten._safe_softmax(dxs, -1, None) * w.to(device)).sum().backward()
     torch.testing.assert_close(dxs.grad.cpu(), xs.grad, atol=1e-6, rtol=1e-5)
+
+
+def test_vectorized_contiguous_path_matches_strided(device):
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        a = torch.randn(64, 515).to(device, dtype)
+        b = torch.randn(64, 515).to(device, dtype)
+        at, bt = a.t().contiguous().t(), b.t().contiguous().t()
+        for name, fn in (("mul", torch.mul), ("add", torch.add), ("div", torch.div)):
+            assert torch.equal(fn(a, b).cpu(), fn(at, bt).cpu()), (dtype, name)
+        idx = torch.device(device).index or 0
+        amd = torch_paras.is_gpu_device(idx) and torch_paras.device_kernel_caps(idx)["wave_size"] == 64
+        unary = (("silu", torch.nn.functional.silu),) if amd else ()
+        for name, fn in unary + (("exp", torch.exp), ("neg", torch.neg)):
+            assert torch.equal(fn(a).cpu(), fn(at).cpu()), (dtype, name)
+
+
+def test_transcendentals_at_fp32_opmath(device):
+    torch.manual_seed(0)
+    x = torch.randn(4096) * 4
+    C = torch_paras._C
+    for fn in (torch.nn.functional.silu, torch.exp, torch.sigmoid):
+        calls = C.clap_dnn_call_count()
+        got = fn(x.to(device)).cpu()
+        ref = fn(x.double()).float()
+        rtol = 4e-6 if C.clap_dnn_call_count() > calls else 4e-7
+        assert torch.allclose(got, ref, rtol=rtol, atol=1e-30), fn
+
+
+def test_softmax_rows_lengths(device):
+    torch.manual_seed(0)
+    for n in (7, 256, 300, 1000, 2048, 4096, 9000, 16384):
+        for dtype, tol in ((torch.float32, 1e-6), (torch.bfloat16, 1e-2), (torch.float16, 1e-3)):
+            x = (torch.randn(3, n) * 4).to(dtype)
+            x[1, : n // 2] = float("-inf")
+            got = torch.softmax(x.to(device), -1).cpu().float()
+            ref = torch.softmax(x.float(), -1)
+            assert torch.allclose(got, ref, atol=tol, rtol=tol), (n, dtype, (got - ref).abs().max())
+    x = torch.randn(2, 4096)
+    x[0] = float("-inf")
+    assert torch.isnan(torch.softmax(x.to(device), -1).cpu()[0]).all()
+    assert torch.equal(torch.ops.aten._safe_softmax(x.to(device), -1, None).cpu()[0], torch.zeros(4096))
+
+
+def test_float_unary_ops_of_integer_inputs(device):
+    x_int = torch.tensor([0, 1, 2, -3, 7])
+    x_bool = torch.tensor([True, False, True, True, False])
+    for f in (torch.exp, torch.exp2, torch.expm1, torch.log, torch.log1p, torch.log2, torch.sqrt, torch.rsqrt,
+              torch.reciprocal, torch.sin, torch.cos, torch.tan, torch.tanh, torch.sigmoid, torch.atan,
+              torch.erf, torch.erfc):
+        for x in (x_int, x_bool):
+            ref = f(x)
+            got = f(x.to(device)).cpu()
+            assert got.dtype == ref.dtype, (f.__name__, x.dtype, got.dtype)
+            assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5, equal_nan=True), (f.__name__, x.dtype, got, ref)
+
+
+def test_vector_norm_of_0d_tensor(device):
+    x = torch.tensor(-3.0)
+    for kw in ({}, {"dim": 0}, {"dim": -1, "keepdim": True}, {"dim": 0, "ord": 1}):
+        ref = torch.linalg.vector_norm(x, **kw)
+        got = torch.linalg.vector_norm(x.to(device), **kw).cpu()
+        assert got.shape == ref.shape and torch.allclose(got, ref), (kw, got, ref)
+
+
+def test_mean_16bit_no_overflow_of_the_sum(device):
+    for dt in (torch.float16, torch.bfloat16):
+        x = torch.full((100000,), 1000.0, dtype=dt)
+        got = x.to(device).mean().cpu()
+        assert torch.isfinite(got) and abs(float(got) - 1000.0) <= 8.0, (dt, got)
+        y = torch.randn(64, 4096).to(dt) * 10
+        torch.testing.assert_close(y.to(device).mean(-1).cpu().float(), y.float().mean(-1), atol=0.05, rtol=1e-2)
+
+
+def test_integer_div_rounding_modes_exact(device):
+    a = torch.tensor([2 ** 60 + 1, -7, 7, -7, 2 ** 62 - 3, -(2 ** 61) - 5], dtype=torch.int64)
+    b = torch.tensor([3, 2, -2, -2, 7, 3], dtype=torch.int64)
+    for mode in ("trunc", "floor"):
+        assert torch.equal(torch.div(a.to(device), b.to(device), rounding_mode=mode).cpu(),
+                           torch.div(a, b, rounding_mode=mode)), mode
+    x = torch.arange(-20, 20, dtype=torch.int32)
+    for mode in ("trunc", "floor"):
+        assert torch.equal(torch.div(x.to(device), 3, rounding_mode=mode).cpu(), torch.div(x, 3, rounding_mode=mode))

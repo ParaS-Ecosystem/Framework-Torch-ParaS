@@ -61,6 +61,9 @@ struct DeviceInfo {
     int         compute_units = 0;
     std::size_t global_mem    = 0;
     bool        fp64          = true;
+    int         wave_size     = 64;
+    bool        mfma          = false;
+    bool        generic       = false;
 };
 
 std::vector<DeviceInfo> enumerate_devices();
@@ -97,6 +100,9 @@ public:
     bool initialized() const { return initialized_; }
     bool is_gpu()      const { return is_gpu_; }
     int  native_id()   const { return native_id_; }
+    bool wave64()      const { return is_gpu_ && wave_size_ == 64 && !generic_; }
+    bool mfma()        const { return is_gpu_ && mfma_ && !generic_; }
+    int  wave_size()   const { return is_gpu_ ? wave_size_ : 0; }
 
     void* alloc(std::size_t nbytes);
     void  dealloc(void* ptr);
@@ -105,6 +111,14 @@ public:
     void synchronize();
 
     bool run_native(const std::function<void(void* native_stream)>& fn);
+
+    void record_event(void** event, bool timing);
+    void wait_event(void* event);
+    static bool event_query(void* event);
+    bool query();
+    static void event_synchronize(void* event);
+    static float event_elapsed_ms(void* start, void* end);
+    static void event_destroy(void* event) noexcept;
 
     static bool graphs_supported();
     bool capturing() const { return capturing_; }
@@ -124,6 +138,9 @@ private:
     bool capturing_   = false;
     bool is_gpu_      = false;
     int  native_id_   = -1;
+    int  wave_size_   = 64;
+    bool mfma_        = false;
+    bool generic_     = false;
 };
 
 const char* backend_name();

@@ -269,6 +269,8 @@ def _match_rms_norm(out):
 
 
 def fuse_rms_norm(gm: fx.GraphModule) -> int:
+    """Replaces the decomposed RMSNorm (x * rsqrt(mean(x^2) + eps) * weight, in transformers'
+    forms) by paras::rms_norm; returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         match = _match_rms_norm(node)
@@ -315,6 +317,8 @@ def _eager_silu_is_paras(value) -> bool:
 
 
 def fuse_swiglu(gm: fx.GraphModule) -> int:
+    """Replaces silu(gate) * up of equal shapes and dtype by paras::swiglu; returns the number
+    of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "mul" or _operands(node) is None:
@@ -360,6 +364,8 @@ def _half_slice(node, x_expected=None):
 
 
 def fuse_rotate_half(gm: fx.GraphModule) -> int:
+    """Replaces cat(-x[..., h:], x[..., :h]) (rotary embeddings' rotate_half) by
+    paras::rotate_half; returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "cat":
@@ -442,7 +448,14 @@ def _repeat_kv_source(node):
     return x, G
 
 
+def _plain_contiguous(node) -> bool:
+    return _op(node) == "contiguous" and len(node.args) == 1 and not node.kwargs
+
+
 def fuse_gqa_attention(gm: fx.GraphModule) -> int:
+    """Lets scaled_dot_product_attention read grouped key/value heads directly: drops the
+    repeat_interleave (and the .contiguous() copy) of the keys and values and sets
+    enable_gqa; returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target is not F.scaled_dot_product_attention:
@@ -452,19 +465,27 @@ def fuse_gqa_attention(gm: fx.GraphModule) -> int:
         if node.kwargs.get("dropout_p", 0.0) != 0.0:
             continue
         q, k, v = node.args
+        kc = k if _plain_contiguous(k) and _private(k, {node}) else None
+        vc = v if _plain_contiguous(v) and _private(v, {node}) else None
+        k = kc.args[0] if kc is not None else k
+        v = vc.args[0] if vc is not None else v
+        users_k = {kc} if kc is not None else {node}
+        users_v = {vc} if vc is not None else {node}
         ks, vs = _repeat_kv_source(k), _repeat_kv_source(v)
         if ks is None or vs is None or ks[1] != vs[1]:
             continue
-        if not (_private(k, {node}) and _private(v, {node}) and _on_paras(q, ks[0], vs[0])):
+        if not (_private(k, users_k) and _private(v, users_v) and _on_paras(q, ks[0], vs[0])):
             continue
-        if not _no_mutation_within([node, k, v, k.args[0], v.args[0], k.args[0].args[0], v.args[0].args[0]]):
+        span = [node, k, v, k.args[0], v.args[0], k.args[0].args[0], v.args[0].args[0]]
+        span += [c for c in (kc, vc) if c is not None]
+        if not _no_mutation_within(span):
             continue
         node.args = (q, ks[0], vs[0])
         node.kwargs = {**node.kwargs, "enable_gqa": True}
-        for rk in (k, v):
+        for rk, c in ((k, kc), (v, vc)):
             expand = rk.args[0]
             unsq = expand.args[0]
-            _erase(gm, [rk, expand, unsq])
+            _erase(gm, ([c] if c is not None else []) + [rk, expand, unsq])
         count += 1
     return count
 
@@ -495,6 +516,8 @@ def _rope_parts(add):
 
 
 def fuse_rope(gm: fx.GraphModule) -> int:
+    """Replaces x * cos + rotate_half(x) * sin by paras::rope; returns the number of
+    substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if _op(node) != "add" or node.kwargs:
@@ -532,6 +555,8 @@ def fuse_rope(gm: fx.GraphModule) -> int:
 
 
 def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
+    """Folds the residual add before paras::rms_norm into paras::add_rms_norm (sum and norm in
+    one kernel); returns the number of substitutions."""
     count = 0
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target is not torch.ops.paras.rms_norm.default:
@@ -583,6 +608,9 @@ _SDPA_KWARGS = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
 
 
 def fuse_sdpa_bool_mask(gm: fx.GraphModule) -> int:
+    """Inference only: replaces scaled_dot_product_attention with a boolean mask (4-D
+    tensors on a paras device, no dropout) by paras::sdpa, which reads the boolean mask
+    directly (grouped key/value heads included); returns the number of substitutions."""
     if torch.is_grad_enabled():
         return 0
     count = 0
@@ -622,6 +650,51 @@ def fuse_sdpa_bool_mask(gm: fx.GraphModule) -> int:
     return count
 
 
+def fuse_rope_index_copy(gm: fx.GraphModule) -> int:
+    """Replaces a RoPE whose result is written into a static KV cache with index_copy_ by
+    paras::rope_index_copy_ (rotate and store in one kernel); returns the number of
+    substitutions."""
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_method" or node.target != "index_copy_" or node.kwargs or len(node.args) != 4:
+            continue
+        cache, dim, index, src = node.args
+        if not isinstance(dim, int) or not isinstance(index, fx.Node):
+            continue
+        chain = [node]
+        if _op(src) == "to" and len(src.args) == 2 and not src.kwargs and isinstance(src.args[1], torch.dtype):
+            if not _private(src, {node}):
+                continue
+            to_node, src = src, src.args[0]
+            tv, sv = _value(to_node), _value(src)
+            if tv is None or sv is None or tv.dtype != sv.dtype:
+                continue
+            chain.append(to_node)
+            users = {to_node}
+        else:
+            users = {node}
+        if not (isinstance(src, fx.Node) and src.op == "call_function"
+                and src.target is torch.ops.paras.rope.default and _private(src, users)):
+            continue
+        x, cos, sin = src.args
+        cv, xv = _value(cache), _value(x)
+        if cv is None or xv is None or cv.dtype != xv.dtype or cv.dim() != xv.dim():
+            continue
+        if torch.is_grad_enabled() and (cv.requires_grad or xv.requires_grad):
+            continue
+        if not _on_paras(cache, index, x, cos, sin):
+            continue
+        chain.append(src)
+        if not _no_mutation_within(chain):
+            continue
+        with gm.graph.inserting_before(node):
+            gm.graph.call_function(torch.ops.paras.rope_index_copy_.default, (cache, dim, index, x, cos, sin))
+        node.replace_all_uses_with(cache)
+        _erase(gm, chain)
+        count += 1
+    return count
+
+
 PASSES = {
     "rms_norm": fuse_rms_norm,
     "swiglu": fuse_swiglu,
@@ -629,6 +702,7 @@ PASSES = {
     "gqa_attention": fuse_gqa_attention,
     "sdpa_bool_mask": fuse_sdpa_bool_mask,
     "rope": fuse_rope,
+    "rope_index_copy": fuse_rope_index_copy,
     "add_rms_norm": fuse_add_rms_norm,
 }
 

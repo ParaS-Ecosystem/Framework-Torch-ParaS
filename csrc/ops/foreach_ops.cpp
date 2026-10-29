@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "core/kernels.h"
+#include "core/telemetry.h"
 
 #include <ATen/ops/_foreach_add_native.h>
 #include <ATen/ops/_foreach_addcdiv_native.h>
@@ -149,7 +150,7 @@ bool foreach_apply(TensorList out, TensorList a, TensorList b, TensorList c,
     return true;
 }
 
-template <typename T> double round_to(double v, const T*) { return static_cast<double>(static_cast<T>(v)); }
+template <typename T> PTSYCL_HOST_DEVICE double round_to(double v, const T*) { return static_cast<double>(static_cast<T>(v)); }
 double scalar_as(const Tensor& like, double v) {
     return like.scalar_type() == c10::kDouble ? v : static_cast<double>(static_cast<float>(v));
 }
@@ -262,10 +263,43 @@ std::vector<Tensor> foreach_sqrt(TensorList self) {
     return at::native::foreach_tensor_sqrt_slow(self);
 }
 
+void amp_foreach_non_finite_check_and_unscale_(at::TensorList self, at::Tensor& found_inf,
+                                               const at::Tensor& inv_scale) {
+    PTSYCL_TRACE_OP("_amp_foreach_non_finite_check_and_unscale_");
+    TORCH_CHECK(found_inf.numel() == 1 && inv_scale.numel() == 1,
+                "_amp_foreach_non_finite_check_and_unscale_: found_inf and inv_scale must have one element");
+    for (const at::Tensor& t : self) {
+        if (!t.defined() || t.numel() == 0) continue;
+        found_inf.masked_fill_(t.isfinite().logical_not_().any().view(found_inf.sizes()), 1.0);
+        auto& g = const_cast<at::Tensor&>(t);
+        if (g.scalar_type() == c10::kHalf || g.scalar_type() == c10::kBFloat16)
+            g.copy_(g.to(c10::kFloat).mul_(inv_scale.to(c10::kFloat)));
+        else
+            g.mul_(inv_scale.to(g.scalar_type()));
+    }
+}
+
+at::Tensor& amp_update_scale_(at::Tensor& scale, at::Tensor& growth_tracker, const at::Tensor& found_inf,
+                              double growth_factor, double backoff_factor, int64_t growth_interval) {
+    PTSYCL_TRACE_OP("_amp_update_scale_");
+    const at::Tensor found = found_inf.gt(0);
+    const at::Tensor next = growth_tracker + 1;
+    const at::Tensor grow = found.logical_not().logical_and_(next.eq(growth_interval));
+    const at::Tensor grown = scale * growth_factor;
+    const at::Tensor take_grown = grow.logical_and(grown.isfinite());
+    const at::Tensor new_scale = at::where(found, scale * backoff_factor, at::where(take_grown, grown, scale));
+    const at::Tensor new_tracker = at::where(found.logical_or(grow), at::zeros_like(next), next);
+    scale.copy_(new_scale);
+    growth_tracker.copy_(new_tracker);
+    return scale;
+}
+
 }
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+    m.impl("aten::_amp_foreach_non_finite_check_and_unscale_", &ptsycl::amp_foreach_non_finite_check_and_unscale_);
+    m.impl("aten::_amp_update_scale_", &ptsycl::amp_update_scale_);
     m.impl("aten::_foreach_mul_.Scalar", &ptsycl::foreach_mul_scalar_);
     m.impl("aten::_foreach_mul_.Tensor", &ptsycl::foreach_mul_tensor_);
     m.impl("aten::_foreach_add_.List", &ptsycl::foreach_add_list_);
