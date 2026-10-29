@@ -713,15 +713,6 @@ std::vector<Tensor> split(const Tensor& self, c10::SymInt split_size_sym, int64_
     return ptsycl::split_with_sizes(self, split_sizes, d);
 }
 
-std::vector<Tensor> chunk(const Tensor& self, int64_t chunks, int64_t dim) {
-    PTSYCL_TRACE_OP("chunk");
-    TORCH_CHECK(chunks > 0, "chunk: chunks must be positive");
-    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
-    const int64_t dim_size = self.size(d);
-    const int64_t split_size = (dim_size + chunks - 1) / chunks;
-    return ptsycl::split(self, c10::SymInt(split_size > 0 ? split_size : 1), d);
-}
-
 Tensor squeeze_all(const Tensor& self) {
     PTSYCL_TRACE_OP("squeeze");
     std::vector<int64_t> new_sizes;
@@ -910,12 +901,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::repeat", &ptsycl::repeat);
     m.impl("aten::split.Tensor", &ptsycl::split);
     m.impl("aten::split_with_sizes", &ptsycl::split_with_sizes);
-    m.impl("aten::chunk", &ptsycl::chunk);
     m.impl("aten::squeeze", &ptsycl::squeeze_all);
     m.impl("aten::squeeze.dim", &ptsycl::squeeze_dim);
     m.impl("aten::squeeze.dims", &ptsycl::squeeze_dims);
     m.impl("aten::unsqueeze", &ptsycl::unsqueeze);
-    m.impl("aten::narrow", &ptsycl::narrow);
     m.impl("aten::slice.Tensor", &ptsycl::slice);
 }
 

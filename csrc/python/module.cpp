@@ -73,6 +73,28 @@ PYBIND11_MODULE(_C, m) {
         return ptsycl::Context::instance().device(index).pool->allocated_bytes();
     });
 
+    m.def("memory_stats", [](int index) {
+        const auto st = ptsycl::Context::instance().device(index).pool->stats();
+        py::dict d;
+        auto put = [&](const char* name, const c10::CachingAllocator::Stat& s) {
+            d[name] = py::make_tuple(s.current, s.peak, s.allocated, s.freed);
+        };
+        put("allocated_bytes", st.allocated_bytes[0]);
+        put("reserved_bytes", st.reserved_bytes[0]);
+        put("active_bytes", st.active_bytes[0]);
+        put("requested_bytes", st.requested_bytes[0]);
+        put("allocation", st.allocation[0]);
+        put("active", st.active[0]);
+        put("segment", st.segment[0]);
+        return d;
+    });
+    m.def("reset_peak_stats", [](int index) {
+        ptsycl::Context::instance().device(index).pool->reset_peak_stats();
+    });
+    m.def("reset_accumulated_stats", [](int index) {
+        ptsycl::Context::instance().device(index).pool->reset_accumulated_stats();
+    });
+
     m.def("cached_bytes", [](int index) {
         return ptsycl::Context::instance().device(index).pool->cached_bytes();
     });

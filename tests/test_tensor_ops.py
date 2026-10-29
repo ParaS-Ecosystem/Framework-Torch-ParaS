@@ -345,6 +345,17 @@ def test_narrow(device):
     assert_close(dev_out, cpu_out, "narrow")
 
 
+def test_chunk_and_narrow_backward(device):
+    x = torch.randn(4, 6, requires_grad=True)
+    w = torch.randn(4, 6)
+    a, b = x.chunk(2, dim=-1)
+    ((a * b).sum() + (x.narrow(0, 1, 2) * w[1:3]).sum()).backward()
+    xd = x.detach().to(device).requires_grad_()
+    ad, bd = xd.chunk(2, dim=-1)
+    ((ad * bd).sum() + (xd.narrow(0, 1, 2) * w[1:3].to(device)).sum()).backward()
+    assert_close(xd.grad, x.grad, "chunk/narrow grad")
+
+
 def test_shape_edge_cases(device):
     empty = torch.empty((0, 3), dtype=torch.float32)
     dev_empty = empty.to(device)

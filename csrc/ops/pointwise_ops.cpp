@@ -18,6 +18,7 @@
 
 
 #include <cmath>
+#include <optional>
 
 #include "core/kernels.h"
 #include "ops/clap_dnn_adapter.h"
@@ -62,11 +63,31 @@ Tensor to_compute(const Tensor& t, c10::ScalarType dtype, c10::Device device) {
     return t.to(t.options().dtype(dtype).device(device));
 }
 
+std::optional<double> opmath_scalar(const Tensor& t, c10::ScalarType out) {
+    if (t.dim() != 0 || !t.device().is_cpu() || !t.unsafeGetTensorImpl()->is_wrapped_number() ||
+        !c10::isFloatingType(out))
+        return std::nullopt;
+    const double v = t.item<double>();
+    return out == c10::kDouble ? v : static_cast<double>(static_cast<float>(v));
+}
+
 template <typename Fn>
 void binary_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
     auto& q = queue_for(out);
     const int64_t n = out.numel();
     if (n == 0) return;
+    if (const auto sb = opmath_scalar(b, out.scalar_type())) {
+        const double sv = *sb;
+        Tensor ac = to_compute(a, out.scalar_type(), out.device());
+        unary_kernel(ac, out, [fn, sv](double x) { return fn(x, sv); });
+        return;
+    }
+    if (const auto sa = opmath_scalar(a, out.scalar_type())) {
+        const double sv = *sa;
+        Tensor bc = to_compute(b, out.scalar_type(), out.device());
+        unary_kernel(bc, out, [fn, sv](double y) { return fn(sv, y); });
+        return;
+    }
     Tensor ae = to_compute(a, out.scalar_type(), out.device()).expand_as(out);
     Tensor be = to_compute(b, out.scalar_type(), out.device()).expand_as(out);
 
@@ -296,7 +317,8 @@ Tensor& div_out(const Tensor& self, const Tensor& other, Tensor& out) {
 
 Tensor& mul_scalar_(Tensor& self, const c10::Scalar& other) {
     PTSYCL_TRACE_OP("mul_.Scalar");
-    const double w = other.toDouble();
+    const double w = self.scalar_type() == c10::kDouble || !c10::isFloatingType(self.scalar_type())
+                         ? other.toDouble() : static_cast<double>(static_cast<float>(other.toDouble()));
     unary_kernel(self, self, [w](double v) { return v * w; });
     return self;
 }
@@ -394,7 +416,15 @@ Tensor& sgn_out(const Tensor& self, Tensor& out) {
 }
 Tensor& pow_scalar_out(const Tensor& self, const c10::Scalar& e, Tensor& out) {
     const double p = e.toDouble();
-    unary_kernel(self, out, [p](double v) { return ::pow(v, p); });
+    if (p == 2.0) {
+        unary_kernel(self, out, [](double v) { return v * v; });
+    } else if (p == 1.0) {
+        unary_kernel(self, out, [](double v) { return v; });
+    } else if (p == -1.0) {
+        unary_kernel(self, out, [](double v) { return 1.0 / v; });
+    } else {
+        unary_kernel(self, out, [p](double v) { return ::pow(v, p); });
+    }
     return out;
 }
 Tensor& lerp_scalar_out(const Tensor& self, const Tensor& end,
@@ -1480,11 +1510,81 @@ std::tuple<Tensor&, Tensor&> sort_out_default(
 }
 
 // --- concatenation ------------------------------------------------------------------
+struct alignas(16) CatWord16 { uint32_t v[4]; };
+struct CatPiece { int64_t src, words_per_row, dst_offset, first; };
+constexpr int kCatMaxPieces = 64;
+struct CatPieces { CatPiece p[kCatMaxPieces]; };
+
+template <typename W>
+void cat_launch(compat::Queue& q, char* dst, int64_t out_row_words, int64_t total_words,
+                int64_t n, const CatPieces& pcs) {
+    W* d = reinterpret_cast<W*>(dst);
+    launch_flat(q, total_words, [=](std::size_t flat_) {
+        const int64_t w = static_cast<int64_t>(flat_);
+        int64_t lo = 0, hi = n - 1;
+        while (lo < hi) {
+            const int64_t mid = (lo + hi + 1) / 2;
+            if (pcs.p[mid].first <= w) lo = mid; else hi = mid - 1;
+        }
+        const CatPiece pc = pcs.p[lo];
+        const int64_t local = w - pc.first;
+        const int64_t row = local / pc.words_per_row, col = local % pc.words_per_row;
+        d[row * out_row_words + pc.dst_offset + col] = reinterpret_cast<const W*>(pc.src)[local];
+    });
+}
+
+bool cat_contiguous(const std::vector<std::reference_wrapper<const Tensor>>& ts, int64_t dim, Tensor& out) {
+    if (!out.is_contiguous() || out.numel() == 0) return false;
+    const int64_t es = static_cast<int64_t>(out.element_size());
+    int64_t inner = 1, outer = 1;
+    for (int64_t d = dim + 1; d < out.dim(); ++d) inner *= out.size(d);
+    for (int64_t d = 0; d < dim; ++d) outer *= out.size(d);
+    struct Piece { const char* src; int64_t row_bytes, dst_off_bytes; };
+    std::vector<Piece> pieces;
+    int64_t offset = 0;
+    for (const Tensor& t : ts) {
+        if (t.numel() == 0) continue;
+        if (t.scalar_type() != out.scalar_type() || t.device() != out.device() || !t.is_contiguous() ||
+            t.dim() != out.dim())
+            return false;
+        const int64_t len = t.size(dim);
+        pieces.push_back({static_cast<const char*>(t.data_ptr()), len * inner * es, offset * inner * es});
+        offset += len;
+    }
+    if (pieces.empty()) return true;
+    if (static_cast<int64_t>(pieces.size()) > kCatMaxPieces) return false;
+    const int64_t out_row_bytes = out.size(dim) * inner * es;
+    int64_t W = 16;
+    auto fits = [&](int64_t w) {
+        if (out_row_bytes % w || reinterpret_cast<std::uintptr_t>(out.data_ptr()) % w) return false;
+        for (const auto& p : pieces)
+            if (p.row_bytes % w || p.dst_off_bytes % w || reinterpret_cast<std::uintptr_t>(p.src) % w) return false;
+        return true;
+    };
+    while (W > 1 && !fits(W)) W = W == 16 ? 4 : 1;
+    const int64_t n = static_cast<int64_t>(pieces.size());
+    CatPieces pcs{};
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        pcs.p[i] = CatPiece{reinterpret_cast<int64_t>(pieces[i].src), pieces[i].row_bytes / W,
+                            pieces[i].dst_off_bytes / W, total};
+        total += outer * (pieces[i].row_bytes / W);
+    }
+    auto& q = queue_for(out);
+    char* dst = static_cast<char*>(out.data_ptr());
+    const int64_t orw = out_row_bytes / W;
+    if (W == 16) cat_launch<CatWord16>(q, dst, orw, total, n, pcs);
+    else if (W == 4) cat_launch<uint32_t>(q, dst, orw, total, n, pcs);
+    else cat_launch<unsigned char>(q, dst, orw, total, n, pcs);
+    return true;
+}
+
 Tensor& cat_out(const at::ITensorListRef& tensors, int64_t dim, Tensor& out) {
     PTSYCL_TRACE_OP("cat.out");
     auto materialized = tensors.materialize();
     TORCH_CHECK(!materialized.empty(), "cat: expected non-empty tensor list");
     const int64_t wrapped = c10::maybe_wrap_dim(dim, out.dim());
+    if (cat_contiguous(materialized, wrapped, out)) return out;
 
     int64_t offset = 0;
     for (const Tensor& t : materialized) {

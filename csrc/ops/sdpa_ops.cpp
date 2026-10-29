@@ -66,8 +66,10 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
     if (q.sym_size(2) > kFusedMaxQuery) {
 #if PTSYCL_SDPA_GEMM_PATH
         if (!queue_for(q).is_gpu()) return false;
-        const bool flash = (dt == c10::kBFloat16 || dt == c10::kHalf) && v.sym_size(3) == q.sym_size(3) &&
-                           (q.sym_size(3) == 64 || q.sym_size(3) == 128);
+        const bool flash = v.sym_size(3) == q.sym_size(3) &&
+                           ((dt == c10::kBFloat16 || dt == c10::kHalf)
+                                ? (q.sym_size(3) == 64 || q.sym_size(3) == 128)
+                                : (dt == c10::kFloat && q.sym_size(3) == 64));
         if (!flash && k.sym_size(2) > kRowLanes * kRowPerLane) return false;
 #else
         return false;
@@ -204,17 +206,10 @@ constexpr int kFlashBlockK = 64;
 constexpr int kFlashLanes = 64;
 constexpr int kFlashThreads = kFlashWaves * kFlashLanes;
 constexpr int kFlashPad = 4;
-constexpr int kFlashPLD = kFlashBlockK + kFlashPad;
 
 template <int D>
-constexpr int flash_kp_elems() {
-    return kFlashBlockK * (D + kFlashPad) > kFlashWaves * kFlashRowsPerWave * kFlashPLD
-               ? kFlashBlockK * (D + kFlashPad)
-               : kFlashWaves * kFlashRowsPerWave * kFlashPLD;
-}
-template <int D>
 constexpr int flash_lds_elems() {
-    return flash_kp_elems<D>() + D * (kFlashBlockK + kFlashPad);
+    return kFlashBlockK * (D + kFlashPad) + D * (kFlashBlockK + kFlashPad);
 }
 
 template <typename T>
@@ -256,26 +251,29 @@ __attribute__((always_inline)) PTSYCL_HOST_DEVICE inline unsigned short flash_p_
 
 template <typename T, int D, int kPer>
 __attribute__((always_inline)) PTSYCL_HOST_DEVICE inline void flash_load_kv(
-    const T* kp, const T* vp, const FlashArgs<T>& a, int64_t j0, int tid, bool kvec, bool vvec,
+    const T* kp, const T* vp, const FlashArgs<T>& a, int j0, int tid, bool kvec, bool vvec,
     flash_v8u (&kreg)[kPer], flash_v8u (&vreg)[kPer]) {
+    const int lk = static_cast<int>(a.Lk);
+    const int ks2 = static_cast<int>(a.ks.s[2]), ks3 = static_cast<int>(a.ks.s[3]);
+    const int vs2 = static_cast<int>(a.vs.s[2]), vs3 = static_cast<int>(a.vs.s[3]);
 #pragma unroll
     for (int t = 0; t < kPer; ++t) {
         const int c = tid + t * kFlashThreads;
         const int r = c / (D / 8), c8 = (c % (D / 8)) * 8;
-        const int64_t key = j0 + r;
-        if (key < a.Lk && kvec) {
-            kreg[t] = *reinterpret_cast<const flash_v8u*>(kp + key * a.ks.s[2] + c8);
+        const int key = j0 + r;
+        if (key < lk && kvec) {
+            kreg[t] = *reinterpret_cast<const flash_v8u*>(kp + key * ks2 + c8);
         } else {
 #pragma unroll
             for (int e = 0; e < 8; ++e)
-                kreg[t][e] = key < a.Lk ? static_cast<unsigned short>(flash_bits(kp[key * a.ks.s[2] + (c8 + e) * a.ks.s[3]])) : 0;
+                kreg[t][e] = key < lk ? static_cast<unsigned short>(flash_bits(kp[key * ks2 + (c8 + e) * ks3])) : 0;
         }
-        if (key < a.Lk && vvec) {
-            vreg[t] = *reinterpret_cast<const flash_v8u*>(vp + key * a.vs.s[2] + c8);
+        if (key < lk && vvec) {
+            vreg[t] = *reinterpret_cast<const flash_v8u*>(vp + key * vs2 + c8);
         } else {
 #pragma unroll
             for (int e = 0; e < 8; ++e)
-                vreg[t][e] = key < a.Lk ? static_cast<unsigned short>(flash_bits(vp[key * a.vs.s[2] + (c8 + e) * a.vs.s[3]])) : 0;
+                vreg[t][e] = key < lk ? static_cast<unsigned short>(flash_bits(vp[key * vs2 + (c8 + e) * vs3])) : 0;
         }
     }
 }
@@ -334,7 +332,8 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     const int lane = tid % kFlashLanes, wave = tid / kFlashLanes;
     const int lr = lane % 16, lg = lane / 16;
     const int64_t g = static_cast<int64_t>(it.get_group(0));
-    const int64_t bh = g / a.q_blocks, qb = g % a.q_blocks;
+    const int64_t gq = g % a.q_blocks;
+    const int64_t bh = g / a.q_blocks, qb = a.causal ? a.q_blocks - 1 - gq : gq;
     const int64_t b = bh / a.H, h = bh % a.H;
     const int64_t q0 = qb * kFlashBlockQ;
     const int64_t row0 = q0 + wave * kFlashRowsPerWave;
@@ -342,14 +341,14 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     const T* kp = a.k + b * a.ks.s[0] + (h / a.kv_group) * a.ks.s[1];
     const T* vp = a.v + b * a.vs.s[0] + (h / a.kv_group) * a.vs.s[1];
     unsigned short* klds = lds;
-    unsigned short* plds = lds + wave * (kFlashRowsPerWave * kFlashPLD);
-    unsigned short* vlds = lds + flash_kp_elems<D>();
+    unsigned short* vlds = lds + kFlashBlockK * KLD;
     const bool kvec = a.ks.s[3] == 1 && a.ks.s[2] % 8 == 0 &&
                       reinterpret_cast<std::uintptr_t>(kp) % 16 == 0;
     const bool vvec = a.vs.s[3] == 1 && a.vs.s[2] % 8 == 0 &&
                       reinterpret_cast<std::uintptr_t>(vp) % 16 == 0;
 
     flash_v8u kreg[kPer], vreg[kPer];
+    const int lk32 = static_cast<int>(a.Lk), lq32 = static_cast<int>(a.Lq);
 
     v4s qa[MT][KS];
 #pragma unroll
@@ -363,13 +362,12 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
                                          : static_cast<short>(0);
     }
     v4f oacc[MT][KS];
-    float m_i[MT][4], l_i[MT][4];
+    float m_i[MT], l_i[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
         for (int n = 0; n < KS; ++n) oacc[mt][n] = v4f{0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { m_i[mt][i] = kNegInf; l_i[mt][i] = 0.f; }
+        m_i[mt] = kNegInf; l_i[mt] = 0.f;
     }
 
     const int64_t k_end = a.causal ? (q0 + kFlashBlockQ < a.Lk ? q0 + kFlashBlockQ : a.Lk) : a.Lk;
@@ -377,15 +375,22 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     const int64_t msum = a.mcls == nullptr ? 0
         : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
     const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
-    for (int64_t j0 = 0; j0 < k_end; j0 += kFlashBlockK) {
-        const signed char tile = a.mcls == nullptr
-                                     ? (has_mask ? kMaskMixed : kMaskZero)
-                                     : a.mcls[msum * a.k_blocks + j0 / kFlashBlockK];
-        if (tile == kMaskDead && may_skip) continue;
-        const bool masked = tile != kMaskZero;
-        flash_load_kv<T, D, kPer>(kp, vp, a, j0, tid, kvec, vvec, kreg, vreg);
+    auto tile_of = [&](int64_t j) -> signed char {
+        return a.mcls == nullptr ? (has_mask ? kMaskMixed : kMaskZero)
+                                 : a.mcls[msum * a.k_blocks + j / kFlashBlockK];
+    };
+    auto next_block = [&](int64_t j) -> int64_t {
+        while (j < k_end && may_skip && tile_of(j) == kMaskDead) j += kFlashBlockK;
+        return j;
+    };
+    int64_t j0 = next_block(0);
+    if (j0 < k_end) flash_load_kv<T, D, kPer>(kp, vp, a, static_cast<int>(j0), tid, kvec, vvec, kreg, vreg);
+    while (j0 < k_end) {
+        const bool masked = tile_of(j0) != kMaskZero;
         flash_store_kv<D, kPer>(klds, vlds, tid, kreg, vreg);
         sycl::group_barrier(it.get_group());
+        const int64_t j_next = next_block(j0 + kFlashBlockK);
+        if (j_next < k_end) flash_load_kv<T, D, kPer>(kp, vp, a, static_cast<int>(j_next), tid, kvec, vvec, kreg, vreg);
 
         v4f sacc[MT][4];
 #pragma unroll
@@ -398,27 +403,26 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
             for (int ks = 0; ks < KS; ++ks) {
                 const v4s kb = *reinterpret_cast<const v4s*>(klds + (n * 16 + lr) * KLD + ks * 16 + 4 * lg);
 #pragma unroll
-                for (int mt = 0; mt < MT; ++mt) sacc[mt][n] = mfma(qa[mt][ks], kb, sacc[mt][n]);
+                for (int mt = 0; mt < MT; ++mt) sacc[mt][n] = mfma(kb, qa[mt][ks], sacc[mt][n]);
             }
-        sycl::group_barrier(it.get_group());
 
+        v4s pb[MT][4];
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
-            float x[4][4], mx[4];
+            const int64_t row = row0 + 16 * mt + lr;
+            const int row32 = static_cast<int>(row);
             const int64_t tile_row0 = row0 + 16 * mt;
             const bool edge = j0 + kFlashBlockK > a.Lk || tile_row0 + 16 > a.Lq ||
                               (a.causal && j0 + kFlashBlockK - 1 > tile_row0);
+            float mx = kNegInf;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int row_l = 16 * mt + 4 * lg + i;
-                mx[i] = kNegInf;
+            for (int n = 0; n < 4; ++n)
 #pragma unroll
-                for (int n = 0; n < 4; ++n) {
+                for (int i = 0; i < 4; ++i) {
                     float sv = sacc[mt][n][i] * a.scale;
                     if (edge || masked) {
-                        const int64_t row = row0 + row_l;
-                        const int64_t key = j0 + n * 16 + lr;
-                        if (key >= a.Lk || row >= a.Lq || (a.causal && key > row)) {
+                        const int key = static_cast<int>(j0) + n * 16 + 4 * lg + i;
+                        if (key >= lk32 || row32 >= lq32 || (a.causal && key > row32)) {
                             sv = kNegInf;
                         } else if (masked) {
                             const int64_t mo = b * a.ms.s[0] + h * a.ms.s[1] + row * a.ms.s[2] + key * a.ms.s[3];
@@ -426,69 +430,248 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
                             if (a.mb != nullptr && !a.mb[mo]) sv = kNegInf;
                         }
                     }
-                    x[i][n] = sv;
-                    mx[i] = sv > mx[i] ? sv : mx[i];
+                    sacc[mt][n][i] = sv;
+                    mx = sv > mx ? sv : mx;
                 }
+#pragma unroll
+            for (int off = 16; off < 64; off <<= 1) {
+                const float o = sycl::permute_group_by_xor(sg, mx, off);
+                mx = o > mx ? o : mx;
             }
+            const float m_new = mx > m_i[mt] ? mx : m_i[mt];
+            const float alpha = m_new == kNegInf ? 1.f : __expf(m_i[mt] - m_new);
+            float rs = 0.f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
+            for (int n = 0; n < 4; ++n)
 #pragma unroll
-                for (int off = 1; off < 16; off <<= 1) {
-                    const float o = sycl::permute_group_by_xor(sg, mx[i], off);
-                    mx[i] = o > mx[i] ? o : mx[i];
+                for (int i = 0; i < 4; ++i) {
+                    const float x = sacc[mt][n][i];
+                    const float pv = x == kNegInf ? 0.f : __expf(x - m_new);
+                    rs += pv;
+                    pb[mt][n][i] = static_cast<short>(flash_p_bits<T>(pv));
                 }
-                const float m_new = mx[i] > m_i[mt][i] ? mx[i] : m_i[mt][i];
-                const float alpha = m_new == kNegInf ? 1.f : __expf(m_i[mt][i] - m_new);
-                float rs = 0.f;
 #pragma unroll
-                for (int n = 0; n < 4; ++n) {
-                    const float pv = x[i][n] == kNegInf ? 0.f : __expf(x[i][n] - m_new);
-                    x[i][n] = pv;
+            for (int off = 16; off < 64; off <<= 1) rs += sycl::permute_group_by_xor(sg, rs, off);
+            l_i[mt] = l_i[mt] * alpha + rs;
+            m_i[mt] = m_new;
+#pragma unroll
+            for (int nd = 0; nd < KS; ++nd) oacc[mt][nd] *= alpha;
+        }
+#pragma unroll
+        for (int n = 0; n < 4; ++n)
+#pragma unroll
+            for (int nd = 0; nd < KS; ++nd) {
+                const v4s va = *reinterpret_cast<const v4s*>(vlds + (nd * 16 + lr) * VLD + n * 16 + 4 * lg);
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) oacc[mt][nd] = mfma(va, pb[mt][n], oacc[mt][nd]);
+            }
+        sycl::group_barrier(it.get_group());
+        j0 = j_next;
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        const int64_t row = row0 + 16 * mt + lr;
+        if (row >= a.Lq) continue;
+        const float inv = l_i[mt] > 0.f ? 1.f / l_i[mt] : 0.f;
+        T* orow = a.o + b * a.os.s[0] + h * a.os.s[1] + row * a.os.s[2];
+#pragma unroll
+        for (int nd = 0; nd < KS; ++nd)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                orow[(nd * 16 + 4 * lg + i) * a.os.s[3]] = static_cast<T>(oacc[mt][nd][i] * inv);
+        if (lg == 0)
+            a.lse[(b * a.H + h) * a.Lq + row] = l_i[mt] > 0.f ? m_i[mt] + ::logf(l_i[mt]) : kNegInf;
+    }
+#else
+    (void)a; (void)it; (void)lds;
+#endif
+}
+
+constexpr int kFlash32BlockK = 32;
+constexpr int kFlash32KLD = 64 + 2;
+constexpr int kFlash32VLD = 64 + 4;
+constexpr int kFlash32LdsElems = kFlash32BlockK * (kFlash32KLD + kFlash32VLD);
+
+template <int D> class Flash32Kernel;
+
+template <int D, typename Item>
+PTSYCL_HOST_DEVICE inline void flash_block_f32(const FlashArgs<float>& a, const Item& it, float* lds) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    static_assert(D == 64, "fp32 flash kernel: head size 64");
+    typedef float v4f __attribute__((ext_vector_type(4)));
+    constexpr int BK = kFlash32BlockK;
+    constexpr int KS = D / 4;
+    constexpr int NT = BK / 16;
+    constexpr int ND = D / 16;
+    constexpr int MT = kFlashTiles;
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+    constexpr int KLD = kFlash32KLD, VLD = kFlash32VLD;
+    constexpr int kPer = BK * D / 4 / kFlashThreads;
+
+    const auto sg = it.get_sub_group();
+    const int tid = static_cast<int>(it.get_local_id(0));
+    const int lane = tid % kFlashLanes, wave = tid / kFlashLanes;
+    const int lr = lane % 16, lg = lane / 16;
+    const int64_t g = static_cast<int64_t>(it.get_group(0));
+    const int64_t gq = g % a.q_blocks;
+    const int64_t bh = g / a.q_blocks, qb = a.causal ? a.q_blocks - 1 - gq : gq;
+    const int64_t b = bh / a.H, h = bh % a.H;
+    const int64_t q0 = qb * kFlashBlockQ;
+    const int64_t row0 = q0 + wave * kFlashRowsPerWave;
+    const float* qp = a.q + b * a.qs.s[0] + h * a.qs.s[1];
+    const float* kp = a.k + b * a.ks.s[0] + (h / a.kv_group) * a.ks.s[1];
+    const float* vp = a.v + b * a.vs.s[0] + (h / a.kv_group) * a.vs.s[1];
+    float* klds = lds;
+    float* vlds = lds + BK * KLD;
+    const bool kvec = a.ks.s[3] == 1 && a.ks.s[2] % 4 == 0 &&
+                      reinterpret_cast<std::uintptr_t>(kp) % 16 == 0;
+    const bool vvec = a.vs.s[3] == 1 && a.vs.s[2] % 4 == 0 &&
+                      reinterpret_cast<std::uintptr_t>(vp) % 16 == 0;
+
+    float qb_[MT][KS];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        const int64_t r = row0 + 16 * mt + lr;
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks)
+            qb_[mt][ks] = r < a.Lq ? qp[r * a.qs.s[2] + (4 * ks + lg) * a.qs.s[3]] : 0.f;
+    }
+    v4f oacc[MT][ND];
+    float m_i[MT], l_i[MT];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int n = 0; n < ND; ++n) oacc[mt][n] = v4f{0.f, 0.f, 0.f, 0.f};
+        m_i[mt] = kNegInf; l_i[mt] = 0.f;
+    }
+
+    const int64_t k_end = a.causal ? (q0 + kFlashBlockQ < a.Lk ? q0 + kFlashBlockQ : a.Lk) : a.Lk;
+    const bool has_mask = a.mf != nullptr || a.mb != nullptr;
+    const int64_t msum = a.mcls == nullptr ? 0
+        : ((a.mb_stride ? b : 0) * a.mb_stride + (a.mh_stride ? h : 0)) * a.q_blocks + qb;
+    const bool may_skip = a.mcls != nullptr && a.mqok[msum] != 0;
+    for (int64_t j0 = 0; j0 < k_end; j0 += BK) {
+        const signed char tile = a.mcls == nullptr
+                                     ? (has_mask ? kMaskMixed : kMaskZero)
+                                     : a.mcls[msum * a.k_blocks + j0 / kFlashBlockK];
+        if (tile == kMaskDead && may_skip) continue;
+        const bool masked = tile != kMaskZero;
+#pragma unroll
+        for (int t = 0; t < kPer; ++t) {
+            const int c = tid + t * kFlashThreads;
+            const int r = c / (D / 4), c4 = (c % (D / 4)) * 4;
+            const int64_t key = j0 + r;
+            v4f kv, vv;
+            if (key < a.Lk && kvec) {
+                kv = *reinterpret_cast<const v4f*>(kp + key * a.ks.s[2] + c4);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) kv[e] = key < a.Lk ? kp[key * a.ks.s[2] + (c4 + e) * a.ks.s[3]] : 0.f;
+            }
+            if (key < a.Lk && vvec) {
+                vv = *reinterpret_cast<const v4f*>(vp + key * a.vs.s[2] + c4);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) vv[e] = key < a.Lk ? vp[key * a.vs.s[2] + (c4 + e) * a.vs.s[3]] : 0.f;
+            }
+            typedef float v2f __attribute__((ext_vector_type(2)));
+            *reinterpret_cast<v2f*>(klds + r * KLD + c4) = kv.lo;
+            *reinterpret_cast<v2f*>(klds + r * KLD + c4 + 2) = kv.hi;
+            *reinterpret_cast<v4f*>(vlds + r * VLD + c4) = vv;
+        }
+        sycl::group_barrier(it.get_group());
+
+        v4f sacc[MT][NT];
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int n = 0; n < NT; ++n) sacc[mt][n] = v4f{0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+#pragma unroll
+            for (int ks = 0; ks < KS; ++ks) {
+                const float ka = klds[(n * 16 + lr) * KLD + 4 * ks + lg];
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt)
+                    sacc[mt][n] = __builtin_amdgcn_mfma_f32_16x16x4f32(ka, qb_[mt][ks], sacc[mt][n], 0, 0, 0);
+            }
+
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            const int64_t row = row0 + 16 * mt + lr;
+            const int64_t tile_row0 = row0 + 16 * mt;
+            const bool edge = j0 + BK > a.Lk || tile_row0 + 16 > a.Lq ||
+                              (a.causal && j0 + BK - 1 > tile_row0);
+            float mx = kNegInf;
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    float sv = sacc[mt][n][i] * a.scale;
+                    if (edge || masked) {
+                        const int64_t key = j0 + n * 16 + 4 * lg + i;
+                        if (key >= a.Lk || row >= a.Lq || (a.causal && key > row)) {
+                            sv = kNegInf;
+                        } else if (masked) {
+                            const int64_t mo = b * a.ms.s[0] + h * a.ms.s[1] + row * a.ms.s[2] + key * a.ms.s[3];
+                            if (a.mf != nullptr) sv += a.mf[mo];
+                            if (a.mb != nullptr && !a.mb[mo]) sv = kNegInf;
+                        }
+                    }
+                    sacc[mt][n][i] = sv;
+                    mx = sv > mx ? sv : mx;
+                }
+#pragma unroll
+            for (int off = 16; off < 64; off <<= 1) {
+                const float o = sycl::permute_group_by_xor(sg, mx, off);
+                mx = o > mx ? o : mx;
+            }
+            const float m_new = mx > m_i[mt] ? mx : m_i[mt];
+            const float alpha = m_new == kNegInf ? 1.f : __expf(m_i[mt] - m_new);
+            float rs = 0.f;
+#pragma unroll
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float x = sacc[mt][n][i];
+                    const float pv = x == kNegInf ? 0.f : __expf(x - m_new);
+                    sacc[mt][n][i] = pv;
                     rs += pv;
                 }
 #pragma unroll
-                for (int off = 1; off < 16; off <<= 1) rs += sycl::permute_group_by_xor(sg, rs, off);
-                l_i[mt][i] = l_i[mt][i] * alpha + rs;
-                m_i[mt][i] = m_new;
+            for (int off = 16; off < 64; off <<= 1) rs += sycl::permute_group_by_xor(sg, rs, off);
+            l_i[mt] = l_i[mt] * alpha + rs;
+            m_i[mt] = m_new;
 #pragma unroll
-                for (int nd = 0; nd < KS; ++nd) oacc[mt][nd][i] *= alpha;
-#pragma unroll
-                for (int n = 0; n < 4; ++n)
-                    plds[(16 * mt + 4 * lg + i) * kFlashPLD + n * 16 + lr] =
-                        flash_p_bits<T>(x[i][n]);
-            }
+            for (int nd = 0; nd < ND; ++nd) oacc[mt][nd] *= alpha;
         }
-        sycl::group_barrier(it.get_group());
+
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) {
-            v4s pa[MT];
+        for (int n = 0; n < NT; ++n)
 #pragma unroll
-            for (int mt = 0; mt < MT; ++mt)
-                pa[mt] = *reinterpret_cast<const v4s*>(plds + (16 * mt + lr) * kFlashPLD + kk * 16 + 4 * lg);
+            for (int i = 0; i < 4; ++i)
 #pragma unroll
-            for (int nd = 0; nd < KS; ++nd) {
-                const v4s vb = *reinterpret_cast<const v4s*>(vlds + (nd * 16 + lr) * VLD + kk * 16 + 4 * lg);
+                for (int nd = 0; nd < ND; ++nd) {
+                    const float va = vlds[(n * 16 + 4 * lg + i) * VLD + nd * 16 + lr];
 #pragma unroll
-                for (int mt = 0; mt < MT; ++mt) oacc[mt][nd] = mfma(pa[mt], vb, oacc[mt][nd]);
-            }
-        }
+                    for (int mt = 0; mt < MT; ++mt)
+                        oacc[mt][nd] = __builtin_amdgcn_mfma_f32_16x16x4f32(va, sacc[mt][n][i], oacc[mt][nd], 0, 0, 0);
+                }
         sycl::group_barrier(it.get_group());
     }
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
+    for (int mt = 0; mt < MT; ++mt) {
+        const int64_t row = row0 + 16 * mt + lr;
+        if (row >= a.Lq) continue;
+        const float inv = l_i[mt] > 0.f ? 1.f / l_i[mt] : 0.f;
+        float* orow = a.o + b * a.os.s[0] + h * a.os.s[1] + row * a.os.s[2];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int64_t row = row0 + 16 * mt + 4 * lg + i;
-            if (row >= a.Lq) continue;
-            const float inv = l_i[mt][i] > 0.f ? 1.f / l_i[mt][i] : 0.f;
+        for (int nd = 0; nd < ND; ++nd)
 #pragma unroll
-            for (int nd = 0; nd < KS; ++nd)
-                a.o[b * a.os.s[0] + h * a.os.s[1] + row * a.os.s[2] + (nd * 16 + lr) * a.os.s[3]] =
-                    static_cast<T>(oacc[mt][nd][i] * inv);
-            if (lr == 0)
-                a.lse[(b * a.H + h) * a.Lq + row] =
-                    l_i[mt][i] > 0.f ? m_i[mt][i] + ::logf(l_i[mt][i]) : kNegInf;
-        }
+            for (int i = 0; i < 4; ++i) orow[(nd * 16 + 4 * lg + i) * a.os.s[3]] = oacc[mt][nd][i] * inv;
+        if (lg == 0)
+            a.lse[(b * a.H + h) * a.Lq + row] = l_i[mt] > 0.f ? m_i[mt] + ::logf(l_i[mt]) : kNegInf;
+    }
 #else
     (void)a; (void)it; (void)lds;
 #endif
@@ -735,15 +918,48 @@ void decode_attention(compat::Queue& queue, const T* pq, const T* pk, const T* p
 #endif
 
 #if PTSYCL_SDPA_GEMM_PATH
+bool head_offsets_fit_int(const Tensor& t) {
+    const int64_t m = (t.size(2) - 1) * std::abs(t.stride(2)) + (t.size(3) - 1) * std::abs(t.stride(3));
+    return t.size(2) < std::numeric_limits<int>::max() && m < std::numeric_limits<int>::max();
+}
+
+template <int D>
+struct FlashOccupancy {};
+
+template <>
+struct FlashOccupancy<64> {
+    static constexpr int paras_max_work_group_size = kFlashThreads;
+    static constexpr int paras_min_waves_per_eu = 3;
+};
+
+template <typename T, int D>
+struct FlashFunctor : FlashOccupancy<D> {
+    FlashArgs<T> a;
+    sycl::local_accessor<unsigned short, 1> lds;
+    void operator()(sycl::nd_item<1> it) const { flash_block<T, D>(a, it, &lds[0]); }
+};
+
 template <typename T, int D>
 void flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t groups) {
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<unsigned short, 1> lds(sycl::range<1>(flash_lds_elems<D>()), cgh);
-        const FlashArgs<T> a = args;
+        const FlashFunctor<T, D> f{{}, args, lds};
         cgh.template parallel_for<FlashKernel<T, D>>(
             sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kFlashThreads)),
                               sycl::range<1>(static_cast<std::size_t>(kFlashThreads))),
-            [=](sycl::nd_item<1> it) { flash_block<T, D>(a, it, &lds[0]); });
+            f);
+    });
+}
+
+template <int D>
+void flash_attention_f32(compat::Queue& queue, const FlashArgs<float>& args, int64_t groups) {
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> lds(sycl::range<1>(kFlash32LdsElems), cgh);
+        const FlashArgs<float> a = args;
+        cgh.template parallel_for<Flash32Kernel<D>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kFlashThreads)),
+                              sycl::range<1>(static_cast<std::size_t>(kFlashThreads))),
+            [=](sycl::nd_item<1> it) { flash_block_f32<D>(a, it, &lds[0]); });
     });
 }
 #endif
@@ -780,8 +996,33 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const auto lopts = q.options().dtype(c10::kLong);
 
 #if PTSYCL_SDPA_GEMM_PATH
+    if (Lq > kFusedMaxQuery && Dv == D && D == 64 && q.scalar_type() == c10::kFloat) {
+        FlashArgs<float> fa{};
+        fa.q = q.data_ptr<float>(); fa.k = k.data_ptr<float>(); fa.v = v.data_ptr<float>();
+        fa.o = out.data_ptr<float>(); fa.lse = lse.data_ptr<float>();
+        fa.mf = has_mask && !bool_mask ? mask.data_ptr<float>() : nullptr;
+        fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
+        fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
+        fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
+        fa.q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
+        fa.scale = sc; fa.causal = is_causal;
+        MaskSummary summary;
+        if (has_mask) {
+            summary = mask_block_summary<float>(queue, *attn_bias, mask, B, H, Lq, Lk);
+            fa.mcls = summary.cls.data_ptr<signed char>();
+            fa.mqok = summary.qok.data_ptr<unsigned char>();
+            fa.k_blocks = summary.k_blocks;
+            fa.mb_stride = summary.mb_stride;
+            fa.mh_stride = summary.mh_stride;
+        }
+        flash_attention_f32<64>(queue, fa, B * H * fa.q_blocks);
+        const Tensor none = Tensor();
+        return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
+                at::empty({}, lopts), at::empty({}, lopts), none};
+    }
     if (Lq > kFusedMaxQuery && Dv == D && (D == 64 || D == 128) &&
-        (q.scalar_type() == c10::kBFloat16 || q.scalar_type() == c10::kHalf)) {
+        (q.scalar_type() == c10::kBFloat16 || q.scalar_type() == c10::kHalf) &&
+        head_offsets_fit_int(k) && head_offsets_fit_int(v)) {
         AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "ptsycl_flash_attention", [&] {
             FlashArgs<scalar_t> fa{};
             fa.q = data_ptr<scalar_t>(q); fa.k = data_ptr<scalar_t>(k); fa.v = data_ptr<scalar_t>(v);
