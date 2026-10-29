@@ -19,8 +19,9 @@
 
 #pragma once
 
-
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 #include <c10/util/Exception.h>
 
@@ -58,10 +59,22 @@ struct StridedSpec {
     int64_t sizes[kMaxDims]{};
     int64_t strides[kMaxDims]{}; // in elements
     int64_t offset = 0;          // in elements
+    bool    identity = false;
+    bool    narrow = false;
 
     // Maps a flat logical index (row-major over sizes) to a storage offset.
     PTSYCL_HOST_DEVICE inline int64_t index(int64_t flat) const {
+        if (identity) return offset + flat;
         int64_t off = offset;
+        if (narrow) {
+            uint32_t f = static_cast<uint32_t>(flat);
+            for (int d = ndim - 1; d >= 0; --d) {
+                const uint32_t sz = static_cast<uint32_t>(sizes[d]);
+                off += static_cast<int64_t>(f % sz) * strides[d];
+                f /= sz;
+            }
+            return off;
+        }
         for (int d = ndim - 1; d >= 0; --d) {
             const int64_t c = flat % sizes[d];
             flat /= sizes[d];
@@ -70,6 +83,28 @@ struct StridedSpec {
         return off;
     }
 };
+
+inline StridedSpec flatten_spec(const StridedSpec& in) {
+    StridedSpec s;
+    s.offset = in.offset;
+    int64_t numel = 1;
+    for (int d = 0; d < in.ndim; ++d) {
+        numel *= in.sizes[d];
+        if (in.sizes[d] == 1) continue;
+        if (s.ndim > 0 &&
+            s.strides[s.ndim - 1] == in.strides[d] * in.sizes[d]) {
+            s.sizes[s.ndim - 1] *= in.sizes[d];
+            s.strides[s.ndim - 1] = in.strides[d];
+        } else {
+            s.sizes[s.ndim] = in.sizes[d];
+            s.strides[s.ndim] = in.strides[d];
+            ++s.ndim;
+        }
+    }
+    s.identity = s.ndim == 0 || (s.ndim == 1 && s.strides[0] == 1);
+    s.narrow = numel <= int64_t{0x7fffffff};
+    return s;
+}
 
 inline bool spec_supported(const at::Tensor& t) { return t.dim() <= kMaxDims; }
 
@@ -84,6 +119,10 @@ inline StridedSpec make_spec(const at::Tensor& t) {
         s.strides[d] = t.stride(d);
     }
     return s;
+}
+
+inline StridedSpec make_flat_spec(const at::Tensor& t) {
+    return flatten_spec(make_spec(t));
 }
 
 // -----------------------------------------------------------------------------
@@ -138,6 +177,18 @@ inline void launch_strided_store(compat::Queue& q, int64_t n, T* out,
 }
 
 
+template <typename T>
+inline T read_scalar(compat::Queue& q, const T* p) {
+    T v;
+    q.copy(&v, p, sizeof(T), true);
+    return v;
+}
+
+template <typename T>
+inline void write_scalar(compat::Queue& q, T* p, T v) {
+    q.copy(p, &v, sizeof(T), true);
+}
+
 constexpr int64_t kReducePartials = 1024;
 
 template <typename acc_t, typename Map, typename Combine>
@@ -155,23 +206,68 @@ inline acc_t reduce_full(compat::Queue& q, int64_t n, acc_t init, Map map,
             acc = combine(acc, map(i));
         partials[s] = acc;
     });
-    q.synchronize(); // partials are read on the host below
+    std::vector<acc_t> host(static_cast<std::size_t>(stripes));
+    q.copy(host.data(), partials, host.size() * sizeof(acc_t), true);
+    q.dealloc(partials);
 
     acc_t result = init;
-    for (int64_t s = 0; s < stripes; ++s) result = combine(result, partials[s]);
-    q.dealloc(partials);
+    for (const acc_t& p : host) result = combine(result, p);
     return result;
 }
 
+template <typename acc_t>
+struct StripePartials {
+    const acc_t* partials;
+    int64_t stripes;
+    PTSYCL_HOST_DEVICE acc_t operator()(int64_t o, int64_t s) const {
+        return partials[o * stripes + s];
+    }
+};
+
 template <typename acc_t, typename Map, typename Combine, typename Store>
 inline void reduce_outer(compat::Queue& q, int64_t out_n, int64_t red_n,
-                         acc_t init, Map map, Combine combine, Store store) {
+                         acc_t init, Map map, Combine combine, Store store,
+                         const at::Tensor& like, int64_t min_stripes = 1) {
     if (out_n <= 0) return;
-    compat::parallel_for(q, static_cast<std::size_t>(out_n), [=](std::size_t o) {
+
+    constexpr int64_t kTargetItems = int64_t{1} << 16;
+    constexpr int64_t kMaxSerialStripes = 1024;
+    int64_t stripes = 1;
+    if (red_n >= 64 && out_n < kTargetItems) {
+        stripes = std::min<int64_t>(red_n / 16, kTargetItems / out_n);
+    }
+    stripes = std::max<int64_t>(stripes, std::min<int64_t>(min_stripes, red_n / 16));
+    if (stripes <= 1) {
+        compat::parallel_for(q, static_cast<std::size_t>(out_n), [=](std::size_t o) {
+            acc_t acc = init;
+            for (int64_t j = 0; j < red_n; ++j)
+                acc = combine(acc, map(static_cast<int64_t>(o), j));
+            store(static_cast<int64_t>(o), acc);
+        });
+        return;
+    }
+
+    at::Tensor scratch = at::empty(
+        {static_cast<int64_t>(out_n * stripes * static_cast<int64_t>(sizeof(acc_t)))},
+        like.options().dtype(at::kByte));
+    acc_t* partials = static_cast<acc_t*>(scratch.data_ptr());
+    compat::parallel_for(q, static_cast<std::size_t>(out_n * stripes), [=](std::size_t t) {
+        const int64_t o = static_cast<int64_t>(t) / stripes;
+        const int64_t s = static_cast<int64_t>(t) % stripes;
         acc_t acc = init;
-        for (int64_t j = 0; j < red_n; ++j)
-            acc = combine(acc, map(static_cast<int64_t>(o), j));
-        store(static_cast<int64_t>(o), acc);
+        for (int64_t j = s; j < red_n; j += stripes) acc = combine(acc, map(o, j));
+        partials[t] = acc;
+    });
+    if (stripes > kMaxSerialStripes) {
+        reduce_outer<acc_t>(q, out_n, stripes, init,
+                            StripePartials<acc_t>{partials, stripes}, combine, store, like);
+        return;
+    }
+    compat::parallel_for(q, static_cast<std::size_t>(out_n), [=](std::size_t o_) {
+        const int64_t o = static_cast<int64_t>(o_);
+        acc_t acc = init;
+        for (int64_t s = 0; s < stripes; ++s) acc = combine(acc, partials[o * stripes + s]);
+        store(o, acc);
     });
 }
 

@@ -108,19 +108,15 @@ def test_index_put_accumulate_token_histogram(device):
         raise AssertionError("Token histogram (int64) accumulation mismatch against CPU reference")
 
 
-def test_index_put_accumulate_unsupported_dtypes(device):
-    # Negative test: Half, BFloat16, int8 must raise RuntimeError
+def test_index_put_accumulate_widened_dtypes(device):
     for dtype in [torch.half, torch.bfloat16, torch.int8]:
-        t = torch.zeros(10, dtype=dtype, device=device)
-        idx = torch.tensor([0, 1, 0], dtype=torch.long, device=device)
-        vals = torch.ones(3, dtype=dtype, device=device)
-        raised = False
-        try:
-            t.index_put_((idx,), vals, accumulate=True)
-        except RuntimeError:
-            raised = True
-        if not raised:
-            raise AssertionError(f"Expected RuntimeError for unsupported dtype {dtype} in accumulate=True, but none raised")
+        t = torch.zeros(10, dtype=dtype)
+        idx = torch.tensor([0, 1, 0, 9, 0], dtype=torch.long)
+        vals = torch.tensor([1, 2, 3, 4, 5], dtype=dtype)
+        ref = t.clone().index_put_((idx,), vals, accumulate=True)
+        out = t.to(device).index_put_((idx.to(device),), vals.to(device), accumulate=True)
+        if not torch.equal(out.cpu(), ref):
+            raise AssertionError(f"index_put_ accumulate mismatch for {dtype}: {out.cpu()} vs {ref}")
 
 
 def test_index_tensor(device):

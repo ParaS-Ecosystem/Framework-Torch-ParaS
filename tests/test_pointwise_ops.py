@@ -187,6 +187,24 @@ def test_argmax(device):
              lambda: torch.argmax(da, dim=1))
 
 
+def test_argmax_argmin_long_rows_ties_nan(device):
+    torch.manual_seed(0)
+    cases = [torch.randn(1, 128008), torch.randn(3, 70001).to(torch.bfloat16),
+             torch.randint(-5, 5, (4, 9000)), torch.randn(2, 33, 5)]
+    tie = torch.zeros(2, 5000); tie[:, 17] = 3.0; tie[:, 4000] = 3.0; cases.append(tie)
+    nan = torch.randn(2, 6000); nan[0, 123] = float("nan"); nan[0, 5000] = float("nan")
+    nan[1, 77] = float("inf"); cases.append(nan)
+    cases.append(torch.full((3, 2000), float("-inf")))
+    for x in cases:
+        dx = x.to(device)
+        for fn in (torch.argmax, torch.argmin):
+            assert torch.equal(fn(dx, dim=-1).cpu(), fn(x, dim=-1)), (fn.__name__, x.shape, x.dtype)
+            assert torch.equal(fn(dx, dim=-1, keepdim=True).cpu(), fn(x, dim=-1, keepdim=True))
+            assert torch.equal(fn(dx).cpu(), fn(x)), (fn.__name__, "flat", x.shape)
+            if x.dim() == 3:
+                assert torch.equal(fn(dx, dim=1).cpu(), fn(x, dim=1))
+
+
 # --- bitwise ------------------------------------------------------------------
 
 def _bool_pair(device):
@@ -500,3 +518,23 @@ def test_argsort(device):
 
 
 
+
+
+def test_safe_softmax_masked_rows_dtype_and_grad(device):
+    x = torch.randn(2, 3, 7)
+    x[0, 1, :] = float("-inf")
+    x[1, 2, :4] = float("-inf")
+    for dtype in (None, torch.float32):
+        for src in (x, x.to(torch.bfloat16)):
+            ref = torch.ops.aten._safe_softmax(src, -1, dtype)
+            out = torch.ops.aten._safe_softmax(src.to(device), -1, dtype).cpu()
+            assert out.dtype == ref.dtype
+            assert torch.equal(out[0, 1], torch.zeros_like(out[0, 1]))
+            tol = 1e-2 if src.dtype == torch.bfloat16 else 1e-6
+            torch.testing.assert_close(out.float(), ref.float(), atol=tol, rtol=tol)
+    xs = torch.randn(4, 9, requires_grad=True)
+    dxs = xs.detach().to(device).requires_grad_()
+    w = torch.randn(4, 9)
+    (torch.ops.aten._safe_softmax(xs, -1, None) * w).sum().backward()
+    (torch.ops.aten._safe_softmax(dxs, -1, None) * w.to(device)).sum().backward()
+    torch.testing.assert_close(dxs.grad.cpu(), xs.grad, atol=1e-6, rtol=1e-5)

@@ -19,6 +19,8 @@
 
 #include "core/kernels.h"
 
+#include <ATen/native/Resize.h>
+
 // NOTE: masked_fill.Scalar/.Tensor (out-of-place) and scatter.src/.value
 // (out-of-place, non-structured-delegate entry) are CompositeExplicitAutograd
 // or structured_delegate upstream -- they decompose into clone()/empty() plus
@@ -119,13 +121,14 @@ Tensor& scatter_src_out(const Tensor& self, int64_t dim, const Tensor& index,
             launch_flat(q, n, [=](std::size_t flat_) {
                 const int64_t flat    = static_cast<int64_t>(flat_);
                 const int64_t idx_off = idx_spec.index(flat);
-                const int64_t src_off = src_spec.index(flat);
 
                 int64_t rem = flat;
                 int64_t out_off = 0;
+                int64_t src_off = 0;
                 for (int dd = ndim - 1; dd >= 0; --dd) {
                     const int64_t c = rem % idx_spec.sizes[dd];
                     rem /= idx_spec.sizes[dd];
+                    src_off += c * src_spec.strides[dd];
                     if (dd != d) out_off += c * out_spec.strides[dd];
                 }
                 const int64_t sel = pidx[idx_off];
@@ -210,6 +213,167 @@ Tensor& scatter_value_(Tensor& self, int64_t dim, const Tensor& index,
     return ptsycl::scatter_value_out(self, dim, index, value, self);
 }
 
+Tensor& scatter_add_out(const Tensor& self, int64_t dim, const Tensor& index,
+                        const Tensor& src, Tensor& out) {
+    PTSYCL_TRACE_OP("scatter_add.out");
+    TORCH_CHECK(index.dim() == self.dim() && src.dim() == self.dim(),
+                "paras scatter_add: index and src must have the same rank as self");
+    TORCH_CHECK(src.scalar_type() == self.scalar_type(),
+                "paras scatter_add: src dtype must match self");
+    TORCH_CHECK(spec_supported(self) && spec_supported(index) &&
+                    spec_supported(src) && spec_supported(out),
+                "paras scatter_add: rank exceeds kernel limit");
+
+    const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+    for (int64_t i = 0; i < index.dim(); ++i) {
+        TORCH_CHECK(index.size(i) <= src.size(i) &&
+                        (i == d || index.size(i) <= self.size(i)),
+                "paras scatter_add: index shape is not compatible with src/self");
+    }
+
+    if (!out.is_same(self)) {
+        at::native::resize_output(out, self.sizes());
+        out.copy_(self);
+    }
+    Tensor idx = to_long(index);
+    const int64_t n = idx.numel();
+    if (n == 0) return out;
+
+    const c10::ScalarType st = out.scalar_type();
+    c10::ScalarType acc_t = st;
+    if (st == c10::kHalf || st == c10::kBFloat16) acc_t = c10::kFloat;
+    else if (st == c10::kBool || st == c10::kByte || st == c10::kChar ||
+             st == c10::kShort) acc_t = c10::kLong;
+
+    Tensor acc = acc_t == st ? out : out.to(acc_t);
+    Tensor s   = acc_t == st ? src : src.to(acc_t);
+
+    auto& q = queue_for(out);
+    const auto idx_spec = make_spec(idx);
+    const auto acc_spec = make_spec(acc);
+    const auto src_spec = make_spec(s);
+    const int     ndim = idx_spec.ndim;
+    const int64_t acc_dim_stride = acc.stride(d);
+
+    auto run = [&](auto tag) {
+        using scalar_t = decltype(tag);
+        scalar_t*       pacc = data_ptr<scalar_t>(acc);
+        const scalar_t* psrc = data_ptr<scalar_t>(s);
+        const int64_t*  pidx = data_ptr<int64_t>(idx);
+
+        launch_flat(q, n, [=](std::size_t flat_) {
+            const int64_t flat    = static_cast<int64_t>(flat_);
+            const int64_t idx_off = idx_spec.index(flat);
+
+            int64_t rem = flat;
+            int64_t acc_off = 0;
+            int64_t src_off = 0;
+            for (int dd = ndim - 1; dd >= 0; --dd) {
+                const int64_t c = rem % idx_spec.sizes[dd];
+                rem /= idx_spec.sizes[dd];
+                src_off += c * src_spec.strides[dd];
+                if (dd != d) acc_off += c * acc_spec.strides[dd];
+            }
+            acc_off += pidx[idx_off] * acc_dim_stride;
+            atomic_add(&pacc[acc_off], psrc[src_off]);
+        });
+    };
+    switch (acc_t) {
+    case c10::kFloat:  run(float{});   break;
+    case c10::kDouble: run(double{});  break;
+    case c10::kInt:    run(int32_t{}); break;
+    case c10::kLong:   run(int64_t{}); break;
+    default:
+        TORCH_CHECK(false, "paras scatter_add: unsupported dtype ", st);
+    }
+
+    if (!acc.is_same(out)) out.copy_(acc);
+    return out;
+}
+
+Tensor scatter_add(const Tensor& self, int64_t dim, const Tensor& index,
+                   const Tensor& src) {
+    PTSYCL_TRACE_OP("scatter_add");
+    Tensor out = self.clone();
+    return ptsycl::scatter_add_out(self, dim, index, src, out);
+}
+
+Tensor& scatter_add_(Tensor& self, int64_t dim, const Tensor& index,
+                     const Tensor& src) {
+    PTSYCL_TRACE_OP("scatter_add_");
+    return ptsycl::scatter_add_out(self, dim, index, src, self);
+}
+
+Tensor& index_add_out(const Tensor& self, int64_t dim, const Tensor& index,
+                      const Tensor& source, const c10::Scalar& alpha, Tensor& out) {
+    PTSYCL_TRACE_OP("index_add.out");
+    const int64_t d = c10::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
+    TORCH_CHECK(index.dim() <= 1, "paras index_add: index must be 0-D or 1-D");
+    TORCH_CHECK(source.scalar_type() == self.scalar_type(),
+                "paras index_add: source dtype must match self");
+    TORCH_CHECK(source.dim() == self.dim(),
+                "paras index_add: source and self must have the same rank");
+    TORCH_CHECK(self.dim() == 0 || source.size(d) == index.numel(),
+                "paras index_add: index length must match source.size(dim)");
+    TORCH_CHECK(spec_supported(self) && spec_supported(source) && spec_supported(out),
+                "paras index_add: rank exceeds kernel limit");
+
+    if (!out.is_same(self)) {
+        at::native::resize_output(out, self.sizes());
+        out.copy_(self);
+    }
+    const int64_t n = source.numel();
+    if (n == 0) return out;
+
+    const c10::ScalarType st = out.scalar_type();
+    c10::ScalarType acc_t = st;
+    if (st == c10::kHalf || st == c10::kBFloat16) acc_t = c10::kFloat;
+    else if (st == c10::kBool || st == c10::kByte || st == c10::kChar ||
+             st == c10::kShort) acc_t = c10::kLong;
+
+    Tensor acc = acc_t == st ? out : out.to(acc_t);
+    Tensor src = acc_t == st ? source : source.to(acc_t);
+    Tensor idx = to_long(index).reshape({-1}).contiguous();
+
+    auto& q = queue_for(out);
+    const auto acc_spec = make_spec(acc);
+    const auto src_spec = make_spec(src);
+    const int     ndim  = src_spec.ndim;
+    const int64_t*  pidx = data_ptr<int64_t>(idx);
+
+    auto run = [&](auto tag) {
+        using scalar_t = decltype(tag);
+        scalar_t*       pacc = data_ptr<scalar_t>(acc);
+        const scalar_t* psrc = data_ptr<scalar_t>(src);
+        const scalar_t  a    = alpha.to<scalar_t>();
+
+        launch_flat(q, n, [=](std::size_t flat_) {
+            int64_t rem = static_cast<int64_t>(flat_);
+            int64_t src_off = 0;
+            int64_t acc_off = 0;
+            for (int dd = ndim - 1; dd >= 0; --dd) {
+                const int64_t c = rem % src_spec.sizes[dd];
+                rem /= src_spec.sizes[dd];
+                src_off += c * src_spec.strides[dd];
+                acc_off += (dd == d ? pidx[c] : c) * acc_spec.strides[dd];
+            }
+            if (ndim == 0) acc_off = 0;
+            atomic_add(&pacc[acc_off], static_cast<scalar_t>(a * psrc[src_off]));
+        });
+    };
+    switch (acc_t) {
+    case c10::kFloat:  run(float{});   break;
+    case c10::kDouble: run(double{});  break;
+    case c10::kInt:    run(int32_t{}); break;
+    case c10::kLong:   run(int64_t{}); break;
+    default:
+        TORCH_CHECK(false, "paras index_add: unsupported dtype ", st);
+    }
+
+    if (!acc.is_same(out)) out.copy_(acc);
+    return out;
+}
+
 } // namespace
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -222,6 +386,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::scatter.value", &ptsycl::scatter_value);
     m.impl("aten::scatter.value_out", &ptsycl::scatter_value_out);
     m.impl("aten::scatter_.value", &ptsycl::scatter_value_);
+    m.impl("aten::scatter_add", &ptsycl::scatter_add);
+    m.impl("aten::scatter_add.out", &ptsycl::scatter_add_out);
+    m.impl("aten::scatter_add_", &ptsycl::scatter_add_);
+    m.impl("aten::index_add.out", &ptsycl::index_add_out);
 }
 
 } // namespace ptsycl

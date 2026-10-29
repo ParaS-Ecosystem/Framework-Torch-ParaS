@@ -52,6 +52,10 @@ if(PTSYCL_DEVICE STREQUAL "cpu")
 elseif(PTSYCL_DEVICE MATCHES "^sycl:(cuda:sm_[0-9]+|hip:gfx[0-9a-zA-Z]+)$")
     set(PTSYCL_FLAVOR_DEFINE PTSYCL_BACKEND_SYCL)
     set(PTSYCL_PARASDEVICE_TARGET "${CMAKE_MATCH_1}")
+    if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:gfx1[0-9]")
+        message(FATAL_ERROR "PTSYCL_DEVICE=${PTSYCL_DEVICE}: RDNA GPUs are not supported (the HIP kernels "
+                            "need 64-lane wavefronts and MFMA: AMD CDNA, e.g. sycl:hip:gfx942)")
+    endif()
     set(PTSYCL_DEVICE_FLAGS "-parasdevice;${PTSYCL_PARASDEVICE_TARGET}")
 else()
     message(FATAL_ERROR "PTSYCL_DEVICE must be 'cpu', 'sycl:cuda:sm_XX', or "
@@ -94,6 +98,7 @@ set(PTSYCL_SOURCES
     csrc/core/context.cpp
     csrc/core/allocator.cpp
     csrc/core/registration.cpp
+    csrc/core/telemetry.cpp
     csrc/ops/tensor_ops.cpp
     # Python exposes CLAP status/stats even in fast builds and with CLAP disabled.
     csrc/ops/clap_dnn_adapter.cpp
@@ -109,10 +114,10 @@ if(NOT PTSYCL_FAST_BUILD)
     csrc/ops/loss_ops.cpp
     csrc/ops/norm_ops.cpp
     csrc/ops/vision_ops.cpp
-    csrc/ops/attention_ops.cpp
     csrc/ops/rms_swiglu_ops.cpp
     csrc/ops/sort_ops.cpp
     csrc/ops/creation_ops.cpp
+    csrc/ops/sdpa_ops.cpp
     )
 else()
     message(STATUS "Fast build: only tensor_ops.cpp; other operator registrations are omitted")
@@ -133,6 +138,13 @@ if(PTSYCL_FLATTEN_HEADERS AND PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL
         list(APPEND PTSYCL_GENERATED_SOURCES "${generated}")
     endforeach()
     set(PTSYCL_SOURCES ${PTSYCL_GENERATED_SOURCES})
+endif()
+
+if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/sdpa_ops.cpp"
+        "${CMAKE_BINARY_DIR}/paras_sources/csrc/ops/sdpa_ops.cpp"
+        PROPERTIES COMPILE_OPTIONS "--gpu-max-threads-per-block=256")
 endif()
 
 add_library(torch_paras_C SHARED ${PTSYCL_SOURCES})
@@ -324,12 +336,25 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
                 "Host C++ compiler not found: ${PTSYCL_CLAP_HOST_CXX}")
         endif()
 
+        set(PTSYCL_CLAP_WRAPPER_DEFS "")
+        if(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+            set(PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_DEVICE_BACKEND_AMD")
+        elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+            set(PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_DEVICE_BACKEND_CUDA")
+        endif()
+        file(READ "${PTSYCL_CLAP_INCLUDE_DIR}/clap/blas_factory.hpp" _ptsycl_clap_blas_api)
+        if(_ptsycl_clap_blas_api MATCHES "gemm_strided_batched_bf16_device")
+            list(APPEND PTSYCL_CLAP_WRAPPER_DEFS "-DPTSYCL_CLAP_HAS_BF16_BATCHED")
+        endif()
+        message(STATUS "CLAP device GEMM: ${PTSYCL_CLAP_WRAPPER_DEFS}")
+
         add_custom_command(
             OUTPUT "${PTSYCL_CLAP_WRAPPER_OBJ}"
             COMMAND "${PTSYCL_CLAP_HOST_CXX}"
                 -std=c++17
                 -fPIC
                 -O3
+                ${PTSYCL_CLAP_WRAPPER_DEFS}
                 "-I${PTSYCL_CLAP_INCLUDE_DIR}"
                 -c
                 "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.cpp"

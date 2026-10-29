@@ -69,9 +69,8 @@ Tensor mse_loss(const Tensor& self, const Tensor& target, int64_t reduction) {
                 return d * d;
             },
             [](double a, double b) { return a + b; });
-        q.synchronize();
-        *data_ptr<scalar_t>(out) =
-            static_cast<scalar_t>(r * mean_scale(reduction, n));
+        write_scalar(q, data_ptr<scalar_t>(out),
+                     static_cast<scalar_t>(r * mean_scale(reduction, n)));
     });
     return out;
 }
@@ -159,9 +158,8 @@ Tensor binary_cross_entropy(const Tensor& self, const Tensor& target,
                 return v;
             },
             [](double a, double b) { return a + b; });
-        q.synchronize();
-        *data_ptr<scalar_t>(out) =
-            static_cast<scalar_t>(r * mean_scale(reduction, n));
+        write_scalar(q, data_ptr<scalar_t>(out),
+                     static_cast<scalar_t>(r * mean_scale(reduction, n)));
     });
     return out;
 }
@@ -256,8 +254,7 @@ std::tuple<Tensor&, Tensor&> nll_loss_forward_out(
                 po[i] = static_cast<scalar_t>(
                     -wv * static_cast<double>(px[i * C + ti]));
             });
-            q.synchronize();
-            *data_ptr<scalar_t>(total_weight) = static_cast<scalar_t>(0);
+            write_scalar(q, data_ptr<scalar_t>(total_weight), static_cast<scalar_t>(0));
             return;
         }
 
@@ -284,8 +281,8 @@ std::tuple<Tensor&, Tensor&> nll_loss_forward_out(
         double result = loss_sum;
         if (reduction == at::Reduction::Mean)
             result = weight_sum > 0 ? loss_sum / weight_sum : 0.0;
-        *data_ptr<scalar_t>(output) = static_cast<scalar_t>(result);
-        *data_ptr<scalar_t>(total_weight) = static_cast<scalar_t>(weight_sum);
+        write_scalar(q, data_ptr<scalar_t>(output), static_cast<scalar_t>(result));
+        write_scalar(q, data_ptr<scalar_t>(total_weight), static_cast<scalar_t>(weight_sum));
     });
     return {output, total_weight};
 }
@@ -310,13 +307,12 @@ Tensor& nll_loss_backward_out(const Tensor& grad_output, const Tensor& self,
         const scalar_t* pw = has_w ? data_ptr<scalar_t>(w) : nullptr;
         scalar_t* pg = data_ptr<scalar_t>(grad_input);
 
-        q.synchronize(); // host reads of small scalars below
-        double tw = static_cast<double>(*data_ptr<scalar_t>(total_weight));
+        double tw = static_cast<double>(read_scalar(q, data_ptr<scalar_t>(total_weight)));
         double g0 = 0.0;
         Tensor go = grad_output.contiguous();
         const scalar_t* pgo = data_ptr<scalar_t>(go);
         const bool per_element = (reduction == at::Reduction::None);
-        if (!per_element) g0 = static_cast<double>(pgo[0]);
+        if (!per_element) g0 = static_cast<double>(read_scalar(q, pgo));
         const bool mean_red = (reduction == at::Reduction::Mean);
 
         launch_flat(q, N, [=](std::size_t i) {

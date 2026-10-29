@@ -22,6 +22,8 @@
 #include "core/kernels.h"
 #include "ops/clap_dnn_adapter.h"
 
+#include <ATen/native/Resize.h>
+
 namespace ptsycl {
 namespace {
 
@@ -40,8 +42,8 @@ void unary_kernel(const Tensor& a, Tensor& out, Fn fn) {
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, ae.scalar_type(), "ptsycl_unary", [&] {
-            const auto sa = make_spec(ae);
-            const auto so = make_spec(out);
+            const auto sa = make_flat_spec(ae);
+            const auto so = make_flat_spec(out);
             const scalar_t* pa = data_ptr<scalar_t>(ae);
             scalar_t* po = data_ptr<scalar_t>(out);
             launch_flat(q, n, [=](std::size_t idx) {
@@ -70,9 +72,9 @@ void binary_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, ae.scalar_type(), "ptsycl_binary", [&] {
-            const auto sa = make_spec(ae);
-            const auto sb = make_spec(be);
-            const auto so = make_spec(out);
+            const auto sa = make_flat_spec(ae);
+            const auto sb = make_flat_spec(be);
+            const auto so = make_flat_spec(out);
             const scalar_t* pa = data_ptr<scalar_t>(ae);
             const scalar_t* pb = data_ptr<scalar_t>(be);
             scalar_t* po = data_ptr<scalar_t>(out);
@@ -100,9 +102,9 @@ void compare_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
 
     AT_DISPATCH_ALL_TYPES_AND3(
         c10::kBool, c10::kHalf, c10::kBFloat16, ae.scalar_type(), "ptsycl_compare", [&] {
-            const auto sa = make_spec(ae);
-            const auto sb = make_spec(be);
-            const auto so = make_spec(out);
+            const auto sa = make_flat_spec(ae);
+            const auto sb = make_flat_spec(be);
+            const auto so = make_flat_spec(out);
             const scalar_t* pa = data_ptr<scalar_t>(ae);
             const scalar_t* pb = data_ptr<scalar_t>(be);
             bool* po = data_ptr<bool>(out);
@@ -149,6 +151,8 @@ ReduceShape split_dims(const Tensor& self, c10::ArrayRef<int64_t> dims) {
             rs.out_n *= self.size(d);
         }
     }
+    rs.kept = flatten_spec(rs.kept);
+    rs.red  = flatten_spec(rs.red);
     return rs;
 }
 
@@ -182,11 +186,11 @@ void reduce_dims_typed(compat::Queue& q, const in_t* in,
         case ReduceKind::Max:  init = std::numeric_limits<acc_t>::lowest(); break;
     }
 
-    AT_DISPATCH_ALL_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, out_view.scalar_type(),
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, out_view.scalar_type(),
         "ptsycl_reduce_store", [&] {
             using out_t = scalar_t;
-            const auto so = make_spec(out_view);
+            const auto so = make_flat_spec(out_view);
             out_t* po = data_ptr<out_t>(out_view);
             const int k = static_cast<int>(kind);
             const auto combine = [=](acc_t a, acc_t b) {
@@ -198,30 +202,17 @@ void reduce_dims_typed(compat::Queue& q, const in_t* in,
                 }
             };
 
-            if (rs.out_n <= 64 && red_n >= (int64_t{1} << 16)) {
-                for (int64_t o = 0; o < rs.out_n; ++o) {
-                    const acc_t r = reduce_full<acc_t>(
-                        q, red_n, init,
-                        [=](int64_t j) {
-                            return static_cast<acc_t>(
-                                in[kept.index(o) + red.index(j)]);
-                        },
-                        combine);
-                    // reduce_full synchronizes, so a host-side store is safe.
-                    po[so.index(o)] = static_cast<out_t>(r);
-                }
-            } else {
-                reduce_outer<acc_t>(
-                    q, rs.out_n, red_n, init,
-                    [=](int64_t o, int64_t j) {
-                        return static_cast<acc_t>(
-                            in[kept.index(o) + red.index(j)]);
-                    },
-                    combine,
-                    [=](int64_t o, acc_t acc) {
-                        po[so.index(o)] = static_cast<out_t>(acc);
-                    });
-            }
+            reduce_outer<acc_t>(
+                q, rs.out_n, red_n, init,
+                [=](int64_t o, int64_t j) {
+                    return static_cast<acc_t>(
+                        in[kept.index(o) + red.index(j)]);
+                },
+                combine,
+                [=](int64_t o, acc_t acc) {
+                    po[so.index(o)] = static_cast<out_t>(acc);
+                },
+                out_view);
         });
 }
 
@@ -234,10 +225,10 @@ void reduce_dims_op(const Tensor& self, c10::ArrayRef<int64_t> dims,
     TORCH_CHECK(out_view.numel() == rs.out_n,
                 "paras reduce: unexpected output shape");
 
-    AT_DISPATCH_ALL_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_reduce", [&] {
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_reduce", [&] {
             const scalar_t* in = data_ptr<scalar_t>(self);
-            if (c10::isIntegralType(self.scalar_type(), /*bool=*/false)) {
+            if (c10::isIntegralType(self.scalar_type(), true)) {
                 reduce_dims_typed<scalar_t, int64_t>(q, in, rs, out_view, kind);
             } else {
                 reduce_dims_typed<scalar_t, double>(q, in, rs, out_view, kind);
@@ -479,6 +470,12 @@ Tensor& silu_backward_out(const Tensor& grad_output, const Tensor& self,
     return grad_input;
 }
 
+Tensor silu_backward(const Tensor& grad_output, const Tensor& self) {
+    Tensor grad_input = at::empty(self.sizes(),
+        grad_output.options().dtype(at::result_type(grad_output, self)));
+    return silu_backward_out(grad_output, self, grad_input);
+}
+
 Tensor hardtanh(const Tensor& self, const c10::Scalar& min_val,
                 const c10::Scalar& max_val) {
     Tensor out = at::empty_like(self);
@@ -709,9 +706,9 @@ void bitwise_kernel(const Tensor& a, const Tensor& b, Tensor& out, Fn fn) {
     Tensor be = to_compute(b, out.scalar_type(), out.device()).expand_as(out);
     AT_DISPATCH_INTEGRAL_TYPES_AND(
         c10::kBool, out.scalar_type(), "ptsycl_bitwise", [&] {
-            const auto sa = make_spec(ae);
-            const auto sb = make_spec(be);
-            const auto so = make_spec(out);
+            const auto sa = make_flat_spec(ae);
+            const auto sb = make_flat_spec(be);
+            const auto so = make_flat_spec(out);
             const scalar_t* pa = data_ptr<scalar_t>(ae);
             const scalar_t* pb = data_ptr<scalar_t>(be);
             scalar_t* po = data_ptr<scalar_t>(out);
@@ -824,8 +821,8 @@ Tensor reduce_all_to_scalar(const Tensor& self, ReduceKind kind) {
     TORCH_CHECK(n > 0, "reduction over empty tensor is not defined");
     Tensor out = at::empty({}, self.options());
 
-    AT_DISPATCH_ALL_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_reduce_all",
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_reduce_all",
         [&] {
             const scalar_t* in = data_ptr<scalar_t>(self_c);
             const int k = static_cast<int>(kind);
@@ -847,9 +844,7 @@ Tensor reduce_all_to_scalar(const Tensor& self, ReduceKind kind) {
                         default: return a > b ? a : b;
                     }
                 });
-            scalar_t* po = data_ptr<scalar_t>(out);
-            q.synchronize();
-            *po = static_cast<scalar_t>(r);
+            write_scalar(q, data_ptr<scalar_t>(out), static_cast<scalar_t>(r));
         });
     return out;
 }
@@ -877,17 +872,21 @@ Tensor dot(const Tensor& self, const Tensor& other) {
                            static_cast<double>(pb[i]);
                 },
                 [](double x, double y) { return x + y; });
-            q.synchronize();
-            *data_ptr<scalar_t>(out) = static_cast<scalar_t>(r);
+            write_scalar(q, data_ptr<scalar_t>(out), static_cast<scalar_t>(r));
         });
     return out;
 }
 
-Tensor& argmax_out(const Tensor& self, std::optional<int64_t> dim,
-                   bool keepdim, Tensor& out) {
-    PTSYCL_TRACE_OP("argmax.out");
-    TORCH_CHECK(out.scalar_type() == c10::kLong,
-                "argmax output must be int64");
+struct ArgAcc {
+    double v;
+    int64_t i;
+};
+
+template <bool kMax>
+Tensor& arg_reduce_out(const char* name, const Tensor& self,
+                       std::optional<int64_t> dim, bool keepdim, Tensor& out) {
+    TORCH_CHECK(out.scalar_type() == c10::kLong, name, " output must be int64");
+    TORCH_CHECK(self.numel() > 0, name, ": expected a non-empty tensor");
     auto& q = queue_for(self);
 
     Tensor src = dim.has_value() ? self : self.reshape({self.numel()});
@@ -898,30 +897,48 @@ Tensor& argmax_out(const Tensor& self, std::optional<int64_t> dim,
     Tensor out_view = dim.has_value()
                           ? squeeze_out(out, src, {d}, keepdim)
                           : out;
-    TORCH_CHECK(out_view.numel() == rs.out_n,
-                "argmax: unexpected output shape");
+    TORCH_CHECK(out_view.numel() == rs.out_n, name, ": unexpected output shape");
 
     AT_DISPATCH_ALL_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_argmax", [&] {
+        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_arg_reduce", [&] {
             const scalar_t* in = data_ptr<scalar_t>(src);
             const auto kept = rs.kept;
             const auto red  = rs.red;
-            const auto so   = make_spec(out_view);
+            const auto so   = make_flat_spec(out_view);
             int64_t* po = data_ptr<int64_t>(out_view);
-            const int64_t red_n = rs.red_n;
-            launch_flat(q, rs.out_n, [=](std::size_t o) {
-                const int64_t base = kept.index(static_cast<int64_t>(o));
-                double best = -std::numeric_limits<double>::infinity();
-                int64_t best_j = 0;
-                for (int64_t j = 0; j < red_n; ++j) {
-                    const double v =
-                        static_cast<double>(in[base + red.index(j)]);
-                    if (v > best) { best = v; best_j = j; }
-                }
-                po[so.index(static_cast<int64_t>(o))] = best_j;
-            });
+            const ArgAcc init{kMax ? -std::numeric_limits<double>::infinity()
+                                   : std::numeric_limits<double>::infinity(),
+                              std::numeric_limits<int64_t>::max()};
+            reduce_outer<ArgAcc>(
+                q, rs.out_n, rs.red_n, init,
+                [=](int64_t o, int64_t j) {
+                    return ArgAcc{static_cast<double>(in[kept.index(o) + red.index(j)]), j};
+                },
+                [](ArgAcc a, ArgAcc b) {
+                    const bool a_nan = a.v != a.v, b_nan = b.v != b.v;
+                    if (a_nan || b_nan) {
+                        if (a_nan && b_nan) return a.i < b.i ? a : b;
+                        return a_nan ? a : b;
+                    }
+                    if (a.v == b.v) return a.i < b.i ? a : b;
+                    return (kMax ? a.v > b.v : a.v < b.v) ? a : b;
+                },
+                [=](int64_t o, ArgAcc acc) { po[so.index(o)] = acc.i; },
+                self);
         });
     return out;
+}
+
+Tensor& argmax_out(const Tensor& self, std::optional<int64_t> dim,
+                   bool keepdim, Tensor& out) {
+    PTSYCL_TRACE_OP("argmax.out");
+    return arg_reduce_out<true>("argmax", self, dim, keepdim, out);
+}
+
+Tensor& argmin_out(const Tensor& self, std::optional<int64_t> dim,
+                   bool keepdim, Tensor& out) {
+    PTSYCL_TRACE_OP("argmin.out");
+    return arg_reduce_out<false>("argmin", self, dim, keepdim, out);
 }
 
 // --- softmax --------------------------------------------------------------------
@@ -931,15 +948,26 @@ Tensor& argmax_out(const Tensor& self, std::optional<int64_t> dim,
 // StridedSpec split as the reductions above, computed separately for the
 // input and output tensors since they can have different strides (and, in
 // the half_to_float case, different dtypes/sizes-in-bytes).
-Tensor& softmax_out(const Tensor& self, int64_t dim, bool /*half_to_float*/,
-                    Tensor& out) {
-    PTSYCL_TRACE_OP("_softmax.out");
+struct MaxSumD {
+    double m;
+    double s;
+};
+
+static Tensor& softmax_impl(const Tensor& self, int64_t dim, bool safe,
+                            Tensor& out) {
     auto& q = queue_for(self);
     const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
     const auto rs_in  = split_dims(self, {d});
     const auto rs_out = split_dims(out, {d});
     TORCH_CHECK(rs_in.out_n == rs_out.out_n && rs_in.red_n == rs_out.red_n,
                 "paras softmax: output shape must match input shape");
+    const int64_t red_n = rs_in.red_n;
+    const int64_t out_n = rs_in.out_n;
+    if (out_n == 0 || red_n == 0) return out;
+    constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+
+    Tensor stats = at::empty({out_n * 2}, self.options().dtype(c10::kDouble));
+    double* st = stats.data_ptr<double>();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_softmax_in",
@@ -948,8 +976,20 @@ Tensor& softmax_out(const Tensor& self, int64_t dim, bool /*half_to_float*/,
             const in_t* pin = data_ptr<in_t>(self);
             const auto kin = rs_in.kept;
             const auto rin = rs_in.red;
-            const int64_t red_n = rs_in.red_n;
-            const int64_t out_n = rs_in.out_n;
+
+            reduce_outer<MaxSumD>(
+                q, out_n, red_n, MaxSumD{kNegInf, 0.0},
+                [=](int64_t o, int64_t j) {
+                    return MaxSumD{static_cast<double>(pin[kin.index(o) + rin.index(j)]), 1.0};
+                },
+                [](MaxSumD x, MaxSumD y) {
+                    if (x.m == kNegInf) return y;
+                    if (y.m == kNegInf) return x;
+                    const double m = x.m > y.m ? x.m : y.m;
+                    return MaxSumD{m, x.s * ::exp(x.m - m) + y.s * ::exp(y.m - m)};
+                },
+                [=](int64_t o, MaxSumD acc) { st[2 * o] = acc.m; st[2 * o + 1] = acc.s; },
+                self, 32);
 
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 c10::kHalf, c10::kBFloat16, out.scalar_type(),
@@ -958,34 +998,47 @@ Tensor& softmax_out(const Tensor& self, int64_t dim, bool /*half_to_float*/,
                     out_t* pout = data_ptr<out_t>(out);
                     const auto kout = rs_out.kept;
                     const auto rout = rs_out.red;
-
-                    launch_flat(q, out_n, [=](std::size_t o_) {
-                        const int64_t o = static_cast<int64_t>(o_);
-                        const int64_t base_in  = kin.index(o);
-                        const int64_t base_out = kout.index(o);
-
-                        double m = -std::numeric_limits<double>::infinity();
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double v = static_cast<double>(
-                                pin[base_in + rin.index(j)]);
-                            if (v > m) m = v;
+                    const bool narrow = out_n * red_n <= int64_t{0x7fffffff};
+                    launch_flat(q, out_n * red_n, [=](std::size_t t) {
+                        int64_t o, j;
+                        if (narrow) {
+                            const uint32_t t32 = static_cast<uint32_t>(t);
+                            const uint32_t r32 = static_cast<uint32_t>(red_n);
+                            o = t32 / r32;
+                            j = t32 % r32;
+                        } else {
+                            o = static_cast<int64_t>(t) / red_n;
+                            j = static_cast<int64_t>(t) % red_n;
                         }
-                        double sum = 0.0;
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double v = static_cast<double>(
-                                pin[base_in + rin.index(j)]);
-                            sum += std::exp(v - m);
+                        const double m = st[2 * o];
+                        double r;
+                        if (m == kNegInf) {
+                            r = safe ? 0.0 : std::numeric_limits<double>::quiet_NaN();
+                        } else {
+                            const double v = static_cast<double>(pin[kin.index(o) + rin.index(j)]);
+                            r = ::exp(v - m) / st[2 * o + 1];
                         }
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double v = static_cast<double>(
-                                pin[base_in + rin.index(j)]);
-                            pout[base_out + rout.index(j)] =
-                                static_cast<out_t>(std::exp(v - m) / sum);
-                        }
+                        pout[kout.index(o) + rout.index(j)] = static_cast<out_t>(r);
                     });
                 });
         });
     return out;
+}
+
+Tensor& softmax_out(const Tensor& self, int64_t dim, bool ,
+                    Tensor& out) {
+    PTSYCL_TRACE_OP("_softmax.out");
+    return softmax_impl(self, dim, false, out);
+}
+
+Tensor safe_softmax(const Tensor& self, int64_t dim,
+                    std::optional<c10::ScalarType> dtype) {
+    PTSYCL_TRACE_OP("_safe_softmax");
+    const Tensor in = dtype.has_value() && *dtype != self.scalar_type()
+                          ? self.to(*dtype)
+                          : self;
+    Tensor out = at::empty(in.sizes(), in.options());
+    return softmax_impl(in, dim, true, out);
 }
 
 Tensor softmax(const Tensor& self, int64_t dim, bool half_to_float) {
@@ -1084,6 +1137,12 @@ Tensor& log_softmax_out(const Tensor& self, int64_t dim,
     const auto rs_out = split_dims(out, {d});
     TORCH_CHECK(rs_in.out_n == rs_out.out_n && rs_in.red_n == rs_out.red_n,
                 "paras log_softmax: output shape must match input shape");
+    const int64_t red_n = rs_in.red_n;
+    const int64_t out_n = rs_in.out_n;
+    if (out_n == 0 || red_n == 0) return out;
+    constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+    Tensor stats = at::empty({out_n * 2}, self.options().dtype(c10::kDouble));
+    double* st = stats.data_ptr<double>();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, self.scalar_type(),
@@ -1092,8 +1151,19 @@ Tensor& log_softmax_out(const Tensor& self, int64_t dim,
             const in_t* pin = data_ptr<in_t>(self);
             const auto kin = rs_in.kept;
             const auto rin = rs_in.red;
-            const int64_t red_n = rs_in.red_n;
-            const int64_t out_n = rs_in.out_n;
+            reduce_outer<MaxSumD>(
+                q, out_n, red_n, MaxSumD{kNegInf, 0.0},
+                [=](int64_t o, int64_t j) {
+                    return MaxSumD{static_cast<double>(pin[kin.index(o) + rin.index(j)]), 1.0};
+                },
+                [](MaxSumD x, MaxSumD y) {
+                    if (x.m == kNegInf) return y;
+                    if (y.m == kNegInf) return x;
+                    const double m = x.m > y.m ? x.m : y.m;
+                    return MaxSumD{m, x.s * ::exp(x.m - m) + y.s * ::exp(y.m - m)};
+                },
+                [=](int64_t o, MaxSumD acc) { st[2 * o] = acc.m; st[2 * o + 1] = ::log(acc.s); },
+                self, 32);
 
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 c10::kHalf, c10::kBFloat16, out.scalar_type(),
@@ -1102,31 +1172,12 @@ Tensor& log_softmax_out(const Tensor& self, int64_t dim,
                     out_t* pout = data_ptr<out_t>(out);
                     const auto kout = rs_out.kept;
                     const auto rout = rs_out.red;
-
-                    launch_flat(q, out_n, [=](std::size_t o_) {
-                        const int64_t o = static_cast<int64_t>(o_);
-                        const int64_t base_in  = kin.index(o);
-                        const int64_t base_out = kout.index(o);
-
-                        double m = -std::numeric_limits<double>::infinity();
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double v = static_cast<double>(
-                                pin[base_in + rin.index(j)]);
-                            if (v > m) m = v;
-                        }
-                        double sum = 0.0;
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double v = static_cast<double>(
-                                pin[base_in + rin.index(j)]);
-                            sum += std::exp(v - m);
-                        }
-                        const double log_sum = std::log(sum);
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double v = static_cast<double>(
-                                pin[base_in + rin.index(j)]);
-                            pout[base_out + rout.index(j)] =
-                                static_cast<out_t>(v - m - log_sum);
-                        }
+                    launch_flat(q, out_n * red_n, [=](std::size_t t) {
+                        const int64_t o = static_cast<int64_t>(t) / red_n;
+                        const int64_t j = static_cast<int64_t>(t) % red_n;
+                        const double v = static_cast<double>(pin[kin.index(o) + rin.index(j)]);
+                        pout[kout.index(o) + rout.index(j)] =
+                            static_cast<out_t>(v - st[2 * o] - st[2 * o + 1]);
                     });
                 });
         });
@@ -1156,6 +1207,11 @@ Tensor& log_softmax_backward_out(const Tensor& grad_output,
                     rs_go.out_n == rs_gi.out_n &&
                     rs_go.red_n == rs_gi.red_n,
                 "paras log_softmax backward: shape mismatch");
+    const int64_t red_n = rs_go.red_n;
+    const int64_t out_n = rs_go.out_n;
+    if (out_n == 0 || red_n == 0) return grad_input;
+    Tensor sums = at::empty({out_n}, grad_output.options().dtype(c10::kDouble));
+    double* ps = sums.data_ptr<double>();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, grad_output.scalar_type(),
@@ -1167,8 +1223,12 @@ Tensor& log_softmax_backward_out(const Tensor& grad_output,
             const auto rgo = rs_go.red;
             const auto ky  = rs_y.kept;
             const auto ry  = rs_y.red;
-            const int64_t red_n = rs_go.red_n;
-            const int64_t out_n = rs_go.out_n;
+            reduce_outer<double>(
+                q, out_n, red_n, 0.0,
+                [=](int64_t o, int64_t j) { return static_cast<double>(pgo[kgo.index(o) + rgo.index(j)]); },
+                [](double x, double y) { return x + y; },
+                [=](int64_t o, double acc) { ps[o] = acc; },
+                grad_output, 32);
 
             AT_DISPATCH_FLOATING_TYPES_AND2(
                 c10::kHalf, c10::kBFloat16, grad_input.scalar_type(),
@@ -1177,26 +1237,12 @@ Tensor& log_softmax_backward_out(const Tensor& grad_output,
                     gi_t* pgi = data_ptr<gi_t>(grad_input);
                     const auto kgi = rs_gi.kept;
                     const auto rgi = rs_gi.red;
-
-                    launch_flat(q, out_n, [=](std::size_t o_) {
-                        const int64_t o = static_cast<int64_t>(o_);
-                        const int64_t base_go = kgo.index(o);
-                        const int64_t base_y  = ky.index(o);
-                        const int64_t base_gi = kgi.index(o);
-
-                        double sum_dy = 0.0;
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            sum_dy += static_cast<double>(
-                                pgo[base_go + rgo.index(j)]);
-                        }
-                        for (int64_t j = 0; j < red_n; ++j) {
-                            const double dy = static_cast<double>(
-                                pgo[base_go + rgo.index(j)]);
-                            const double y = static_cast<double>(
-                                py[base_y + ry.index(j)]);
-                            pgi[base_gi + rgi.index(j)] = static_cast<gi_t>(
-                                dy - std::exp(y) * sum_dy);
-                        }
+                    launch_flat(q, out_n * red_n, [=](std::size_t t) {
+                        const int64_t o = static_cast<int64_t>(t) / red_n;
+                        const int64_t j = static_cast<int64_t>(t) % red_n;
+                        const double dy = static_cast<double>(pgo[kgo.index(o) + rgo.index(j)]);
+                        const double y = static_cast<double>(py[ky.index(o) + ry.index(j)]);
+                        pgi[kgi.index(o) + rgi.index(j)] = static_cast<gi_t>(dy - ::exp(y) * ps[o]);
                     });
                 });
         });
@@ -1322,11 +1368,10 @@ std::tuple<Tensor&, Tensor&> topk_out(const Tensor& self, c10::SymInt k_sym,
     const int64_t out_n = rs_in.out_n;
     if (out_n == 0 || k == 0) return {values, indices};
 
-    Tensor cpu_in = self.to(at::kCPU).contiguous();
-    auto [cpu_vals, cpu_idxs] = at::topk(
-        cpu_in, k, d, largest, /*sorted=*/true);
-    values.copy_(cpu_vals.to(self.device()));
-    indices.copy_(cpu_idxs.to(self.device()));
+    Tensor order = at::argsort(self, true, d, largest)
+                       .narrow(d, 0, k);
+    values.copy_(self.gather(d, order));
+    indices.copy_(order);
     return {values, indices};
 }
 
@@ -1399,11 +1444,9 @@ std::tuple<Tensor&, Tensor&> sort_out(
     const int64_t out_n = rs_in.out_n;
     if (out_n == 0 || rs_in.red_n == 0) return {values, indices};
 
-    Tensor cpu_in = self.to(at::kCPU).contiguous();
-    auto [cpu_vals, cpu_idxs] = at::sort(
-        cpu_in, /*stable=*/stable_opt.value_or(false), d, descending);
-    values.copy_(cpu_vals.to(self.device()));
-    indices.copy_(cpu_idxs.to(self.device()));
+    Tensor order = at::argsort(self, stable_opt.value_or(false), d, descending);
+    values.copy_(self.gather(d, order));
+    indices.copy_(order);
     return {values, indices};
 }
 
@@ -1484,6 +1527,334 @@ Tensor cat(const at::ITensorListRef& tensors, int64_t dim) {
 //                             /*sorted=*/true, values, indices);
 // }
 
+
+Tensor& logical_not_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("logical_not.out");
+    at::native::resize_output(out, self.sizes());
+    if (out.scalar_type() == c10::kBool) {
+        compare_kernel(self, wrap_scalar(0, self), out,
+                       [](double x, double y) { return x == y; });
+        return out;
+    }
+    Tensor mask = at::empty(out.sizes(), out.options().dtype(c10::kBool));
+    compare_kernel(self, wrap_scalar(0, self), mask,
+                   [](double x, double y) { return x == y; });
+    out.copy_(mask);
+    return out;
+}
+
+Tensor& isneginf_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("isneginf.out");
+    at::native::resize_output(out, self.sizes());
+    compare_kernel(self, self, out, [](double x, double) {
+        return x == -std::numeric_limits<double>::infinity();
+    });
+    return out;
+}
+
+Tensor& isposinf_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("isposinf.out");
+    at::native::resize_output(out, self.sizes());
+    compare_kernel(self, self, out, [](double x, double) {
+        return x == std::numeric_limits<double>::infinity();
+    });
+    return out;
+}
+
+Tensor& any_all_reduce(const Tensor& self, Tensor& out, bool is_all) {
+    at::native::resize_output(out, {});
+    if (self.numel() == 0) {
+        out.fill_(is_all);
+        return out;
+    }
+    Tensor flags = self.ne(0).to(c10::kByte);
+    Tensor r = at::empty({}, flags.options());
+    reduce_dims_op(flags, all_dims(flags), false, r,
+                   is_all ? ReduceKind::Min : ReduceKind::Max);
+    out.copy_(r);
+    return out;
+}
+
+Tensor& any_all_dims(const Tensor& self, c10::IntArrayRef dims_in, bool keepdim,
+                     Tensor& out, bool is_all) {
+    std::vector<int64_t> dims = dims_in.empty()
+        ? all_dims(self)
+        : std::vector<int64_t>(dims_in.begin(), dims_in.end());
+    std::vector<int64_t> out_sizes;
+    std::vector<bool> reduced(self.dim(), false);
+    for (int64_t d : dims) reduced[c10::maybe_wrap_dim(d, self.dim())] = true;
+    for (int64_t d = 0; d < self.dim(); ++d) {
+        if (!reduced[d]) out_sizes.push_back(self.size(d));
+        else if (keepdim) out_sizes.push_back(1);
+    }
+    at::native::resize_output(out, out_sizes);
+    if (out.numel() == 0) return out;
+    if (self.numel() == 0) {
+        out.fill_(is_all);
+        return out;
+    }
+    Tensor flags = self.ne(0).to(c10::kByte);
+    Tensor r = at::empty(out_sizes, flags.options());
+    reduce_dims_op(flags, dims, keepdim, r, is_all ? ReduceKind::Min : ReduceKind::Max);
+    out.copy_(r);
+    return out;
+}
+
+Tensor& any_dim_out(const Tensor& self, int64_t dim, bool keepdim, Tensor& out) {
+    PTSYCL_TRACE_OP("any.out");
+    return any_all_dims(self, {dim}, keepdim, out, false);
+}
+
+Tensor& all_dim_out(const Tensor& self, int64_t dim, bool keepdim, Tensor& out) {
+    PTSYCL_TRACE_OP("all.out");
+    return any_all_dims(self, {dim}, keepdim, out, true);
+}
+
+Tensor& any_dims_out(const Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
+                     Tensor& out) {
+    PTSYCL_TRACE_OP("any.dims_out");
+    return any_all_dims(self, dim.value_or(c10::IntArrayRef{}), keepdim, out, false);
+}
+
+Tensor& all_dims_out(const Tensor& self, at::OptionalIntArrayRef dim, bool keepdim,
+                     Tensor& out) {
+    PTSYCL_TRACE_OP("all.dims_out");
+    return any_all_dims(self, dim.value_or(c10::IntArrayRef{}), keepdim, out, true);
+}
+
+Tensor& any_all_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("any.all_out");
+    return any_all_reduce(self, out, false);
+}
+
+Tensor& all_all_out(const Tensor& self, Tensor& out) {
+    PTSYCL_TRACE_OP("all.all_out");
+    return any_all_reduce(self, out, true);
+}
+
+Tensor& isin_out(const Tensor& elements, const Tensor& test_elements,
+                 bool , bool invert, Tensor& out) {
+    PTSYCL_TRACE_OP("isin.Tensor_Tensor_out");
+    TORCH_CHECK(out.scalar_type() == c10::kBool, "paras isin: out must be bool");
+    at::native::resize_output(out, elements.sizes());
+    auto& q = queue_for(out);
+    const int64_t n = elements.numel();
+    if (n == 0) return out;
+    const auto common = at::result_type(elements, test_elements);
+    Tensor e = to_compute(elements, common, out.device()).contiguous();
+    Tensor t = to_compute(test_elements, common, out.device()).reshape({-1}).contiguous();
+    const int64_t m = t.numel();
+    Tensor dst = out.is_contiguous() ? out : at::empty(out.sizes(), out.options());
+
+    AT_DISPATCH_ALL_TYPES_AND3(
+        c10::kBool, c10::kHalf, c10::kBFloat16, common, "ptsycl_isin", [&] {
+            const scalar_t* pe = data_ptr<scalar_t>(e);
+            const scalar_t* pt = data_ptr<scalar_t>(t);
+            bool* po = data_ptr<bool>(dst);
+            launch_flat(q, n, [=](std::size_t i_) {
+                const int64_t i = static_cast<int64_t>(i_);
+                bool found = false;
+                for (int64_t j = 0; j < m && !found; ++j) {
+                    if constexpr (std::is_integral_v<scalar_t>)
+                        found = static_cast<int64_t>(pe[i]) == static_cast<int64_t>(pt[j]);
+                    else
+                        found = static_cast<double>(pe[i]) == static_cast<double>(pt[j]);
+                }
+                po[i] = found != invert;
+            });
+        });
+    if (!dst.is_same(out)) out.copy_(dst);
+    return out;
+}
+
+Tensor& floor_divide_out(const Tensor& self, const Tensor& other, Tensor& out) {
+    PTSYCL_TRACE_OP("floor_divide.out");
+    at::native::resize_output(out, at::infer_size(self.sizes(), other.sizes()));
+    binary_kernel(self, other, out,
+                  [](double x, double y) { return ::floor(x / y); });
+    return out;
+}
+
+Tensor floor_divide(const Tensor& self, const Tensor& other) {
+    PTSYCL_TRACE_OP("floor_divide");
+    const auto dtype = at::result_type(self, other);
+    Tensor out = at::empty(at::infer_size(self.sizes(), other.sizes()),
+                           self.options().dtype(dtype));
+    return ptsycl::floor_divide_out(self, other, out);
+}
+
+Tensor& floor_divide_(Tensor& self, const Tensor& other) {
+    PTSYCL_TRACE_OP("floor_divide_.Tensor");
+    return ptsycl::floor_divide_out(self, other, self);
+}
+
+Tensor& linalg_vector_norm_out(const Tensor& self, const c10::Scalar& ord,
+                               at::OptionalIntArrayRef dim, bool keepdim,
+                               std::optional<c10::ScalarType> dtype, Tensor& out) {
+    PTSYCL_TRACE_OP("linalg_vector_norm.out");
+    c10::ScalarType acc = dtype.value_or(self.scalar_type());
+    if (acc == c10::kHalf || acc == c10::kBFloat16) acc = c10::kFloat;
+    TORCH_CHECK(c10::isFloatingType(acc), "paras vector_norm: floating input required");
+    std::vector<int64_t> dims = dim.has_value() && !dim->empty()
+        ? std::vector<int64_t>(dim->begin(), dim->end())
+        : all_dims(self);
+    const double p = ord.toDouble();
+    if (p != 0.0 && !std::isinf(p) && c10::isFloatingType(self.scalar_type())) {
+        std::vector<int64_t> shape;
+        std::vector<bool> reduced(self.dim(), false);
+        for (int64_t d : dims) reduced[c10::maybe_wrap_dim(d, self.dim())] = true;
+        for (int64_t d = 0; d < self.dim(); ++d)
+            if (!reduced[d]) shape.push_back(self.size(d));
+            else if (keepdim) shape.push_back(1);
+        at::native::resize_output(out, shape);
+        auto& q = queue_for(self);
+        const auto rs = split_dims(self, dims);
+        Tensor out_view = squeeze_out(out, self, dims, keepdim);
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_vector_norm", [&] {
+                const scalar_t* in = data_ptr<scalar_t>(self);
+                const auto kept = rs.kept;
+                const auto red = rs.red;
+                AT_DISPATCH_FLOATING_TYPES_AND2(
+                    c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_vector_norm_out", [&] {
+                    using out_t = scalar_t;
+                    const auto so = make_flat_spec(out_view);
+                    out_t* po = data_ptr<out_t>(out_view);
+                    reduce_outer<double>(
+                        q, rs.out_n, rs.red_n, 0.0,
+                        [=](int64_t o, int64_t j) {
+                            const double v = ::fabs(static_cast<double>(in[kept.index(o) + red.index(j)]));
+                            return p == 2.0 ? v * v : p == 1.0 ? v : ::pow(v, p);
+                        },
+                        [](double a, double b) { return a + b; },
+                        [=](int64_t o, double acc_v) {
+                            po[so.index(o)] = static_cast<out_t>(
+                                p == 2.0 ? ::sqrt(acc_v) : p == 1.0 ? acc_v : ::pow(acc_v, 1.0 / p));
+                        },
+                        self);
+                });
+            });
+        return out;
+    }
+    Tensor x = self.to(acc).abs();
+    Tensor r;
+    if (p == 2.0) {
+        r = at::sum(x * x, dims, keepdim).sqrt();
+    } else if (p == 1.0) {
+        r = at::sum(x, dims, keepdim);
+    } else if (p == 0.0) {
+        r = at::sum(x.ne(0).to(acc), dims, keepdim);
+    } else if (std::isinf(p)) {
+        r = p > 0 ? at::amax(x, dims, keepdim) : at::amin(x, dims, keepdim);
+    } else {
+        r = at::pow(at::sum(at::pow(x, p), dims, keepdim), 1.0 / p);
+    }
+    at::native::resize_output(out, r.sizes());
+    out.copy_(r);
+    return out;
+}
+
+#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+constexpr int64_t kForeachChunk = int64_t{1} << 20;
+constexpr int64_t kForeachLanes = 64;
+template <typename T> class ForeachNormChunks;
+template <typename T> class ForeachNormFinish;
+
+bool foreach_norm_fused(c10::ArrayRef<Tensor> tensors, double p, c10::ScalarType out_dt,
+                        std::vector<Tensor>& result) {
+    if (tensors.empty() || p == 0.0 || std::isinf(p)) return false;
+    const auto dt = tensors[0].scalar_type();
+    const auto dev = tensors[0].device();
+    if (!c10::isFloatingType(dt) || !queue_for(tensors[0]).is_gpu()) return false;
+    for (const auto& t : tensors)
+        if (t.scalar_type() != dt || t.device() != dev || !t.is_contiguous()) return false;
+
+    const int64_t n = static_cast<int64_t>(tensors.size());
+    std::vector<int64_t> ptrs(n), first(n + 1), chunk_tensor, chunk_start;
+    for (int64_t i = 0; i < n; ++i) {
+        ptrs[i] = reinterpret_cast<int64_t>(tensors[i].data_ptr());
+        first[i] = static_cast<int64_t>(chunk_tensor.size());
+        for (int64_t s0 = 0; s0 < tensors[i].numel(); s0 += kForeachChunk) {
+            chunk_tensor.push_back(i);
+            chunk_start.push_back(s0);
+        }
+    }
+    first[n] = static_cast<int64_t>(chunk_tensor.size());
+    const int64_t K = first[n];
+    std::vector<int64_t> numel(n);
+    for (int64_t i = 0; i < n; ++i) numel[i] = tensors[i].numel();
+    std::vector<int64_t> meta;
+    meta.reserve(3 * n + 1 + 2 * K);
+    meta.insert(meta.end(), ptrs.begin(), ptrs.end());
+    meta.insert(meta.end(), numel.begin(), numel.end());
+    meta.insert(meta.end(), first.begin(), first.end());
+    meta.insert(meta.end(), chunk_tensor.begin(), chunk_tensor.end());
+    meta.insert(meta.end(), chunk_start.begin(), chunk_start.end());
+    Tensor dmeta = at::from_blob(meta.data(), {static_cast<int64_t>(meta.size())}, at::kLong)
+                       .to(tensors[0].options().dtype(at::kLong));
+    const int64_t* pm = data_ptr<int64_t>(dmeta);
+    const int64_t* d_ptrs = pm;
+    const int64_t* d_numel = pm + n;
+    const int64_t* d_first = pm + 2 * n;
+    const int64_t* d_ct = pm + 3 * n + 1;
+    const int64_t* d_cs = d_ct + K;
+
+    Tensor partial = at::zeros({std::max<int64_t>(K, 1)}, tensors[0].options().dtype(at::kDouble));
+    double* pp = partial.data_ptr<double>();
+    Tensor out = at::empty({n}, tensors[0].options().dtype(out_dt));
+    auto& q = queue_for(tensors[0]);
+    AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, dt, "ptsycl_foreach_norm", [&] {
+        if (K > 0) {
+            q.sycl_queue().template parallel_for<ForeachNormChunks<scalar_t>>(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(K * kForeachLanes)),
+                                  sycl::range<1>(static_cast<std::size_t>(kForeachLanes))),
+                [=](sycl::nd_item<1> it) {
+                    const auto sg = it.get_sub_group();
+                    const int64_t k = static_cast<int64_t>(it.get_group(0));
+                    const int64_t t = d_ct[k];
+                    const scalar_t* x = reinterpret_cast<const scalar_t*>(d_ptrs[t]);
+                    const int64_t end = d_cs[k] + kForeachChunk < d_numel[t] ? d_cs[k] + kForeachChunk : d_numel[t];
+                    double acc = 0.0;
+                    for (int64_t j = d_cs[k] + static_cast<int64_t>(it.get_local_id(0)); j < end; j += kForeachLanes) {
+                        const double v = ::fabs(static_cast<double>(x[j]));
+                        acc += p == 2.0 ? v * v : p == 1.0 ? v : ::pow(v, p);
+                    }
+                    acc = sycl::reduce_over_group(sg, acc, sycl::plus<double>());
+                    if (it.get_local_id(0) == 0) pp[k] = acc;
+                });
+        }
+        AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, out_dt, "ptsycl_foreach_norm_out", [&] {
+            using out_t = scalar_t;
+            out_t* po = data_ptr<out_t>(out);
+            compat::parallel_for(q, static_cast<std::size_t>(n), [=](std::size_t i) {
+                double acc = 0.0;
+                for (int64_t k = d_first[i]; k < d_first[i + 1]; ++k) acc += pp[k];
+                po[i] = static_cast<out_t>(p == 2.0 ? ::sqrt(acc) : p == 1.0 ? acc : ::pow(acc, 1.0 / p));
+            });
+        });
+    });
+    result.clear();
+    for (int64_t i = 0; i < n; ++i) result.push_back(out[i]);
+    return true;
+}
+#endif
+
+std::vector<Tensor> foreach_norm(at::TensorList tensors, const c10::Scalar& ord,
+                                 std::optional<c10::ScalarType> dtype) {
+    PTSYCL_TRACE_OP("_foreach_norm.Scalar");
+    std::vector<Tensor> result;
+    const double p = ord.toDouble();
+#if defined(PTSYCL_BACKEND_SYCL) && PARAS_HIP_BACKEND
+    if (!tensors.empty()) {
+        const auto out_dt = dtype.value_or(tensors[0].scalar_type());
+        if (foreach_norm_fused(tensors, p, out_dt, result)) return result;
+    }
+#endif
+    for (const auto& t : tensors)
+        result.push_back(at::linalg_vector_norm(t, ord, at::OptionalIntArrayRef{}, false, dtype));
+    return result;
+}
+
 } // namespace
 } // namespace ptsycl
 
@@ -1529,6 +1900,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::tanh_backward.grad_input", &ptsycl::tanh_backward_out);
     m.impl("aten::silu.out", &ptsycl::silu_out);
     m.impl("aten::silu_backward.grad_input", &ptsycl::silu_backward_out);
+    m.impl("aten::silu_backward", &ptsycl::silu_backward);
     m.impl("aten::hardtanh", &ptsycl::hardtanh);
     m.impl("aten::hardtanh_", &ptsycl::hardtanh_);
     m.impl("aten::hardtanh_backward", &ptsycl::hardtanh_backward);
@@ -1581,6 +1953,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::amax.out", &ptsycl::amax_out);
     m.impl("aten::amin.out", &ptsycl::amin_out);
     m.impl("aten::argmax.out", &ptsycl::argmax_out);
+    m.impl("aten::argmin.out", &ptsycl::argmin_out);
     m.impl("aten::min", &ptsycl::min);
     m.impl("aten::max", &ptsycl::max);
     m.impl("aten::dot", &ptsycl::dot);
@@ -1588,6 +1961,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::cat.out", &ptsycl::cat_out);
     m.impl("aten::cat", &ptsycl::cat);
     m.impl("aten::_softmax", &ptsycl::softmax);
+    m.impl("aten::_safe_softmax", &ptsycl::safe_softmax);
     m.impl("aten::_softmax.out", &ptsycl::softmax_out);
     m.impl("aten::_softmax_backward_data", &ptsycl::softmax_backward);
     m.impl("aten::_softmax_backward_data.out",
@@ -1610,5 +1984,21 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("aten::sort.stable", &ptsycl::sort_stable);
     m.impl("aten::sort.values", &ptsycl::sort_out_default);
     m.impl("aten::sort.values_stable", &ptsycl::sort_out);
+
+    m.impl("aten::logical_not.out", &ptsycl::logical_not_out);
+    m.impl("aten::isneginf.out", &ptsycl::isneginf_out);
+    m.impl("aten::isposinf.out", &ptsycl::isposinf_out);
+    m.impl("aten::any.all_out", &ptsycl::any_all_out);
+    m.impl("aten::all.all_out", &ptsycl::all_all_out);
+    m.impl("aten::any.out", &ptsycl::any_dim_out);
+    m.impl("aten::all.out", &ptsycl::all_dim_out);
+    m.impl("aten::any.dims_out", &ptsycl::any_dims_out);
+    m.impl("aten::all.dims_out", &ptsycl::all_dims_out);
+    m.impl("aten::isin.Tensor_Tensor_out", &ptsycl::isin_out);
+    m.impl("aten::floor_divide", &ptsycl::floor_divide);
+    m.impl("aten::floor_divide.out", &ptsycl::floor_divide_out);
+    m.impl("aten::floor_divide_.Tensor", &ptsycl::floor_divide_);
+    m.impl("aten::linalg_vector_norm.out", &ptsycl::linalg_vector_norm_out);
+    m.impl("aten::_foreach_norm.Scalar", &ptsycl::foreach_norm);
 
 }

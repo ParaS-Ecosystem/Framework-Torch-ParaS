@@ -26,6 +26,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
+#include <dlfcn.h>
+#endif
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -97,6 +100,31 @@ std::vector<sycl::device>& device_table() {
     static std::vector<sycl::device> table;
     return table;
 }
+
+int vendor_visible_gpu_count() {
+#if PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND
+#if PARAS_HIP_BACKEND
+    const char* libs[] = {"libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"};
+    const char* symbol = "hipGetDeviceCount";
+#else
+    const char* libs[] = {"libcudart.so", "libcudart.so.12", "libcudart.so.11.0"};
+    const char* symbol = "cudaGetDeviceCount";
+#endif
+    void* handle = nullptr;
+    for (const char* lib : libs)
+        if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+    for (const char* lib : libs)
+        if (handle == nullptr) handle = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
+    if (handle != nullptr) {
+        using CountFn = int (*)(int*);
+        auto count_fn = reinterpret_cast<CountFn>(dlsym(handle, symbol));
+        int count = 0;
+        if (count_fn != nullptr && count_fn(&count) == 0) return count;
+        return -1;
+    }
+#endif
+    return -1;
+}
 } // namespace
 
 sycl::device& device_by_native_id(int native_id) {
@@ -116,6 +144,7 @@ void Queue::init(const DeviceInfo& dev) {
     native_id_ = dev.native_id;
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
+        ::setenv("PARAS_ASYNC_KERNELS", "1", 0);
         sycl::device& device = device_by_native_id(native_id_);
         try {
             auto impl = std::make_unique<Impl>();
@@ -150,6 +179,9 @@ std::vector<DeviceInfo> enumerate_devices() {
     auto& table = device_table();
     table.clear();
     auto gpus = sycl::device::get_devices(sycl::info::device_type::gpu);
+    const int visible = vendor_visible_gpu_count();
+    if (visible >= 0 && static_cast<std::size_t>(visible) < gpus.size())
+        gpus.resize(static_cast<std::size_t>(visible));
     for (std::size_t i = 0; i < gpus.size(); ++i) {
         DeviceInfo gpu;
         gpu.name          = gpus[i].get_info<sycl::info::device::name>();
@@ -237,10 +269,10 @@ void* Queue::alloc(std::size_t nbytes) {
 #if defined(PTSYCL_BACKEND_SYCL)
     if (is_gpu_) {
         void* p = static_cast<void*>(
-            sycl::malloc_shared<std::byte>(nbytes, sycl_queue()));
+            sycl::malloc_device<std::byte>(nbytes, sycl_queue()));
         if (p == nullptr) {
             std::ostringstream os;
-            os << "sycl::malloc_shared(" << nbytes << " bytes) on device "
+            os << "sycl::malloc_device(" << nbytes << " bytes) on device "
                << native_id_ << " failed";
             fail(os.str());
         }
@@ -296,6 +328,23 @@ void Queue::synchronize() {
     if (is_gpu_) {
         sycl_queue().wait();
     }
+#endif
+}
+
+bool Queue::run_native(const std::function<void(void* native_stream)>& fn) {
+#if defined(PTSYCL_BACKEND_SYCL) && (PARAS_HIP_BACKEND || PARAS_CUDA_BACKEND)
+    if (!is_gpu_) return false;
+    sycl_queue().parasSYCL_enqueue_custom_operation([&](sycl::interop_handle ih) {
+#if PARAS_HIP_BACKEND
+        fn(static_cast<void*>(ih.get_native_queue<sycl::backend::hip>()));
+#else
+        fn(static_cast<void*>(ih.get_native_queue<sycl::backend::cuda>()));
+#endif
+    });
+    return true;
+#else
+    (void)fn;
+    return false;
 #endif
 }
 

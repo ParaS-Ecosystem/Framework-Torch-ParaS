@@ -71,9 +71,7 @@ fi
     -DPTSYCL_CUDA_HOME="${PTSYCL_CUDA_HOME:-}" \
     -DPython3_EXECUTABLE="${PTSYCL_PYTHON}"
 
-# parascc names its /tmp intermediates with second resolution; parallel
-# compiles would race on them, so the build is serial by design.
-"${CMAKE_BIN}" --build "${BUILD_DIR}" -- -j1
+"${CMAKE_BIN}" --build "${BUILD_DIR}" -j"${PTSYCL_BUILD_JOBS:-$(nproc)}"
 
 cp "${BUILD_DIR}/lib/_C.so" "${REPO_ROOT}/python/torch_paras/_C.so"
 echo "[build.sh] installed ${FLAVOR} flavor -> python/torch_paras/_C.so"

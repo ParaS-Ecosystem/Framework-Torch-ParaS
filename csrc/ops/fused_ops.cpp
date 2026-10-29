@@ -44,6 +44,9 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
                                     double eps) {
     PTSYCL_TRACE_OP("paras::rms_norm");
     TORCH_CHECK(spec_supported(input), "paras rms_norm: rank exceeds kernel limit");
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type(),
+                "paras rms_norm: weight dtype ", weight.scalar_type(),
+                " must match input dtype ", input.scalar_type());
 
     Tensor in = input.contiguous();
     Tensor w  = weight.contiguous();
@@ -57,31 +60,40 @@ std::tuple<Tensor, Tensor> rms_norm(const Tensor& input, const Tensor& weight,
     if (rows == 0 || H == 0) return {out, rstd};
 
     auto& q = queue_for(in);
+    float* pr = data_ptr<float>(rstd);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, in.scalar_type(), "ptsycl_rms_norm", [&] {
             const scalar_t* pin  = data_ptr<scalar_t>(in);
             const scalar_t* pw   = data_ptr<scalar_t>(w);
             scalar_t*       pout = data_ptr<scalar_t>(out);
-            float*          pr   = data_ptr<float>(rstd);
+            const double inv_h = 1.0 / static_cast<double>(H);
+            const double eps32 = static_cast<double>(static_cast<float>(eps));
 
-            launch_flat(q, rows, [=](std::size_t r_) {
-                const int64_t r = static_cast<int64_t>(r_);
-                const scalar_t* row_in  = pin + r * H;
-                scalar_t*       row_out = pout + r * H;
+            reduce_outer<double>(
+                q, rows, H, 0.0,
+                [=](int64_t r, int64_t j) {
+                    const double x = static_cast<double>(
+                        static_cast<float>(static_cast<double>(pin[r * H + j])));
+                    return static_cast<double>(static_cast<float>(::pow(x, 2.0)));
+                },
+                [](double a, double b) { return a + b; },
+                [=](int64_t r, double sum) {
+                    const float mean = static_cast<float>(
+                        static_cast<double>(static_cast<float>(sum)) * inv_h);
+                    const float var = static_cast<float>(static_cast<double>(mean) + eps32);
+                    pr[r] = static_cast<float>(1.0 / ::sqrt(static_cast<double>(var)));
+                },
+                rstd);
 
-                double ss = 0.0;
-                for (int64_t j = 0; j < H; ++j) {
-                    const double v = static_cast<double>(row_in[j]);
-                    ss += v * v;
-                }
-                const double rms = 1.0 / ::sqrt(ss / static_cast<double>(H) + eps);
-                pr[r] = static_cast<float>(rms);
-
-                for (int64_t j = 0; j < H; ++j) {
-                    row_out[j] = static_cast<scalar_t>(
-                        static_cast<double>(row_in[j]) * rms *
-                        static_cast<double>(pw[j]));
-                }
+            launch_flat(q, rows * H, [=](std::size_t idx) {
+                const int64_t i = static_cast<int64_t>(idx);
+                const int64_t r = i / H;
+                const float x = static_cast<float>(static_cast<double>(pin[i]));
+                const float n = static_cast<float>(
+                    static_cast<double>(x) * static_cast<double>(pr[r]));
+                const scalar_t nb = static_cast<scalar_t>(n);
+                pout[i] = static_cast<scalar_t>(
+                    static_cast<double>(pw[i % H]) * static_cast<double>(nb));
             });
         });
     return {out, rstd};
@@ -92,6 +104,9 @@ std::tuple<Tensor, Tensor> rms_norm_backward(const Tensor& grad_out,
                                              const Tensor& weight,
                                              const Tensor& rstd) {
     PTSYCL_TRACE_OP("paras::rms_norm_backward");
+    TORCH_CHECK(grad_out.scalar_type() == input.scalar_type() &&
+                    weight.scalar_type() == input.scalar_type(),
+                "paras rms_norm_backward: grad_out, input and weight must share a dtype");
     Tensor go = grad_out.contiguous();
     Tensor in = input.contiguous();
     Tensor w  = weight.contiguous();
@@ -103,66 +118,58 @@ std::tuple<Tensor, Tensor> rms_norm_backward(const Tensor& grad_out,
     if (rows == 0 || H == 0) return {grad_input, grad_weight};
 
     auto& q = queue_for(in);
+    Tensor dots = at::empty({rows}, in.options().dtype(c10::kDouble));
+    double* pd = data_ptr<double>(dots);
+    const float* pr = data_ptr<float>(rstd);
     AT_DISPATCH_FLOATING_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, in.scalar_type(), "ptsycl_rms_norm_bwd_dx",
-        [&] {
+        c10::kHalf, c10::kBFloat16, in.scalar_type(), "ptsycl_rms_norm_bwd", [&] {
             const scalar_t* pin = data_ptr<scalar_t>(in);
             const scalar_t* pgo = data_ptr<scalar_t>(go);
             const scalar_t* pw  = data_ptr<scalar_t>(w);
-            const float*    pr  = data_ptr<float>(rstd);
             scalar_t*       pgi = data_ptr<scalar_t>(grad_input);
-
-            launch_flat(q, rows, [=](std::size_t r_) {
-                const int64_t r = static_cast<int64_t>(r_);
-                const scalar_t* row_x = pin + r * H;
-                const scalar_t* row_g = pgo + r * H;
-                scalar_t*       row_i = pgi + r * H;
-                const double rr = static_cast<double>(pr[r]);
-
-                double dot = 0.0;
-                for (int64_t j = 0; j < H; ++j)
-                    dot += static_cast<double>(row_g[j]) *
-                           static_cast<double>(pw[j]) *
-                           static_cast<double>(row_x[j]);
-                const double coef = rr * rr * rr / static_cast<double>(H);
-
-                for (int64_t j = 0; j < H; ++j) {
-                    const double gj = static_cast<double>(row_g[j]);
-                    const double wj = static_cast<double>(pw[j]);
-                    const double xj = static_cast<double>(row_x[j]);
-                    row_i[j] = static_cast<scalar_t>(gj * wj * rr - coef * xj * dot);
-                }
-            });
-        });
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, in.scalar_type(), "ptsycl_rms_norm_bwd_dw",
-        [&] {
-            const scalar_t* pin = data_ptr<scalar_t>(in);
-            const scalar_t* pgo = data_ptr<scalar_t>(go);
-            const float*    pr  = data_ptr<float>(rstd);
             scalar_t*       pgw = data_ptr<scalar_t>(grad_weight);
 
-            launch_flat(q, H, [=](std::size_t j_) {
-                const int64_t j = static_cast<int64_t>(j_);
-                double acc = 0.0;
-                for (int64_t r = 0; r < rows; ++r)
-                    acc += static_cast<double>(pgo[r * H + j]) *
-                           static_cast<double>(pin[r * H + j]) *
-                           static_cast<double>(pr[r]);
-                pgw[j] = static_cast<scalar_t>(acc);
+            reduce_outer<double>(
+                q, rows, H, 0.0,
+                [=](int64_t r, int64_t j) {
+                    const int64_t i = r * H + j;
+                    return static_cast<double>(pgo[i]) * static_cast<double>(pw[j]) *
+                           static_cast<double>(pin[i]);
+                },
+                [](double a, double b) { return a + b; },
+                [=](int64_t r, double dot) { pd[r] = dot; },
+                dots);
+
+            launch_flat(q, rows * H, [=](std::size_t idx) {
+                const int64_t i = static_cast<int64_t>(idx);
+                const int64_t r = i / H;
+                const double rr = static_cast<double>(pr[r]);
+                const double coef = rr * rr * rr / static_cast<double>(H);
+                pgi[i] = static_cast<scalar_t>(
+                    static_cast<double>(pgo[i]) * static_cast<double>(pw[i % H]) * rr -
+                    coef * static_cast<double>(pin[i]) * pd[r]);
             });
+
+            reduce_outer<double>(
+                q, H, rows, 0.0,
+                [=](int64_t j, int64_t r) {
+                    const int64_t i = r * H + j;
+                    return static_cast<double>(pgo[i]) * static_cast<double>(pin[i]) *
+                           static_cast<double>(pr[r]);
+                },
+                [](double a, double b) { return a + b; },
+                [=](int64_t j, double acc) { pgw[j] = static_cast<scalar_t>(acc); },
+                grad_weight);
         });
     return {grad_input, grad_weight};
 }
 
-// -----------------------------------------------------------------------------
-// swiglu: silu(gate) * up, fused into a single kernel each way.
-// -----------------------------------------------------------------------------
 Tensor swiglu(const Tensor& gate, const Tensor& up) {
     PTSYCL_TRACE_OP("paras::swiglu");
     TORCH_CHECK(gate.sizes() == up.sizes(),
                 "paras swiglu: gate and up must have the same shape");
+    TORCH_CHECK(gate.scalar_type() == up.scalar_type(),
+                "paras swiglu: gate and up must have the same dtype");
     TORCH_CHECK(spec_supported(gate) && spec_supported(up),
                 "paras swiglu: rank exceeds kernel limit");
 
@@ -175,9 +182,9 @@ Tensor swiglu(const Tensor& gate, const Tensor& up) {
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, out.scalar_type(), "ptsycl_swiglu", [&] {
-            const auto sg = make_spec(ge);
-            const auto su = make_spec(ue);
-            const auto so = make_spec(out);
+            const auto sg = make_flat_spec(ge);
+            const auto su = make_flat_spec(ue);
+            const auto so = make_flat_spec(out);
             const scalar_t* pg = data_ptr<scalar_t>(ge);
             const scalar_t* pu = data_ptr<scalar_t>(ue);
             scalar_t*       po = data_ptr<scalar_t>(out);
@@ -185,9 +192,9 @@ Tensor swiglu(const Tensor& gate, const Tensor& up) {
             launch_flat(q, n, [=](std::size_t idx) {
                 const int64_t i = static_cast<int64_t>(idx);
                 const double g = static_cast<double>(pg[sg.index(i)]);
-                const double s = g / (1.0 + ::exp(-g));
-                po[so.index(i)] =
-                    static_cast<scalar_t>(s * static_cast<double>(pu[su.index(i)]));
+                const scalar_t s = static_cast<scalar_t>(g / (1.0 + ::exp(-g)));
+                po[so.index(i)] = static_cast<scalar_t>(
+                    static_cast<double>(s) * static_cast<double>(pu[su.index(i)]));
             });
         });
     return out;
@@ -196,6 +203,9 @@ Tensor swiglu(const Tensor& gate, const Tensor& up) {
 std::tuple<Tensor, Tensor> swiglu_backward(const Tensor& grad_out,
                                            const Tensor& gate, const Tensor& up) {
     PTSYCL_TRACE_OP("paras::swiglu_backward");
+    TORCH_CHECK(grad_out.scalar_type() == gate.scalar_type() &&
+                    up.scalar_type() == gate.scalar_type(),
+                "paras swiglu_backward: grad_out, gate and up must share a dtype");
     Tensor grad_gate = at::empty_like(gate);
     Tensor grad_up   = at::empty_like(up);
     auto& q = queue_for(grad_gate);
@@ -246,8 +256,8 @@ Tensor rotate_half(const Tensor& x) {
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, x.scalar_type(), "ptsycl_rotate_half", [&] {
-            const auto sx = make_spec(x);
-            const auto so = make_spec(out);
+            const auto sx = make_flat_spec(x);
+            const auto so = make_flat_spec(out);
             const scalar_t* px = data_ptr<scalar_t>(x);
             scalar_t*       po = data_ptr<scalar_t>(out);
 
@@ -282,8 +292,8 @@ Tensor rotate_half_backward(const Tensor& grad_out) {
     AT_DISPATCH_FLOATING_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, grad_out.scalar_type(),
         "ptsycl_rotate_half_bwd", [&] {
-            const auto sg = make_spec(grad_out);
-            const auto so = make_spec(grad_in);
+            const auto sg = make_flat_spec(grad_out);
+            const auto so = make_flat_spec(grad_in);
             const scalar_t* pg = data_ptr<scalar_t>(grad_out);
             scalar_t*       po = data_ptr<scalar_t>(grad_in);
 

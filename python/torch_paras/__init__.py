@@ -51,6 +51,10 @@ __all__ = [
     "device_name",
     "backend_name",
     "get_amp_supported_dtype",
+    "runtime_stats",
+    "reset_runtime_stats",
+    "set_strict",
+    "is_strict",
     "nn",
 ]
 
@@ -113,6 +117,32 @@ def memory_cached(device: int = 0) -> int:
 
 def get_amp_supported_dtype() -> list[torch.dtype]:
     return [torch.float16, torch.float32]
+
+
+def runtime_stats() -> dict:
+    """Execution counters since start-up or the last reset_runtime_stats().
+
+    ``cpu_fallbacks`` maps each operator that ran on the boxed CPU fallback
+    (no ParaS kernel) to its call count. The copy counters cover every tensor
+    transfer between a paras device and host memory, including transfers
+    made inside operator implementations; ``scalar_reads`` counts
+    single-value reads such as ``tensor.item()``.
+    """
+    return _C.runtime_stats()
+
+
+def reset_runtime_stats() -> None:
+    _C.reset_runtime_stats()
+
+
+def set_strict(enabled: bool = True) -> None:
+    """Make operators without a ParaS kernel raise instead of falling back to
+    the CPU. Also enabled at start-up by ``PTSYCL_STRICT=1``."""
+    _C.set_strict(bool(enabled))
+
+
+def is_strict() -> bool:
+    return _C.strict()
 
 
 def _register() -> None:

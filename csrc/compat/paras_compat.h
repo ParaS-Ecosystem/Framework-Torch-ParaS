@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -41,7 +42,8 @@
 #if (defined(PTSYCL_BACKEND_CUDA) || defined(PTSYCL_BACKEND_SYCL)) && \
     (defined(__CUDACC__) || defined(__CUDA__))
 #define PTSYCL_HOST_DEVICE __host__ __device__
-#elif defined(PTSYCL_BACKEND_HIP) && (defined(__HIPCC__) || defined(__HIP__))
+#elif (defined(PTSYCL_BACKEND_HIP) || defined(PTSYCL_BACKEND_SYCL)) && \
+    (defined(__HIPCC__) || defined(__HIP__))
 #define PTSYCL_HOST_DEVICE __host__ __device__
 #else
 #define PTSYCL_HOST_DEVICE
@@ -99,6 +101,8 @@ public:
     void copy(void* dst, const void* src, std::size_t nbytes, bool blocking);
     void memset(void* ptr, int value, std::size_t nbytes);
     void synchronize();
+
+    bool run_native(const std::function<void(void* native_stream)>& fn);
 
 #if defined(PTSYCL_BACKEND_SYCL)
     // Queue ownership and construction remain in paras_compat.cpp.

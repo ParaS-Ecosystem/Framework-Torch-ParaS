@@ -27,42 +27,36 @@
 // against launch_flat without knowing whether this queue type supports
 // shared/local memory or cross-thread sync within a launch.
 //
-// So this file deliberately splits by flavor:
-//   - PTSYCL_BACKEND_CPU: launch_flat still runs one thread per *row*
-//     (not per element), and each thread does a real std::stable_sort /
-//     std::sort with a heap-allocated buffer -- perfectly fine, this is
-//     plain host C++ under the kem threadpool, same as any OpenMP kernel.
-//   - PTSYCL_BACKEND_CUDA / PTSYCL_BACKEND_HIP: heap allocation and
-//     std::sort inside device code are not something I can assume this
-//     toolchain supports. What's below is a bounded insertion sort over
-//     a fixed-size *local* array (no heap, no exceptions), capped by
-//     PTSYCL_ARGSORT_MAX_LEN and enforced with a TORCH_CHECK. This is a
-//     correctness stopgap, O(len^2) per row and one row per thread, not
-//     a real GPU sort -- if `self.size(dim)` exceeds the cap, or if rows
-//     are large enough that per-row O(len^2) actually matters for your
-//     workloads, this needs a proper parallel sort (thrust::sort_by_key
-//     if CUDA thrust is linkable here, or a bitonic sort using whatever
-//     shared-memory primitive ParaS exposes) before it's production-
-//     ready. Grep for an existing aten::sort registration first, too --
-//     if one exists, it may already have solved this properly and
-//     argsort should be wired to call it (via at::sort) instead of
-//     duplicating a sort implementation here.
+// So this file splits by flavor:
+//   - PTSYCL_BACKEND_CPU: launch_flat runs one thread per *row* (not per
+//     element), and each thread does a std::sort with a heap-allocated
+//     buffer -- plain host C++ under the kem threadpool.
+//   - PTSYCL_BACKEND_SYCL (GPU): a batched bitonic sort. Rows are padded to
+//     a power of two and every compare-exchange stage is one launch_flat over
+//     all padded elements, so there is no per-row length limit and no
+//     thread-local storage. O(n log^2 n) work.
+// Both flavours share one total order (exact keys, NaN largest, ties by
+// position), so results are identical across devices and always stable.
 // -----------------------------------------------------------------------------
 
 #include "core/kernels.h"
 
 #include <algorithm>
 #include <numeric>
+#include <type_traits>
 #include <vector>
 
-#ifndef PTSYCL_ARGSORT_MAX_LEN
-#define PTSYCL_ARGSORT_MAX_LEN 4096
-#endif
 
 namespace ptsycl {
 namespace {
 
 using at::Tensor;
+
+#if !defined(PTSYCL_BACKEND_CPU)
+constexpr int64_t kRankSortMaxLen = 2048;
+constexpr int64_t kBitonicLocalBlock = 1024;
+template <typename T> class BitonicLocalStages;
+#endif
 
 // Row layout shared by both flavors: given `self` and a (already
 // wrapped) `dim`, a "row" is one 1-D slice along `dim`; there are
@@ -126,12 +120,30 @@ Tensor argsort_stable(const Tensor& self, bool stable, int64_t dim, bool descend
     const int64_t dim_stride = layout.dim_stride;
     const int64_t out_dim_stride = out.stride(d);
 
-#if defined(PTSYCL_BACKEND_CPU)
+#define PTSYCL_ARGSORT_BEFORE(KEY_OF)                                         \
+    [=](int64_t a, int64_t b) {                                               \
+        if (a < 0) return false;                                              \
+        if (b < 0) return true;                                               \
+        const auto ka = KEY_OF(a);                                            \
+        const auto kb = KEY_OF(b);                                            \
+        const bool a_nan = ka != ka;                                          \
+        const bool b_nan = kb != kb;                                          \
+        if (a_nan || b_nan) {                                                 \
+            if (a_nan && b_nan) return a < b;                                 \
+            return descending ? a_nan : b_nan;                                \
+        }                                                                     \
+        if (ka != kb) return descending ? ka > kb : ka < kb;                  \
+        return a < b;                                                         \
+    }
+
     AT_DISPATCH_ALL_TYPES_AND2(
         c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_argsort", [&] {
+            using key_t = std::conditional_t<std::is_integral_v<scalar_t>, int64_t, double>;
             const scalar_t* pin = data_ptr<scalar_t>(self);
             int64_t*        pout = data_ptr<int64_t>(out);
 
+#if defined(PTSYCL_BACKEND_CPU)
+            (void)stable;
             launch_flat(q, layout.num_rows, [=](std::size_t row_) {
                 const int64_t row = static_cast<int64_t>(row_);
 
@@ -148,84 +160,185 @@ Tensor argsort_stable(const Tensor& self, bool stable, int64_t dim, bool descend
                 };
                 const int64_t in_base  = base_offset(self_spec, row);
                 const int64_t out_base = base_offset(out_spec, row);
+                const scalar_t* base = pin + in_base;
+
+                auto key_of = [=](int64_t e) {
+                    if constexpr (std::is_same_v<scalar_t, double>)
+                        return base[e * dim_stride];
+                    else if constexpr (std::is_integral_v<scalar_t>)
+                        return static_cast<key_t>(base[e * dim_stride]);
+                    else
+                        return static_cast<key_t>(static_cast<float>(base[e * dim_stride]));
+                };
+                auto before = PTSYCL_ARGSORT_BEFORE(key_of);
 
                 std::vector<int64_t> idx(dim_size);
                 std::iota(idx.begin(), idx.end(), int64_t{0});
-                const scalar_t* base = pin + in_base;
-                auto cmp = [&](int64_t a, int64_t b) {
-                    const float va = static_cast<float>(base[a * dim_stride]);
-                    const float vb = static_cast<float>(base[b * dim_stride]);
-                    return descending ? va > vb : va < vb;
-                };
-                if (stable) std::stable_sort(idx.begin(), idx.end(), cmp);
-                else        std::sort(idx.begin(), idx.end(), cmp);
+                std::sort(idx.begin(), idx.end(), before);
 
                 for (int64_t e = 0; e < dim_size; ++e)
                     pout[out_base + e * out_dim_stride] = idx[e];
             });
-        });
 #else
-    TORCH_CHECK(dim_size <= PTSYCL_ARGSORT_MAX_LEN,
-                "paras argsort: dim size ", dim_size, " exceeds the CUDA/HIP "
-                "reference kernel's fixed-buffer cap of ", PTSYCL_ARGSORT_MAX_LEN,
-                " (see the note at the top of sort_ops.cpp -- this flavor needs "
-                "a real parallel sort for rows this large)");
-
-    AT_DISPATCH_ALL_TYPES_AND2(
-        c10::kHalf, c10::kBFloat16, self.scalar_type(), "ptsycl_argsort", [&] {
-            const scalar_t* pin = data_ptr<scalar_t>(self);
-            int64_t*        pout = data_ptr<int64_t>(out);
-
-            launch_flat(q, layout.num_rows, [=](std::size_t row_) {
-                const int64_t row = static_cast<int64_t>(row_);
-
-                auto base_offset = [](const RowSpec& s, int64_t r) {
-                    int64_t rem = r;
-                    int64_t off = 0;
-                    for (int dd = s.ndim - 1; dd >= 0; --dd) {
-                        if (dd == s.skip_dim) continue;
-                        const int64_t c = rem % s.sizes[dd];
-                        rem /= s.sizes[dd];
-                        off += c * s.strides[dd];
+            (void)stable;
+            if (dim_size <= kRankSortMaxLen) {
+                launch_flat(q, layout.num_rows * dim_size, [=](std::size_t t_) {
+                    const int64_t t = static_cast<int64_t>(t_);
+                    const int64_t row = t / dim_size;
+                    const int64_t e = t % dim_size;
+                    int64_t rem = row;
+                    int64_t in_base = 0;
+                    int64_t out_base = 0;
+                    for (int dd = self_spec.ndim - 1; dd >= 0; --dd) {
+                        if (dd == self_spec.skip_dim) continue;
+                        const int64_t c = rem % self_spec.sizes[dd];
+                        rem /= self_spec.sizes[dd];
+                        in_base += c * self_spec.strides[dd];
+                        out_base += c * out_spec.strides[dd];
                     }
-                    return off;
+                    const scalar_t* base = pin + in_base;
+                    auto key_of = [=](int64_t i) {
+                        if constexpr (std::is_same_v<scalar_t, double>)
+                            return base[i * dim_stride];
+                        else if constexpr (std::is_integral_v<scalar_t>)
+                            return static_cast<key_t>(base[i * dim_stride]);
+                        else
+                            return static_cast<key_t>(static_cast<float>(base[i * dim_stride]));
+                    };
+                    auto before = PTSYCL_ARGSORT_BEFORE(key_of);
+                    int64_t rank = 0;
+                    for (int64_t j = 0; j < dim_size; ++j) rank += before(j, e) ? 1 : 0;
+                    pout[out_base + rank * out_dim_stride] = e;
+                });
+            } else {
+                int64_t P = 1;
+                while (P < dim_size) P <<= 1;
+                const int64_t rows = layout.num_rows;
+                Tensor work = at::empty({rows, P}, self.options().dtype(c10::kLong));
+                int64_t* pw = data_ptr<int64_t>(work);
+
+                launch_flat(q, rows * P, [=](std::size_t t_) {
+                    const int64_t t = static_cast<int64_t>(t_);
+                    const int64_t e = t % P;
+                    pw[t] = e < dim_size ? e : -1;
+                });
+
+                const bool local_ok = q.is_gpu();
+                const int64_t BLK = local_ok ? std::min<int64_t>(P, kBitonicLocalBlock) : 1;
+                auto local_stages = [&](int64_t kmin, int64_t kmax) {
+                    const int64_t half = BLK / 2;
+                    const int64_t groups = rows * (P / BLK);
+                    q.sycl_queue().submit([&](sycl::handler& cgh) {
+                        sycl::local_accessor<int64_t, 1> sh(sycl::range<1>(static_cast<std::size_t>(BLK)), cgh);
+                        cgh.template parallel_for<BitonicLocalStages<scalar_t>>(
+                            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * half)),
+                                              sycl::range<1>(static_cast<std::size_t>(half))),
+                            [=](sycl::nd_item<1> it) {
+                                const int64_t g = static_cast<int64_t>(it.get_group(0));
+                                const int64_t row = g / (P / BLK);
+                                const int64_t base_pos = (g % (P / BLK)) * BLK;
+                                const int64_t tid = static_cast<int64_t>(it.get_local_id(0));
+                                int64_t rem = row;
+                                int64_t in_base = 0;
+                                for (int dd = self_spec.ndim - 1; dd >= 0; --dd) {
+                                    if (dd == self_spec.skip_dim) continue;
+                                    const int64_t c = rem % self_spec.sizes[dd];
+                                    rem /= self_spec.sizes[dd];
+                                    in_base += c * self_spec.strides[dd];
+                                }
+                                const scalar_t* base = pin + in_base;
+                                auto key_of = [=](int64_t e) {
+                                    if constexpr (std::is_same_v<scalar_t, double>)
+                                        return base[e * dim_stride];
+                                    else if constexpr (std::is_integral_v<scalar_t>)
+                                        return static_cast<key_t>(base[e * dim_stride]);
+                                    else
+                                        return static_cast<key_t>(static_cast<float>(base[e * dim_stride]));
+                                };
+                                auto before = PTSYCL_ARGSORT_BEFORE(key_of);
+                                int64_t* w = pw + row * P + base_pos;
+                                sh[tid] = w[tid];
+                                sh[tid + half] = w[tid + half];
+                                sycl::group_barrier(it.get_group());
+                                for (int64_t k = kmin; k <= kmax; k <<= 1) {
+                                    for (int64_t j = (k >> 1) < half ? (k >> 1) : half; j > 0; j >>= 1) {
+                                        const int64_t i = 2 * j * (tid / j) + (tid % j);
+                                        const int64_t l = i + j;
+                                        const int64_t a = sh[i];
+                                        const int64_t b = sh[l];
+                                        const bool ascending_block = ((base_pos + i) & k) == 0;
+                                        if (ascending_block ? before(b, a) : before(a, b)) {
+                                            sh[i] = b;
+                                            sh[l] = a;
+                                        }
+                                        sycl::group_barrier(it.get_group());
+                                    }
+                                }
+                                w[tid] = sh[tid];
+                                w[tid + half] = sh[tid + half];
+                            });
+                    });
                 };
-                const int64_t in_base  = base_offset(self_spec, row);
-                const int64_t out_base = base_offset(out_spec, row);
-                const scalar_t* base = pin + in_base;
+                if (BLK > 1) local_stages(2, BLK);
+                for (int64_t k = BLK > 1 ? 2 * BLK : 2; k <= P; k <<= 1) {
+                    for (int64_t j = k >> 1; j >= BLK && j > 0; j >>= 1) {
+                        launch_flat(q, rows * P, [=](std::size_t t_) {
+                            const int64_t t = static_cast<int64_t>(t_);
+                            const int64_t i = t % P;
+                            const int64_t l = i ^ j;
+                            if (l <= i) return;
+                            const int64_t row = t / P;
 
-                // Fixed-size, no-heap insertion sort -- O(dim_size^2),
-                // correctness stopgap only (see file header). Comparisons
-                // go through float rather than raw scalar_t: c10::Half
-                // has an implicit conversion to CUDA's __half, and
-                // __half also defines operator</operator> (cuda_fp16.hpp)
-                // -- comparing two c10::Half values directly is genuinely
-                // ambiguous to the compiler under nvcc/clang-cuda (two
-                // equally-good overload resolution paths), not just a
-                // style nit. Casting sidesteps the ambiguity and matches
-                // the float-accumulation choice already made in
-                // matmul_ops.cpp for the same underlying reason.
-                int64_t local_idx[PTSYCL_ARGSORT_MAX_LEN];
-                for (int64_t e = 0; e < dim_size; ++e) local_idx[e] = e;
-                for (int64_t i = 1; i < dim_size; ++i) {
-                    const int64_t key = local_idx[i];
-                    const float key_val = static_cast<float>(base[key * dim_stride]);
-                    int64_t j = i - 1;
-                    while (j >= 0) {
-                        const float vj = static_cast<float>(base[local_idx[j] * dim_stride]);
-                        const bool should_shift =
-                            descending ? vj < key_val : vj > key_val;
-                        if (!should_shift) break;
-                        local_idx[j + 1] = local_idx[j];
-                        --j;
+                            int64_t rem = row;
+                            int64_t in_base = 0;
+                            for (int dd = self_spec.ndim - 1; dd >= 0; --dd) {
+                                if (dd == self_spec.skip_dim) continue;
+                                const int64_t c = rem % self_spec.sizes[dd];
+                                rem /= self_spec.sizes[dd];
+                                in_base += c * self_spec.strides[dd];
+                            }
+                            const scalar_t* base = pin + in_base;
+                            auto key_of = [=](int64_t e) {
+                                if constexpr (std::is_same_v<scalar_t, double>)
+                                    return base[e * dim_stride];
+                                else if constexpr (std::is_integral_v<scalar_t>)
+                                    return static_cast<key_t>(base[e * dim_stride]);
+                                else
+                                    return static_cast<key_t>(static_cast<float>(base[e * dim_stride]));
+                            };
+                            auto before = PTSYCL_ARGSORT_BEFORE(key_of);
+
+                            int64_t* w = pw + row * P;
+                            const int64_t a = w[i];
+                            const int64_t b = w[l];
+                            const bool ascending_block = (i & k) == 0;
+                            if (ascending_block ? before(b, a) : before(a, b)) {
+                                w[i] = b;
+                                w[l] = a;
+                            }
+                        });
                     }
-                    local_idx[j + 1] = key;
+                    if (BLK > 1) local_stages(k, k);
                 }
-                for (int64_t e = 0; e < dim_size; ++e)
-                    pout[out_base + e * out_dim_stride] = local_idx[e];
-            });
-        });
+
+                launch_flat(q, rows * dim_size, [=](std::size_t t_) {
+                    const int64_t t = static_cast<int64_t>(t_);
+                    const int64_t row = t / dim_size;
+                    const int64_t e = t % dim_size;
+                    int64_t rem = row;
+                    int64_t out_base = 0;
+                    for (int dd = out_spec.ndim - 1; dd >= 0; --dd) {
+                        if (dd == out_spec.skip_dim) continue;
+                        const int64_t c = rem % out_spec.sizes[dd];
+                        rem /= out_spec.sizes[dd];
+                        out_base += c * out_spec.strides[dd];
+                    }
+                    pout[out_base + e * out_dim_stride] = pw[row * P + e];
+                });
+            }
 #endif
+        });
+#undef PTSYCL_ARGSORT_BEFORE
     return out;
 }
 

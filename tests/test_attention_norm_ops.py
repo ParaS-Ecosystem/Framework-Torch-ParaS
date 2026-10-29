@@ -211,3 +211,172 @@ def test_copy_from_host(device):
     src_cpu = torch.randn(4, 5)
     a.copy_(src_cpu)
     assert_close(a.cpu(), src_cpu, "copy_from_host")
+
+def _sdpa_ops(fn):
+    """Runs fn, returning (result, names of the ATen ops it dispatched)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Record(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.ops = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.ops.append(func.__name__.split(".")[0])
+            return func(*args, **(kwargs or {}))
+
+    rec = Record()
+    with rec:
+        out = fn()
+    return out, rec.ops
+
+
+def test_sdpa_fused_decode_path(device):
+    torch.manual_seed(0)
+    B, H, Lk, D = 2, 4, 37, 16
+    for dtype, tol in ((torch.float32, 1e-5), (torch.bfloat16, 2e-2)):
+        for Lq in (1, 5):
+            q = torch.randn(B, Lq, H, D).transpose(1, 2).to(dtype)
+            k = torch.randn(B, H, Lk, D).to(dtype)
+            v = torch.randn(B, H, Lk, D).to(dtype)
+            bmask = torch.rand(B, 1, Lq, Lk) > 0.3
+            bmask[0, 0, 0] = False
+            fmask = torch.randn(1, 1, Lq, Lk).to(dtype)
+            for kw in ({}, {"attn_mask": bmask}, {"attn_mask": fmask},
+                       {"is_causal": True}, {"scale": 0.3}):
+                ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float(),
+                                                     **{a: (b.float() if a == "attn_mask" and b.dtype != torch.bool else b)
+                                                        for a, b in kw.items()})
+                if "attn_mask" in kw and kw["attn_mask"].dtype == torch.bool:
+                    ref = torch.nan_to_num(ref, nan=0.0)
+                dkw = {a: (b.to(device) if torch.is_tensor(b) else b) for a, b in kw.items()}
+                out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+                    q.to(device), k.to(device), v.to(device), **dkw))
+                assert "_scaled_dot_product_fused_attention_overrideable" in ops, ops
+                assert out.dtype == dtype and out.shape == (B, H, Lq, D)
+                torch.testing.assert_close(out.cpu().float(), ref, atol=tol, rtol=tol)
+
+
+def test_sdpa_training_and_long_query_use_math(device):
+    q = torch.randn(1, 2, 3, 8, requires_grad=True)
+    k = torch.randn(1, 2, 6, 8, requires_grad=True)
+    v = torch.randn(1, 2, 6, 8, requires_grad=True)
+    dq, dk, dv = (t.detach().to(device).requires_grad_() for t in (q, k, v))
+    out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(dq, dk, dv, is_causal=True))
+    assert "_scaled_dot_product_fused_attention_overrideable" not in ops
+    F.scaled_dot_product_attention(q, k, v, is_causal=True).sum().backward()
+    out.sum().backward()
+    for a, b in ((dq, q), (dk, k), (dv, v)):
+        torch.testing.assert_close(a.grad.cpu(), b.grad, atol=1e-5, rtol=1e-4)
+
+
+def test_sdpa_fused_prefill_path(device):
+    import torch_paras
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    B, H, L, D = 1, 3, 300, 32
+    for dtype, tol in ((torch.float32, 1e-4), (torch.bfloat16, 3e-2)):
+        q = torch.randn(B, L, H, D).transpose(1, 2).to(dtype)
+        k = torch.randn(B, H, L, D).to(dtype)
+        v = torch.randn(B, H, L, D).to(dtype)
+        bmask = torch.rand(B, 1, L, L) > 0.2
+        bmask[0, 0, 7] = False
+        fmask = torch.triu(torch.full((L, L), float("-inf")), 1)[None, None].to(dtype)
+        for kw in ({"is_causal": True}, {"attn_mask": bmask}, {"attn_mask": fmask}, {}):
+            ref = F.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(),
+                **{a: (b.float() if a == "attn_mask" and b.dtype != torch.bool else b) for a, b in kw.items()})
+            ref = torch.nan_to_num(ref, nan=0.0)
+            dkw = {a: (b.to(device) if torch.is_tensor(b) else b) for a, b in kw.items()}
+            out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+                q.to(device), k.to(device), v.to(device), **dkw))
+            fused = "_scaled_dot_product_fused_attention_overrideable" in ops
+            assert fused == gpu, (fused, gpu, ops[:6])
+            torch.testing.assert_close(out.cpu().float(), ref, atol=tol, rtol=tol)
+
+
+def test_sdpa_fused_precision_matches_math(device):
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    torch.manual_seed(0)
+    for L in (8, 300):
+        q = 3 * torch.randn(1, 4, L, 64)
+        k = 3 * torch.randn(1, 4, L, 64)
+        v = torch.randn(1, 4, L, 64)
+        mask = torch.triu(torch.full((L, L), torch.finfo(torch.bfloat16).min), 1)[None, None]
+        ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double(), attn_mask=mask.double())
+        qb, kb, vb, mb = (t.to(torch.bfloat16).to(device) for t in (q, k, v, mask))
+        err = lambda o: ((o.cpu().double() - ref).norm() / ref.norm()).item()
+        fused = err(F.scaled_dot_product_attention(qb, kb, vb, attn_mask=mb))
+        with sdpa_kernel(SDPBackend.MATH):
+            math_err = err(F.scaled_dot_product_attention(qb, kb, vb, attn_mask=mb))
+        assert fused <= 1.1 * math_err, (L, fused, math_err)
+
+
+def test_sdpa_long_keys(device):
+    import torch_paras
+    torch.manual_seed(0)
+    gpu = torch_paras.is_gpu_device(torch.device(device).index or 0)
+    B, H, L, D = 1, 2, 5000, 64
+    q = torch.randn(B, L, H, D).transpose(1, 2)
+    k = torch.randn(B, H, L, D)
+    v = torch.randn(B, H, L, D)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    for dtype, tol, want in ((torch.bfloat16, 2.5e-2, gpu), (torch.float16, 4e-3, gpu), (torch.float32, 1e-4, False)):
+        out, ops = _sdpa_ops(lambda: F.scaled_dot_product_attention(
+            q.to(dtype).to(device), k.to(dtype).to(device), v.to(dtype).to(device), is_causal=True))
+        fused = "_scaled_dot_product_fused_attention_overrideable" in ops
+        assert fused == want, (dtype, fused, ops[:6])
+        torch.testing.assert_close(out.cpu().float(), ref, atol=tol, rtol=tol)
+
+
+def test_sdpa_flash_kernel_cases(device):
+    torch.manual_seed(0)
+    cases = [(2, 3, 130, 130, 64), (1, 2, 70, 200, 128), (1, 4, 257, 257, 64)]
+    for dtype, tol in ((torch.bfloat16, 2.5e-2), (torch.float16, 4e-3)):
+        for B, H, Lq, Lk, D in cases:
+            q = torch.randn(B, Lq, H, D).transpose(1, 2).to(dtype)
+            k = torch.randn(B, H, Lk, D).to(dtype)
+            v = torch.randn(B, H, Lk, D).to(dtype)
+            bmask = torch.rand(B, 1, Lq, Lk) > 0.3
+            bmask[0, 0, 5] = False
+            fmask = torch.randn(B, 1, Lq, Lk).to(dtype)
+            for kw in ({"is_causal": True}, {"attn_mask": bmask}, {"attn_mask": fmask}, {}, {"scale": 0.2}):
+                ref = F.scaled_dot_product_attention(
+                    q.double(), k.double(), v.double(),
+                    **{n: (t.double() if n == "attn_mask" and t.dtype != torch.bool else t) for n, t in kw.items()})
+                ref = torch.nan_to_num(ref, nan=0.0)
+                dkw = {n: (t.to(device) if torch.is_tensor(t) else t) for n, t in kw.items()}
+                out = F.scaled_dot_product_attention(q.to(device), k.to(device), v.to(device), **dkw)
+                assert out.dtype == dtype and out.shape == (B, H, Lq, D)
+                err = ((out.cpu().double() - ref).norm() / ref.norm()).item()
+                assert err < tol, (dtype, B, H, Lq, Lk, D, list(kw), err)
+
+
+def test_sdpa_flash_block_masks(device):
+    torch.manual_seed(0)
+    B, H, L, D = 1, 2, 300, 64
+    for dtype in (torch.bfloat16, torch.float16):
+        q = torch.randn(B, L, H, D).transpose(1, 2).to(dtype).to(device)
+        k = torch.randn(B, H, L, D).to(dtype).to(device)
+        v = torch.randn(B, H, L, D).to(dtype).to(device)
+        causal = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        additive = torch.triu(torch.full((L, L), torch.finfo(dtype).min), 1)[None, None].to(dtype)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=additive.to(device))
+        assert torch.equal(out.cpu(), causal.cpu()), dtype
+        boolean = torch.ones(L, L, dtype=torch.bool).tril()[None, None]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=boolean.to(device))
+        assert torch.equal(out.cpu(), causal.cpu()), dtype
+        plain = F.scaled_dot_product_attention(q, k, v)
+        zero = torch.zeros(B, 1, L, L, dtype=dtype, device=device)
+        assert torch.equal(F.scaled_dot_product_attention(q, k, v, attn_mask=zero).cpu(), plain.cpu())
+        pad = additive.clone()
+        pad[..., :, :20] = torch.finfo(dtype).min
+        ref = F.scaled_dot_product_attention(q.cpu().double(), k.cpu().double(), v.cpu().double(),
+                                             attn_mask=pad.double())
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=pad.to(device))
+        err = ((out.cpu().double() - ref).norm() / ref.norm()).item()
+        assert err < 2.5e-2, (dtype, err)
+        m = additive.to(device)
+        F.scaled_dot_product_attention(q, k, v, attn_mask=m)
+        m.zero_()
+        assert torch.equal(F.scaled_dot_product_attention(q, k, v, attn_mask=m).cpu(), plain.cpu())
