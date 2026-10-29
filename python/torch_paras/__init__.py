@@ -40,6 +40,7 @@ import types
 import torch
 
 from . import _C
+from . import graphs  # noqa: F401
 from . import nn  # noqa: F401
 
 __all__ = [
@@ -56,6 +57,7 @@ __all__ = [
     "set_strict",
     "is_strict",
     "compile",
+    "graphs",
     "nn",
     "optimizer",
 ]

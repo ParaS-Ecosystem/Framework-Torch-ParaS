@@ -82,6 +82,8 @@ inline void host_parallel_for(std::size_t n, F&& f) {
         &ctx);
 }
 
+class Graph;
+
 class Queue {
 public:
     Queue();
@@ -104,6 +106,12 @@ public:
 
     bool run_native(const std::function<void(void* native_stream)>& fn);
 
+    static bool graphs_supported();
+    bool capturing() const { return capturing_; }
+    void begin_capture();
+    std::shared_ptr<Graph> end_capture();
+    void replay(const Graph& graph);
+
 #if defined(PTSYCL_BACKEND_SYCL)
     // Queue ownership and construction remain in paras_compat.cpp.
     sycl::queue& sycl_queue() const;
@@ -113,6 +121,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     bool initialized_ = false;
+    bool capturing_   = false;
     bool is_gpu_      = false;
     int  native_id_   = -1;
 };

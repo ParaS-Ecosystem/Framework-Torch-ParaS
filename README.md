@@ -52,6 +52,9 @@ to the host CPU. Tested on Intel CPUs, NVIDIA GPUs, and AMD GPUs.
   (`sycl::malloc_device`, GPU) or aligned host memory (CPU).
 - A graph optimizer for `torch.compile` (`backend="paras"`), for
   inference and training -- see docs/GRAPH_OPTIMIZER.md.
+- Graph capture and replay (`torch_paras.graphs`, and
+  `torch_paras.compile(..., graphs=True)` for compiled inference) on ParaS
+  record-and-replay command graphs -- see docs/GRAPHS.md.
 
 ## Graph optimizer
 

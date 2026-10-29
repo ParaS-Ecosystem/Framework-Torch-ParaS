@@ -68,7 +68,7 @@ from typing import Iterable, Sequence
 import torch
 from torch import fx
 
-from . import ops, passes, residency
+from . import ops, passes, replay, residency
 
 ALL_FUSIONS = tuple(passes.PASSES)
 
@@ -89,17 +89,21 @@ class Options:
     eager_at_recompile_limit: frames Dynamo refuses to recompile run
              eagerly (their callees keep their graphs; see the module
              docstring); False keeps Dynamo's own behaviour.
+    graphs:  replay static-shape inference graphs from a capture
+             (replay.py): one launch per graph instead of one per operator.
     """
 
     fusions: tuple = ALL_FUSIONS
     strict: bool = False
     min_dynamic_graph_ops: int = 8
     eager_at_recompile_limit: bool = True
+    graphs: bool = False
 
     @classmethod
     def make(cls, fusions: Iterable[str] | None = None, strict: bool = False,
              min_dynamic_graph_ops: int | None = None,
-             eager_at_recompile_limit: bool | None = None) -> "Options":
+             eager_at_recompile_limit: bool | None = None,
+             graphs: bool = False) -> "Options":
         chosen = ALL_FUSIONS if fusions is None else tuple(fusions)
         unknown = set(chosen) - set(ALL_FUSIONS)
         if unknown:
@@ -110,7 +114,7 @@ class Options:
         at_limit = (cls.eager_at_recompile_limit if eager_at_recompile_limit is None
                     else bool(eager_at_recompile_limit))
         return cls(fusions=chosen, strict=bool(strict), min_dynamic_graph_ops=limit,
-                   eager_at_recompile_limit=at_limit)
+                   eager_at_recompile_limit=at_limit, graphs=bool(graphs))
 
 
 @dataclass
@@ -123,6 +127,7 @@ class GraphReport:
     residency: dict = field(default_factory=dict)
     cpu_fallback_ops: Counter = field(default_factory=Counter)
     runs_eagerly: str = ""
+    replay: str = ""
 
     @property
     def fully_on_paras(self) -> bool:
@@ -138,6 +143,8 @@ class GraphReport:
             parts.append("CPU fallback: " + ", ".join(sorted(self.cpu_fallback_ops)))
         if self.runs_eagerly:
             parts.append(f"runs eagerly ({self.runs_eagerly})")
+        if self.replay:
+            parts.append(self.replay)
         return " | ".join(parts)
 
 
@@ -157,7 +164,7 @@ def reset_reports() -> None:
         _reports.clear()
 
 
-_analyses: dict[bytes, list] = {}
+_analyses: dict[bytes, tuple] = {}
 
 
 def _symbolic(s) -> object:
@@ -293,6 +300,22 @@ def _graph_callable(gm: fx.GraphModule, code, hand_back_now: bool):
     return run
 
 
+def _replayed(gm, run, example_inputs, meta, report):
+    if replay.has_dynamic_shapes(example_inputs):
+        replayed = replay.Split(gm, run, example_inputs, meta, report)
+    else:
+        replayed = replay.Replayed(run, meta, report)
+        report.replay = "replayed"
+
+    def call(*args):
+        if _exceeded:
+            _hand_back_exceeded()
+        return replayed(*args)
+
+    call.replayed = replayed
+    return call
+
+
 def make_backend(options: Options = Options()):
     """Returns a TorchDynamo backend callable configured by `options`."""
 
@@ -301,7 +324,7 @@ def make_backend(options: Options = Options()):
         from torch._dynamo.backends.common import aot_autograd
         from torch._functorch import config as functorch_config
 
-        from torch._guards import CompileContext
+        from torch._guards import CompileContext, TracingContext
 
         ops.register()
         code = _root_code()
@@ -329,16 +352,23 @@ def make_backend(options: Options = Options()):
         with _lock:
             cached = _analyses.get(key)
         if cached is not None:
-            for stage, kinds, cpu_ops in cached:
+            stages, meta = cached
+            for stage, kinds, cpu_ops in stages:
                 record(stage, kinds, cpu_ops)
         else:
             stages = []
+            meta = None
 
             def analyser(stage):
                 def analyse_stage(aten_gm: fx.GraphModule, _inputs):
+                    nonlocal meta
                     kinds, cpu_ops = residency.analyse(aten_gm)
                     stages.append((stage, kinds, cpu_ops))
                     record(stage, kinds, cpu_ops)
+                    if stage != "backward":
+                        ctx = TracingContext.try_get()
+                        if ctx is not None and ctx.fw_metadata is not None:
+                            meta = replay.meta_from_aot(ctx.fw_metadata, replay.random_ops(aten_gm))
                     return make_boxed_func(aten_gm.forward)
                 return analyse_stage
 
@@ -350,12 +380,18 @@ def make_backend(options: Options = Options()):
                 )(gm, example_inputs)
             gm.recompile()
             with _lock:
-                _analyses[key] = stages
+                _analyses[key] = (stages, meta)
         if (options.min_dynamic_graph_ops and _is_whole_frame(gm)
                 and _has_dynamic_shapes(example_inputs)
                 and _tensor_op_count(gm) < options.min_dynamic_graph_ops):
             report.runs_eagerly = "small dynamic-shape graph"
         compiled = _graph_callable(gm, code, bool(report.runs_eagerly))
+        if options.graphs and not report.runs_eagerly:
+            why = replay.not_replayable(meta, example_inputs)
+            if why:
+                report.replay = "not replayed: " + why
+            else:
+                compiled = _replayed(gm, compiled, example_inputs, meta, report)
         with _lock:
             _reports.append(report)
         return compiled

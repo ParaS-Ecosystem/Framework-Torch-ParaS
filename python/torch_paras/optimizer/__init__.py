@@ -70,7 +70,7 @@ __all__ = [
 def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False,
             min_dynamic_graph_ops: int | None = None,
             eager_at_recompile_limit: bool | None = None,
-            specialize_blocks: bool = True,
+            specialize_blocks: bool = True, graphs: bool = False,
             fullgraph: bool = False, dynamic: bool | None = None):
     """``torch.compile`` with the paras backend.
 
@@ -85,11 +85,15 @@ def compile(model, *, fusions: Iterable[str] | None = None, strict: bool = False
                (a transformer's layers) its own forward code object, so each
                keeps its own Dynamo cache (``specialize_repeated_blocks``;
                ``unspecialize`` undoes it). Modules only; default True.
+    graphs:    replay static-shape inference graphs from a capture: one
+               launch per graph instead of one per operator (replay.py;
+               needs a ParaS build with command graphs). Default False.
     fullgraph, dynamic: forwarded to torch.compile.
     """
     options = Options.make(fusions=fusions, strict=strict,
                            min_dynamic_graph_ops=min_dynamic_graph_ops,
-                           eager_at_recompile_limit=eager_at_recompile_limit)
+                           eager_at_recompile_limit=eager_at_recompile_limit,
+                           graphs=graphs)
     if specialize_blocks and isinstance(model, torch.nn.Module):
         specialize_repeated_blocks(model)
     return torch.compile(model, backend=make_backend(options),
