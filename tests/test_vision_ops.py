@@ -42,3 +42,23 @@ def test_upsample_nearest2d(device):
     out = F.interpolate(x.to(device), size=(9, 11), mode="nearest")
     assert_close(out, F.interpolate(x, size=(9, 11), mode="nearest"),
                  "upsample_nearest2d")
+
+
+def test_max_pool2d_forward_backward_and_compile(device):
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 17, 15, requires_grad=True)
+    for kw in ({"kernel_size": 3, "stride": 2, "padding": 1},
+               {"kernel_size": 2, "stride": 1, "dilation": 2},
+               {"kernel_size": 3, "stride": 2, "ceil_mode": True}):
+        dx = x.detach().to(device).requires_grad_()
+        y = torch.nn.functional.max_pool2d(x, **kw)
+        dy = torch.nn.functional.max_pool2d(dx, **kw)
+        assert torch.equal(dy.detach().cpu(), y.detach())
+        g = torch.randn(y.shape)
+        y.backward(g)
+        dy.backward(g.to(device))
+        assert torch.allclose(dx.grad.cpu(), x.grad, atol=1e-6)
+        x.grad = None
+    f = torch.compile(lambda t: torch.nn.functional.max_pool2d(t, 3, 2, 1), backend="paras")
+    t = torch.randn(2, 4, 16, 16)
+    assert torch.equal(f(t.to(device)).cpu(), torch.nn.functional.max_pool2d(t, 3, 2, 1))

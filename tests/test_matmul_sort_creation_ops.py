@@ -194,3 +194,37 @@ def test_arange(device):
 def test_arange_float_step(device):
     check_op("arange_float_step", lambda: torch.arange(0.0, 2.0, 0.25),
               lambda: torch.arange(0.0, 2.0, 0.25, device=device))
+
+
+def _near(actual, expected, msg, tol=1e-5):
+    """Max error relative to the reference's largest magnitude (at least 1)."""
+    actual, expected = actual.cpu().float(), expected.cpu().float()
+    assert actual.shape == expected.shape, (msg, actual.shape, expected.shape)
+    err = ((actual - expected).abs().max() / expected.abs().max().clamp_min(1.0)).item()
+    assert err <= tol, f"{msg}: relative error {err:.3e} > {tol:.1e}"
+
+
+def test_linear_few_rows(device):
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    for dt, tol in ((torch.bfloat16, 3e-2), (torch.float16, 3e-3), (torch.float32, 1e-4)):
+        for m, n, k in ((1, 1, 8), (1, 4099, 2048), (3, 5, 24), (4, 64, 512), (8, 33, 1024), (9, 16, 64)):
+            x = torch.randn(m, k, dtype=dt)
+            w = torch.randn(n, k, dtype=dt) / k ** 0.5
+            b = torch.randn(n, dtype=dt)
+            ref = (x.float() @ w.float().t())
+            got = F.linear(x.to(device), w.to(device))
+            _near(got.float(), ref, f"linear {dt} {m}x{n}x{k}", tol=tol)
+            got = F.linear(x.to(device), w.to(device), b.to(device))
+            _near(got.float(), ref + b.float(), f"linear+bias {dt} {m}x{n}x{k}", tol=tol)
+            got = torch.addmm(b.to(device), x.to(device), w.to(device).t(), beta=0.5, alpha=2.0)
+            _near(got.float(), 2 * ref + 0.5 * b.float(), f"addmm {dt} {m}x{n}x{k}", tol=2 * tol)
+    x = torch.randn(2, 12, dtype=torch.bfloat16)
+    w = torch.randn(12, 7, dtype=torch.bfloat16)
+    _near((x.to(device) @ w.to(device)).float(), x.float() @ w.float(), "plain mm", tol=3e-2)
+    wt = torch.randn(7, 12, dtype=torch.bfloat16)
+    _near(F.linear(x.to(device), wt.to(device)).float(), x.float() @ wt.float().t(), "k=12", tol=3e-2)
+    big = torch.randn(3, 2049, dtype=torch.bfloat16)
+    xs = big.to(device)[:, 1:]
+    w2 = torch.randn(16, 2048, dtype=torch.bfloat16)
+    _near(F.linear(xs, w2.to(device)).float(), big[:, 1:].float() @ w2.float().t(), "offset", tol=3e-2)

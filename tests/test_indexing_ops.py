@@ -140,3 +140,28 @@ def test_triu(device):
 def test_tril(device):
     a, _, da, _ = _pair(device)
     check_op("tril", lambda: torch.tril(a, -1), lambda: torch.tril(da, -1))
+
+
+def test_index_rows_dim0(device):
+    g = torch.Generator().manual_seed(0)
+    cases = [((48, 2048), torch.float32), ((48, 2048), torch.bfloat16),
+             ((40, 3), torch.float32), ((40, 6), torch.float16),
+             ((40, 3), torch.bool), ((40,), torch.int64), ((20, 3, 5), torch.int8),
+             ((30, 4, 8), torch.float64)]
+    for shape, dt in cases:
+        x = (torch.randn(shape, generator=g) * 10).to(dt)
+        idx = torch.randint(-shape[0], shape[0], (37,), generator=g)
+        got = x.to(device)[idx.to(device)]
+        assert torch.equal(got.cpu(), x[idx]), (shape, dt, "gather")
+        perm = torch.randperm(shape[0], generator=g)[:17]
+        perm[::3] -= shape[0]
+        vals = (torch.randn((17,) + shape[1:], generator=g) * 10).to(dt)
+        ref = x.clone()
+        ref[perm] = vals
+        dx = x.to(device)
+        dx[perm.to(device)] = vals.to(device)
+        assert torch.equal(dx.cpu(), ref), (shape, dt, "scatter")
+    x = torch.randn(8, 6, generator=g)
+    idx = torch.tensor([5, 0, -1, 2])
+    assert torch.equal(x.to(device).t()[idx.to(device)].cpu(), x.t()[idx])
+    assert torch.equal(x.to(device)[:, idx.to(device)].cpu(), x[:, idx])

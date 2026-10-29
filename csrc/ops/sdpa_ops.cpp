@@ -56,8 +56,10 @@ bool fused_supported(const Tensor& q, const Tensor& k, const Tensor& v,
     if (dt != c10::kFloat && dt != c10::kHalf && dt != c10::kBFloat16) return false;
     if (k.scalar_type() != dt || v.scalar_type() != dt) return false;
     if (q.sym_size(0) != k.sym_size(0) || k.sym_size(0) != v.sym_size(0)) return false;
-    if (q.sym_size(1) != k.sym_size(1) || k.sym_size(1) != v.sym_size(1)) return false;
-    (void)enable_gqa;
+    if (k.sym_size(1) != v.sym_size(1)) return false;
+    if (q.sym_size(1) != k.sym_size(1) &&
+        !(enable_gqa && k.sym_size(1) > 0 && q.sym_size(1) % k.sym_size(1) == 0))
+        return false;
     if (q.sym_size(3) != k.sym_size(3) || k.sym_size(2) != v.sym_size(2)) return false;
     if (k.sym_size(2) == 0) return false;
     if (q.sym_size(2) > kFusedMaxQuery) {
@@ -220,6 +222,7 @@ struct FlashArgs {
     const T* mf; const bool* mb;
     Strides4 qs, ks, vs, os, ms;
     int64_t H, Lq, Lk, q_blocks;
+    int64_t kv_group;
     float scale;
     bool causal;
     const signed char* mcls; const unsigned char* mqok;
@@ -335,8 +338,8 @@ PTSYCL_HOST_DEVICE inline void flash_block(const FlashArgs<T>& a, const Item& it
     const int64_t q0 = qb * kFlashBlockQ;
     const int64_t row0 = q0 + wave * kFlashRowsPerWave;
     const T* qp = a.q + b * a.qs.s[0] + h * a.qs.s[1];
-    const T* kp = a.k + b * a.ks.s[0] + h * a.ks.s[1];
-    const T* vp = a.v + b * a.vs.s[0] + h * a.vs.s[1];
+    const T* kp = a.k + b * a.ks.s[0] + (h / a.kv_group) * a.ks.s[1];
+    const T* vp = a.v + b * a.vs.s[0] + (h / a.kv_group) * a.vs.s[1];
     unsigned short* klds = lds;
     unsigned short* plds = lds + wave * (kFlashRowsPerWave * kFlashPLD);
     unsigned short* vlds = lds + flash_kp_elems<D>();
@@ -605,6 +608,129 @@ MaskSummary mask_block_summary(compat::Queue& queue, const Tensor& attn_bias,
     return out;
 }
 
+#endif
+
+#if defined(PTSYCL_BACKEND_SYCL)
+constexpr int kDecodeThreads = 256;
+constexpr int64_t kDecodeMaxKeys = 8192;
+constexpr int64_t kDecodeMaxDim = 256;
+
+template <typename T, bool Vec> class DecodeAttentionKernel;
+
+template <typename T>
+struct alignas(sizeof(T) * 8) DecodeChunk {
+    T v[8];
+};
+
+template <typename Op>
+PTSYCL_HOST_DEVICE inline float decode_block_reduce(const sycl::nd_item<1>& it, float* rd,
+                                                    float v, Op op) {
+    const int tid = static_cast<int>(it.get_local_id(0));
+    rd[tid] = v;
+    for (int s = kDecodeThreads / 2; s > 0; s >>= 1) {
+        sycl::group_barrier(it.get_group());
+        if (tid < s) rd[tid] = op(rd[tid], rd[tid + s]);
+    }
+    sycl::group_barrier(it.get_group());
+    const float out = rd[0];
+    sycl::group_barrier(it.get_group());
+    return out;
+}
+
+struct DecodeMax {
+    PTSYCL_HOST_DEVICE float operator()(float a, float b) const { return a > b ? a : b; }
+};
+struct DecodeSum {
+    PTSYCL_HOST_DEVICE float operator()(float a, float b) const { return a + b; }
+};
+
+template <typename T, bool Vec>
+void decode_attention(compat::Queue& queue, const T* pq, const T* pk, const T* pv, T* po,
+                      float* L, const bool* pmb, const T* pmf, Strides4 qs, Strides4 ks,
+                      Strides4 vs, Strides4 os, Strides4 ms, int64_t rows, int64_t Lq,
+                      int64_t H, int64_t G, int64_t Lk, int64_t D, int64_t Dv, float sc,
+                      bool is_causal) {
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+    using KC = DecodeChunk<T>;
+    const int64_t slices = kDecodeThreads / Dv;
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> s_lds(sycl::range<1>(static_cast<std::size_t>(Lk)), cgh);
+        sycl::local_accessor<float, 1> q_lds(sycl::range<1>(static_cast<std::size_t>(D)), cgh);
+        sycl::local_accessor<float, 1> r_lds(sycl::range<1>(kDecodeThreads), cgh);
+        cgh.template parallel_for<DecodeAttentionKernel<T, Vec>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(rows * kDecodeThreads)),
+                              sycl::range<1>(kDecodeThreads)),
+            [=](sycl::nd_item<1> it) {
+                const int tid = static_cast<int>(it.get_local_id(0));
+                const int64_t r = static_cast<int64_t>(it.get_group(0));
+                const int64_t i = r % Lq, h = (r / Lq) % H, b = r / (Lq * H);
+                float* S = &s_lds[0];
+                float* qf = &q_lds[0];
+                float* rd = &r_lds[0];
+                const T* qr = pq + b * qs.s[0] + h * qs.s[1] + i * qs.s[2];
+                for (int64_t d = tid; d < D; d += kDecodeThreads)
+                    qf[d] = static_cast<float>(qr[d * qs.s[3]]);
+                sycl::group_barrier(it.get_group());
+
+                const T* kb = pk + b * ks.s[0] + (h / G) * ks.s[1];
+                const int64_t mrow = b * ms.s[0] + h * ms.s[1] + i * ms.s[2];
+                float m = kNegInf;
+                for (int64_t j = tid; j < Lk; j += kDecodeThreads) {
+                    float s = kNegInf;
+                    if (!(is_causal && j > i)) {
+                        const T* kj = kb + j * ks.s[2];
+                        float acc = 0.f;
+                        if constexpr (Vec) {
+                            for (int64_t d0 = 0; d0 < D; d0 += 8) {
+                                const KC c = *reinterpret_cast<const KC*>(kj + d0);
+#pragma unroll
+                                for (int e = 0; e < 8; ++e)
+                                    acc += qf[d0 + e] * static_cast<float>(c.v[e]);
+                            }
+                        } else {
+                            for (int64_t d = 0; d < D; ++d)
+                                acc += qf[d] * static_cast<float>(kj[d * ks.s[3]]);
+                        }
+                        s = acc * sc;
+                        const int64_t mo = mrow + j * ms.s[3];
+                        if (pmb != nullptr && !pmb[mo]) s = kNegInf;
+                        if (pmf != nullptr) s += static_cast<float>(pmf[mo]);
+                    }
+                    S[j] = s;
+                    m = s > m ? s : m;
+                }
+                m = decode_block_reduce(it, rd, m, DecodeMax{});
+                float sum = 0.f;
+                for (int64_t j = tid; j < Lk; j += kDecodeThreads) {
+                    const float p = S[j] == kNegInf ? 0.f : ::expf(S[j] - m);
+                    S[j] = p;
+                    sum += p;
+                }
+                sum = decode_block_reduce(it, rd, sum, DecodeSum{});
+
+                const int64_t d = tid % Dv, slice = tid / Dv;
+                float acc = 0.f;
+                if (slice < slices) {
+                    const T* vd = pv + b * vs.s[0] + (h / G) * vs.s[1] + d * vs.s[3];
+                    for (int64_t j = slice; j < Lk; j += slices)
+                        acc += S[j] * static_cast<float>(vd[j * vs.s[2]]);
+                }
+                rd[tid] = acc;
+                sycl::group_barrier(it.get_group());
+                const bool empty = m == kNegInf;
+                if (tid < Dv) {
+                    float o = 0.f;
+                    for (int64_t sl = 0; sl < slices; ++sl) o += rd[sl * Dv + tid];
+                    po[b * os.s[0] + h * os.s[1] + i * os.s[2] + tid * os.s[3]] =
+                        static_cast<T>(empty ? 0.f : o / sum);
+                }
+                if (tid == 0) L[r] = empty ? kNegInf : m + ::logf(sum);
+            });
+    });
+}
+#endif
+
+#if PTSYCL_SDPA_GEMM_PATH
 template <typename T, int D>
 void flash_attention(compat::Queue& queue, const FlashArgs<T>& args, int64_t groups) {
     queue.sycl_queue().submit([&](sycl::handler& cgh) {
@@ -631,6 +757,9 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 
     const int64_t B = q.size(0), H = q.size(1), Lq = q.size(2), D = q.size(3);
     const int64_t Lk = k.size(2), Dv = v.size(3);
+    TORCH_CHECK(k.size(1) > 0 && H % k.size(1) == 0 && v.size(1) == k.size(1),
+                "paras fused attention: ", H, " query heads for ", k.size(1), " key/value heads");
+    const int64_t G = H / k.size(1);
     const int64_t rows = B * H * Lq;
     const float sc = static_cast<float>(
         scale.has_value() ? *scale : 1.0 / std::sqrt(static_cast<double>(D)));
@@ -656,7 +785,7 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             fa.mf = has_mask && !bool_mask ? data_ptr<scalar_t>(mask) : nullptr;
             fa.mb = bool_mask ? mask.data_ptr<bool>() : nullptr;
             fa.qs = strides4(q); fa.ks = strides4(k); fa.vs = strides4(v); fa.os = strides4(out); fa.ms = ms;
-            fa.H = H; fa.Lq = Lq; fa.Lk = Lk;
+            fa.H = H; fa.Lq = Lq; fa.Lk = Lk; fa.kv_group = G;
             fa.q_blocks = (Lq + kFlashBlockQ - 1) / kFlashBlockQ;
             fa.scale = sc; fa.causal = is_causal;
             MaskSummary summary;
@@ -675,6 +804,10 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         const Tensor none = Tensor();
         return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
                 at::empty({}, lopts), at::empty({}, lopts), none};
+    }
+    if (Lq > kFusedMaxQuery && G > 1) {
+        return fused_attention(q, k.repeat_interleave(G, 1), v.repeat_interleave(G, 1), attn_bias,
+                               dropout_p, is_causal, return_debug_mask, scale);
     }
     if (Lq > kFusedMaxQuery) {
         Tensor S = at::empty({B, H, Lq, Lk}, q.options().dtype(c10::kFloat));
@@ -714,9 +847,35 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 #endif
 
-    Tensor scores = at::empty({rows, Lk}, q.options().dtype(c10::kFloat));
     const Strides4 qs = strides4(q), ks = strides4(k), vs = strides4(v),
                    os = strides4(out);
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (queue.is_gpu() && Lk > 0 && Lk <= kDecodeMaxKeys && D <= kDecodeMaxDim &&
+        Dv <= kDecodeThreads) {
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            c10::kHalf, c10::kBFloat16, q.scalar_type(), "ptsycl_decode_attention", [&] {
+                const scalar_t* pk = data_ptr<scalar_t>(k);
+                const bool vec = ks.s[3] == 1 && D % 8 == 0 && ks.s[2] % 8 == 0 &&
+                                 ks.s[1] % 8 == 0 && ks.s[0] % 8 == 0 &&
+                                 reinterpret_cast<std::uintptr_t>(pk) % 16 == 0 &&
+                                 sizeof(scalar_t) <= 2;
+                auto run = [&](auto tag) {
+                    decode_attention<scalar_t, decltype(tag)::value>(
+                        queue, data_ptr<scalar_t>(q), pk, data_ptr<scalar_t>(v), data_ptr<scalar_t>(out),
+                        lse.data_ptr<float>(), bool_mask ? mask.data_ptr<bool>() : nullptr,
+                        has_mask && !bool_mask ? data_ptr<scalar_t>(mask) : nullptr,
+                        qs, ks, vs, os, ms, rows, Lq, H, G, Lk, D, Dv, sc, is_causal);
+                };
+                if (vec) run(std::true_type{});
+                else run(std::false_type{});
+            });
+        const Tensor none = Tensor();
+        return {out, lse, none, none, c10::SymInt(Lq), c10::SymInt(Lk),
+                at::empty({}, lopts), at::empty({}, lopts), none};
+    }
+#endif
+
+    Tensor scores = at::empty({rows, Lk}, q.options().dtype(c10::kFloat));
 
     float* S = scores.data_ptr<float>();
     float* L = lse.data_ptr<float>();
@@ -741,7 +900,7 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                     s = kNegInf;
                 } else {
                     const scalar_t* qr = pq + b * qs.s[0] + h * qs.s[1] + i * qs.s[2];
-                    const scalar_t* kj = pk + b * ks.s[0] + h * ks.s[1] + j * ks.s[2];
+                    const scalar_t* kj = pk + b * ks.s[0] + (h / G) * ks.s[1] + j * ks.s[2];
                     float acc = 0.f;
                     for (int64_t d = 0; d < D; ++d)
                         acc += static_cast<float>(qr[d * qs.s[3]]) *
@@ -775,7 +934,7 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                 const float l = L[r];
                 float acc = 0.f;
                 if (l != kNegInf) {
-                    const scalar_t* vd = pv + b * vs.s[0] + h * vs.s[1] + d * vs.s[3];
+                    const scalar_t* vd = pv + b * vs.s[0] + (h / G) * vs.s[1] + d * vs.s[3];
                     for (int64_t j = 0; j < Lk; ++j) {
                         const float s = S[r * Lk + j];
                         if (s != kNegInf)
@@ -792,6 +951,19 @@ fused_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             at::empty({}, lopts), at::empty({}, lopts), none};
 }
 
+Tensor paras_sdpa(const Tensor& q, const Tensor& k, const Tensor& v,
+                  const std::optional<Tensor>& mask, double scale, bool is_causal) {
+    PTSYCL_TRACE_OP("paras::sdpa");
+    const bool gqa = q.dim() == 4 && k.dim() == 4 && q.size(1) != k.size(1);
+    if (fused_supported(q, k, v, mask, 0.0, gqa))
+        return std::get<0>(fused_attention(q, k, v, mask, 0.0, is_causal, false, scale));
+    return at::scaled_dot_product_attention(q, k, v, mask, 0.0, is_causal, scale, gqa);
+}
+
+}
+
+TORCH_LIBRARY_IMPL(paras, PrivateUse1, m) {
+    m.impl("sdpa", &paras_sdpa);
 }
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

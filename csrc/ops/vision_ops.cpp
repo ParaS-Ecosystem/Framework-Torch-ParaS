@@ -256,81 +256,28 @@ Tensor& avg_pool2d_backward_out(
     return grad_input;
 }
 
-class MaxPool2dFunction : public torch::autograd::Function<MaxPool2dFunction> {
-public:
-    static Tensor forward(AutogradContext* ctx,
-                          const Tensor& self,
-                          IntArrayRef kernel_size,
-                          IntArrayRef stride,
-                          IntArrayRef padding,
-                          IntArrayRef dilation,
-                          bool ceil_mode)
-    {
-        at::AutoDispatchBelowADInplaceOrView g;
-        c10::Device dev = self.device();
-
-        Tensor cpu_in = to_cpu(self);
-        Tensor cpu_out = at::max_pool2d(cpu_in, kernel_size, stride,
-                                         padding, dilation, ceil_mode);
-        Tensor result = to_device(cpu_out, dev);
-
-        ctx->save_for_backward({self.contiguous()});
-        ctx->saved_data["kernel_0"]  = kernel_size[0];
-        ctx->saved_data["kernel_1"]  = kernel_size[1];
-        ctx->saved_data["pad_0"]     = padding[0];
-        ctx->saved_data["pad_1"]     = padding[1];
-        ctx->saved_data["stride_0"]  = stride.empty() ? kernel_size[0] : stride[0];
-        ctx->saved_data["stride_1"]  = stride.empty() ? kernel_size[1] : stride[1];
-        ctx->saved_data["dil_0"]     = dilation[0];
-        ctx->saved_data["dil_1"]     = dilation[1];
-        ctx->saved_data["ceil_mode"] = ceil_mode;
-
-        return result;
-    }
-
-    static tensor_list backward(AutogradContext* ctx,
-                                 tensor_list grad_outputs)
-    {
-        Tensor input = ctx->get_saved_variables()[0];
-        c10::Device dev = input.device();
-
-        int64_t k0  = ctx->saved_data["kernel_0"].toInt();
-        int64_t k1  = ctx->saved_data["kernel_1"].toInt();
-        int64_t p0  = ctx->saved_data["pad_0"].toInt();
-        int64_t p1  = ctx->saved_data["pad_1"].toInt();
-        int64_t s0  = ctx->saved_data["stride_0"].toInt();
-        int64_t s1  = ctx->saved_data["stride_1"].toInt();
-        int64_t d0  = ctx->saved_data["dil_0"].toInt();
-        int64_t d1  = ctx->saved_data["dil_1"].toInt();
-        bool ceil_mode = ctx->saved_data["ceil_mode"].toBool();
-
-        Tensor cpu_dy = to_cpu(grad_outputs[0]);
-        Tensor cpu_x  = to_cpu(input);
-
-        auto result_fwd = at::max_pool2d_with_indices(
-            cpu_x, {k0, k1}, {s0, s1}, {p0, p1}, {d0, d1}, ceil_mode);
-        auto cpu_idx = std::get<1>(result_fwd);
-
-        Tensor cpu_dx = at::max_pool2d_with_indices_backward(
-            cpu_dy, cpu_x, {k0, k1}, {s0, s1}, {p0, p1},
-            {d0, d1}, ceil_mode, cpu_idx);
-
-        Tensor dx = to_device(cpu_dx.contiguous(), dev);
-        return {dx, Tensor{}, Tensor{}, Tensor{}, Tensor{}, Tensor{}};
-    }
-};
-
-Tensor max_pool2d_autograd(
-    const Tensor& self,
-    IntArrayRef kernel_size,
-    IntArrayRef stride,
-    IntArrayRef padding,
-    IntArrayRef dilation,
-    bool ceil_mode)
+std::tuple<Tensor&, Tensor&> max_pool2d_with_indices_out(
+    const Tensor& self, IntArrayRef kernel_size, IntArrayRef stride, IntArrayRef padding,
+    IntArrayRef dilation, bool ceil_mode, Tensor& out, Tensor& indices)
 {
-    PTSYCL_TRACE_OP("max_pool2d");
-    return MaxPool2dFunction::apply(self, kernel_size, stride,
-                                    padding, dilation, ceil_mode);
+    PTSYCL_TRACE_OP("max_pool2d_with_indices.out");
+    auto res = at::max_pool2d_with_indices(to_cpu(self), kernel_size, stride, padding, dilation, ceil_mode);
+    upload(std::get<0>(res), out);
+    upload(std::get<1>(res), indices);
+    return {out, indices};
+}
+
+Tensor& max_pool2d_with_indices_backward_out(
+    const Tensor& grad_output, const Tensor& self, IntArrayRef kernel_size, IntArrayRef stride,
+    IntArrayRef padding, IntArrayRef dilation, bool ceil_mode, const Tensor& indices,
+    Tensor& grad_input)
+{
+    PTSYCL_TRACE_OP("max_pool2d_with_indices_backward.grad_input");
+    Tensor cpu_dx = at::max_pool2d_with_indices_backward(
+        to_cpu(grad_output), to_cpu(self), kernel_size, stride, padding, dilation, ceil_mode,
+        to_cpu(indices));
+    upload(cpu_dx, grad_input);
+    return grad_input;
 }
 
 struct GemmOperand {
@@ -404,6 +351,123 @@ bool device_gemm_eligible(const Tensor& a, const Tensor& b, const Tensor& out,
 #endif
 }
 
+#if defined(PTSYCL_BACKEND_SYCL)
+constexpr int64_t kGemvMaxRows = 8;
+constexpr int kGemvCols = 4;
+constexpr int kGemvThreads = 256;
+constexpr int kGemvMaxSubGroups = kGemvThreads / 16;
+
+template <typename T, int M> class GemvKernel;
+
+template <typename T, int V>
+struct alignas(sizeof(T) * V) GemvChunk {
+    T v[V];
+};
+
+template <typename T, int M>
+void small_m_gemm(compat::Queue& queue, const T* A, int64_t lda, const T* W, int64_t ldw,
+                  T* C, int64_t ldc, int64_t n, int64_t k, float alpha, float beta) {
+    constexpr int V = 16 / sizeof(T);
+    using Ch = GemvChunk<T, V>;
+    const int64_t chunks = k / V;
+    const int64_t groups = (n + kGemvCols - 1) / kGemvCols;
+    queue.sycl_queue().submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> part(sycl::range<1>(M * kGemvCols * kGemvMaxSubGroups), cgh);
+      cgh.template parallel_for<GemvKernel<T, M>>(
+        sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kGemvThreads)),
+                          sycl::range<1>(kGemvThreads)),
+        [=](sycl::nd_item<1> it) {
+            const auto sg = it.get_sub_group();
+            const int tid = static_cast<int>(it.get_local_id(0));
+            const int sgid = static_cast<int>(sg.get_group_linear_id());
+            const int sgs = static_cast<int>(sg.get_group_linear_range());
+            const int64_t n0 = static_cast<int64_t>(it.get_group(0)) * kGemvCols;
+            const T* rows[kGemvCols];
+#pragma unroll
+            for (int c = 0; c < kGemvCols; ++c)
+                rows[c] = W + (n0 + c < n ? n0 + c : n - 1) * ldw;
+            float acc[M][kGemvCols] = {};
+            for (int64_t ch = tid; ch < chunks; ch += kGemvThreads) {
+                Ch w[kGemvCols];
+#pragma unroll
+                for (int c = 0; c < kGemvCols; ++c)
+                    w[c] = *reinterpret_cast<const Ch*>(rows[c] + ch * V);
+#pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    const Ch x = *reinterpret_cast<const Ch*>(A + m * lda + ch * V);
+#pragma unroll
+                    for (int e = 0; e < V; ++e) {
+                        const float xv = static_cast<float>(x.v[e]);
+#pragma unroll
+                        for (int c = 0; c < kGemvCols; ++c)
+                            acc[m][c] += xv * static_cast<float>(w[c].v[e]);
+                    }
+                }
+            }
+            float* pp = &part[0];
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+#pragma unroll
+                for (int c = 0; c < kGemvCols; ++c) {
+                    const float v = sycl::reduce_over_group(sg, acc[m][c], sycl::plus<float>());
+                    if (sg.get_local_linear_id() == 0) pp[(m * kGemvCols + c) * kGemvMaxSubGroups + sgid] = v;
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            if (tid < M * kGemvCols) {
+                const int m = tid / kGemvCols, c = tid % kGemvCols;
+                if (n0 + c < n) {
+                    float v = 0.f;
+                    for (int g = 0; g < sgs; ++g) v += pp[tid * kGemvMaxSubGroups + g];
+                    T* o = C + m * ldc + n0 + c;
+                    const float prev = beta != 0.f ? static_cast<float>(*o) : 0.f;
+                    *o = static_cast<T>(alpha * v + beta * prev);
+                }
+            }
+        });
+    });
+}
+
+bool try_small_m_gemm(const Tensor& a, const Tensor& b, Tensor& out, double alpha, double beta) {
+    if (out.dim() != 2 || a.dim() != 2 || b.dim() != 2) return false;
+    const int64_t m = out.size(0), n = out.size(1), k = a.size(1);
+    if (m < 1 || m > kGemvMaxRows || n < 1 || k < 1) return false;
+    const auto st = a.scalar_type();
+    if (!(st == c10::kBFloat16 || st == c10::kHalf || st == c10::kFloat) ||
+        b.scalar_type() != st || out.scalar_type() != st)
+        return false;
+    const int64_t V = 16 / static_cast<int64_t>(a.element_size());
+    const int64_t lda = m == 1 ? k : a.stride(0), ldw = b.stride(1), ldc = m == 1 ? n : out.stride(0);
+    if (a.stride(1) != 1 || b.stride(0) != 1 || out.stride(1) != 1) return false;
+    if (k % V || lda % V || ldw % V || ldw < k || lda < k || ldc < n) return false;
+    if (reinterpret_cast<std::uintptr_t>(a.data_ptr()) % 16 ||
+        reinterpret_cast<std::uintptr_t>(b.data_ptr()) % 16)
+        return false;
+    auto& q = queue_for(out);
+    if (!q.is_gpu()) return false;
+    AT_DISPATCH_FLOATING_TYPES_AND2(c10::kHalf, c10::kBFloat16, st, "ptsycl_small_m_gemm", [&] {
+        if constexpr (!std::is_same_v<scalar_t, double>) {
+            const scalar_t* pa = data_ptr<scalar_t>(a);
+            const scalar_t* pw = data_ptr<scalar_t>(b);
+            scalar_t* pc = data_ptr<scalar_t>(out);
+            const float al = static_cast<float>(alpha), be = static_cast<float>(beta);
+            switch (m) {
+                case 1: small_m_gemm<scalar_t, 1>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 2: small_m_gemm<scalar_t, 2>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 3: small_m_gemm<scalar_t, 3>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 4: small_m_gemm<scalar_t, 4>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 5: small_m_gemm<scalar_t, 5>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 6: small_m_gemm<scalar_t, 6>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 7: small_m_gemm<scalar_t, 7>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+                case 8: small_m_gemm<scalar_t, 8>(q, pa, lda, pw, ldw, pc, ldc, n, k, al, be); break;
+            }
+        }
+    });
+    PTSYCL_TRACE_OP("gemm.small_m");
+    return true;
+}
+#endif
+
 bool device_gemm(const Tensor& a, const Tensor& b, Tensor& out,
                  double alpha, double beta) {
 #ifdef PTSYCL_USE_CLAP_BLAS
@@ -417,6 +481,9 @@ bool device_gemm(const Tensor& a, const Tensor& b, Tensor& out,
         return true;
     }
 
+#if defined(PTSYCL_BACKEND_SYCL)
+    if (!batched && try_small_m_gemm(a, b, out, alpha, beta)) return true;
+#endif
     const GemmOperand A = gemm_operand(a);
     const GemmOperand B = gemm_operand(b);
     if (!fits_int(A.ld) || !fits_int(B.ld)) return false;
@@ -868,6 +935,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
            &ptsycl::avg_pool2d_out);
     m.impl("aten::avg_pool2d_backward.grad_input",
            &ptsycl::avg_pool2d_backward_out);
+    m.impl("aten::max_pool2d_with_indices.out",
+           &ptsycl::max_pool2d_with_indices_out);
+    m.impl("aten::max_pool2d_with_indices_backward.grad_input",
+           &ptsycl::max_pool2d_with_indices_backward_out);
     m.impl("aten::mm.out",
            &ptsycl::mm_out);
     m.impl("aten::bmm.out",
@@ -892,8 +963,4 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
            &ptsycl::upsample_bilinear2d_out);
     m.impl("aten::upsample_bilinear2d_backward.grad_input",
            &ptsycl::upsample_bilinear2d_backward_out);
-}
-
-TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
-    m.impl("aten::max_pool2d", &ptsycl::max_pool2d_autograd);
 }

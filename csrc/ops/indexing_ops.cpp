@@ -410,6 +410,52 @@ PreparedIndex prepare_advanced_indexing(
     return res;
 }
 
+template <typename W>
+void copy_index_rows(compat::Queue& q, const char* src, char* dst, const int64_t* idx,
+                     int64_t rows, int64_t row_bytes, int64_t dim0, bool gather) {
+    const int64_t words = row_bytes / static_cast<int64_t>(sizeof(W));
+    const W* s = reinterpret_cast<const W*>(src);
+    W* d = reinterpret_cast<W*>(dst);
+    launch_flat(q, rows * words, [=](std::size_t flat_) {
+        const int64_t flat = static_cast<int64_t>(flat_);
+        const int64_t r = flat / words, w = flat % words;
+        int64_t j = idx[r];
+        if (j < 0) j += dim0;
+        if (gather) d[r * words + w] = s[j * words + w];
+        else        d[j * words + w] = s[r * words + w];
+    });
+}
+
+struct alignas(16) Word16 { uint32_t v[4]; };
+
+bool index_rows_applies(const Tensor& self, const PreparedIndex& prep) {
+    const auto& info = prep.info;
+    return info.num_indexed == 1 && info.is_indexed[0] && info.b_ndim == 1 &&
+           self.dim() >= 1 && self.is_contiguous();
+}
+
+void index_rows(const Tensor& self, const PreparedIndex& prep, const Tensor& other, bool gather) {
+    const int64_t rows = prep.expanded_indices[0].numel();
+    const int64_t dim0 = self.size(0);
+    const int64_t row_bytes = (dim0 == 0 ? 0 : self.numel() / dim0) * self.element_size();
+    if (rows == 0 || row_bytes == 0) return;
+    auto& q = queue_for(self);
+    const int64_t* pidx = data_ptr<int64_t>(prep.expanded_indices[0]);
+    const char* src = static_cast<const char*>(gather ? self.data_ptr() : other.data_ptr());
+    char* dst = static_cast<char*>(gather ? other.data_ptr() : self.data_ptr());
+    const auto aligned = [&](std::size_t a) {
+        return row_bytes % static_cast<int64_t>(a) == 0 &&
+               reinterpret_cast<std::uintptr_t>(src) % a == 0 &&
+               reinterpret_cast<std::uintptr_t>(dst) % a == 0;
+    };
+    if (aligned(16))
+        copy_index_rows<Word16>(q, src, dst, pidx, rows, row_bytes, dim0, gather);
+    else if (aligned(4))
+        copy_index_rows<uint32_t>(q, src, dst, pidx, rows, row_bytes, dim0, gather);
+    else
+        copy_index_rows<uint8_t>(q, src, dst, pidx, rows, row_bytes, dim0, gather);
+}
+
 Tensor index_tensor(const Tensor& self,
                     const c10::List<c10::optional<Tensor>>& indices) {
     PTSYCL_TRACE_OP("index.Tensor");
@@ -419,6 +465,10 @@ Tensor index_tensor(const Tensor& self,
     Tensor out = at::empty(prep.out_sizes, self.options());
     const int64_t n = out.numel();
     if (n == 0) return out;
+    if (index_rows_applies(self, prep)) {
+        index_rows(self, prep, out, true);
+        return out;
+    }
 
     auto& q = queue_for(self);
     const auto info = prep.info;
@@ -476,6 +526,10 @@ Tensor& index_put_(Tensor& self, const c10::List<c10::optional<Tensor>>& indices
     auto& q = queue_for(self);
     const auto info = prep.info;
 
+    if (!accumulate && index_rows_applies(self, prep)) {
+        index_rows(self, prep, v, false);
+        return self;
+    }
     if (!accumulate) {
         AT_DISPATCH_ALL_TYPES_AND3(
             c10::kBool, c10::kHalf, c10::kBFloat16, self.scalar_type(),

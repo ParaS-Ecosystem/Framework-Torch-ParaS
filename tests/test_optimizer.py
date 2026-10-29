@@ -221,7 +221,7 @@ def test_block_inference_parity_and_reports(device):
         ref = block(x, cos, sin)
         out = torch.compile(block, backend="paras")(x, cos, sin)
     _close(out, ref, 1e-5, "block inference")
-    expected = {"rms_norm": 2, "rotate_half": 2}
+    expected = {"rms_norm": 2, "rotate_half": 2, "rope": 2, "add_rms_norm": 1}
     if _silu_fusable(device, torch.float32):
         expected["swiglu"] = 1
     assert _fusions() == expected, _fusions()
@@ -528,3 +528,186 @@ def test_no_fusion_across_inplace_update(device):
     out = torch.compile(f, backend="paras")(x.clone(), w)
     assert _fusions() == {}, _fusions()
     assert_close(out, ref, "rms_norm across x.add_")
+
+
+def _repeat_kv(x, n_rep):
+    b, h, s, d = x.shape
+    return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
+
+
+def test_gqa_attention_fused_and_exact(device):
+    torch.manual_seed(0)
+
+    def attend(q, k, v, mask):
+        return F.scaled_dot_product_attention(q, _repeat_kv(k, 4), _repeat_kv(v, 4), attn_mask=mask)
+
+    with torch.no_grad():
+        for Lq, Lk in ((1, 77), (64, 64)):
+            _reset()
+            q = torch.randn(1, 8, Lq, 64, device=device, dtype=torch.bfloat16)
+            k = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+            v = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+            mask = torch.zeros(1, 1, Lq, Lk, device=device, dtype=torch.bfloat16)
+            mask[..., Lk // 2:] = torch.finfo(torch.bfloat16).min
+            ref = attend(q, k, v, mask)
+            out = torch_paras.compile(attend)(q, k, v, mask)
+            assert _fusions().get("gqa_attention") == 1, _fusions()
+            assert torch.equal(out.cpu(), ref.cpu()), (Lq, Lk)
+
+
+def test_sdpa_bool_mask_fused_and_exact(device):
+    torch.manual_seed(0)
+
+    def attend(q, k, v, mask):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+
+    for Lq, Lk in ((1, 77), (64, 64)):
+        q = torch.randn(1, 8, Lq, 64, device=device, dtype=torch.bfloat16)
+        k = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+        v = torch.randn(1, 2, Lk, 64, device=device, dtype=torch.bfloat16)
+        mask = torch.ones(1, 1, Lq, Lk, device=device, dtype=torch.bool).tril(Lk - Lq)
+        mask[..., :3] = False
+        with torch.no_grad():
+            _reset()
+            ref = attend(q, k, v, mask)
+            out = torch_paras.compile(attend)(q, k, v, mask)
+            assert _fusions().get("sdpa_bool_mask") == 1, _fusions()
+            assert torch.equal(out.cpu(), ref.cpu()), (Lq, Lk)
+    _reset()
+    qg = q.clone().requires_grad_()
+    out = torch_paras.compile(attend)(qg, k, v, mask)
+    assert "sdpa_bool_mask" not in _fusions(), _fusions()
+    assert torch.equal(out.detach().cpu(), attend(qg, k, v, mask).detach().cpu())
+
+
+
+def _rotate(x):
+    h = x.shape[-1] // 2
+    return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
+
+
+def _apply_rope(q, k, cos, sin):
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    return q * cos + _rotate(q) * sin, k * cos + _rotate(k) * sin
+
+
+def _apply_partial_rope(q, cos, sin, rot=32):
+    q_rot, q_pass = q[..., :rot], q[..., rot:]
+    q_rot = q_rot * cos.unsqueeze(1) + _rotate(q_rot) * sin.unsqueeze(1)
+    return torch.cat((q_rot, q_pass), dim=-1)
+
+
+def test_rope_fused_and_exact(device):
+    torch.manual_seed(0)
+    for dtype in (torch.bfloat16, torch.float32):
+        _reset()
+        q = torch.randn(2, 8, 5, 64, device=device, dtype=dtype).transpose(1, 2)
+        k = torch.randn(2, 2, 8, 64, device=device, dtype=dtype)
+        cos = torch.randn(2, 8, 64, device=device, dtype=dtype)
+        sin = torch.randn(2, 8, 64, device=device, dtype=dtype)
+        with torch.no_grad():
+            ref = _apply_rope(q, k, cos, sin)
+            out = torch_paras.compile(_apply_rope)(q, k, cos, sin)
+        assert _fusions().get("rope") == 2, _fusions()
+        for o, r in zip(out, ref):
+            assert torch.equal(o.cpu(), r.cpu()), dtype
+        _reset()
+        with torch.no_grad():
+            ref = _apply_partial_rope(q, cos[..., :32], sin[..., :32])
+            out = torch_paras.compile(_apply_partial_rope)(q, cos[..., :32], sin[..., :32])
+        assert _fusions().get("rope") == 1, _fusions()
+        assert torch.equal(out.cpu(), ref.cpu()), dtype
+
+
+def test_rope_training_gradient(device):
+    torch.manual_seed(0)
+    _reset()
+    q = torch.randn(1, 4, 6, 32, device=device, requires_grad=True)
+    k = torch.randn(1, 4, 6, 32, device=device, requires_grad=True)
+    cos, sin = torch.randn(1, 6, 32, device=device), torch.randn(1, 6, 32, device=device)
+    loss = lambda f: sum((t * t).sum() for t in f(q, k, cos, sin))
+    ref = torch.autograd.grad(loss(_apply_rope), (q, k))
+    got = torch.autograd.grad(loss(torch_paras.compile(_apply_rope)), (q, k))
+    assert _fusions().get("rope") == 2, _fusions()
+    for g, r in zip(got, ref):
+        _close(g, r, 1e-5, "rope grad")
+
+
+class _ResidualNorm(nn.Module):
+    """h = residual + x; (h, RMSNorm(h)) -- a decoder layer's residual add and
+    the norm after it."""
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden))
+
+    def forward(self, residual, x):
+        h = residual + x
+        hf = h.to(torch.float32)
+        var = hf.pow(2).mean(-1, keepdim=True)
+        norm = self.weight * (hf * torch.rsqrt(var + 1e-6)).to(h.dtype)
+        return h * 2, norm
+
+
+def test_add_rms_norm_fused_and_exact(device):
+    torch.manual_seed(0)
+    for dtype in (torch.bfloat16, torch.float32):
+        for hidden in (48, 2048):
+            _reset()
+            m = _ResidualNorm(hidden).to(device=device, dtype=dtype)
+            r = torch.randn(3, 4, hidden, device=device, dtype=dtype)
+            x = torch.randn(3, 4, hidden, device=device, dtype=dtype)
+            with torch.no_grad():
+                ref = m(r, x)
+                out = torch_paras.compile(m)(r, x)
+            assert _fusions().get("add_rms_norm") == 1, _fusions()
+            for o, e in zip(out, ref):
+                assert torch.equal(o.cpu(), e.cpu()), (dtype, hidden)
+
+
+def test_add_rms_norm_training_gradient(device):
+    torch.manual_seed(0)
+    _reset()
+    m = _ResidualNorm(256).to(device)
+    r = torch.randn(2, 3, 256, device=device, requires_grad=True)
+    x = torch.randn(2, 3, 256, device=device, requires_grad=True)
+
+    def loss(f):
+        h, n = f(r, x)
+        return (h * h).sum() + (n * n * 0.5).sum()
+
+    ref = torch.autograd.grad(loss(m), (r, x, m.weight))
+    got = torch.autograd.grad(loss(torch_paras.compile(m)), (r, x, m.weight))
+    assert _fusions().get("add_rms_norm") == 1, _fusions()
+    for g, e in zip(got, ref):
+        _close(g, e, 1e-4, "add_rms_norm grad")
+
+
+def test_fused_nodes_have_example_values(device):
+    import sys
+    passes = sys.modules["torch_paras.optimizer.passes"]
+    seen = []
+
+    def backend(gm, example_inputs):
+        passes.run(gm, set(passes.PASSES))
+        for n in gm.graph.nodes:
+            if n.op == "call_function" and getattr(n.target, "namespace", "") == "paras":
+                seen.append((str(n.target), n.meta.get("example_value") is not None))
+        return gm.forward
+
+    torch.manual_seed(0)
+    m = _ResidualNorm(64).to(device)
+    cos, sin = torch.randn(1, 3, 64, device=device), torch.randn(1, 3, 64, device=device)
+
+    def step(res, x):
+        h, n = m(res, x)
+        q, k = _apply_rope(n.view(1, 3, 1, 64).transpose(1, 2), n.view(1, 3, 1, 64).transpose(1, 2), cos, sin)
+        return h + q.sum() + k.sum()
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        torch.compile(step, backend=backend)(torch.randn(1, 3, 64, device=device),
+                                             torch.randn(1, 3, 64, device=device))
+    names = {t for t, _ in seen}
+    assert {"paras.add_rms_norm.default", "paras.rope.default"} <= names, seen
+    assert all(ok for _, ok in seen), seen

@@ -128,6 +128,10 @@ inference graph.
 | `rms_norm` | `w * (x32 * rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)` with `x32 = x.to(float32)` (or `x` already fp32; `x*x` accepted for `pow(2)`) | `paras::rms_norm(x, w, eps)` |
 | `swiglu` | `silu(gate) * up` (skipped where CLAP-DNN runs eager SiLU, see below) | `paras::swiglu(gate, up)` |
 | `rotate_half` | `cat((-x[..., h:], x[..., :h]), -1)` with `h = x.shape[-1] // 2` | `paras::rotate_half(x)` |
+| `sdpa_bool_mask` | `scaled_dot_product_attention(q, k, v, attn_mask=<bool>)`, inference graphs only | `paras::sdpa(q, k, v, mask, scale, is_causal)`: the boolean mask goes to the fused kernels as it is, instead of ATen's `where(mask, 0, -inf)` on every call (three kernels per layer for the mask a decoder builds once per step); same result |
+| `gqa_attention` | `scaled_dot_product_attention(q, repeat_kv(k), repeat_kv(v))`, `repeat_kv(x) = x[:, :, None].expand(B, Hk, G, L, D).reshape(B, Hk*G, L, D)` (transformers' form) | the same call on `k`, `v` with `enable_gqa=True`: the fused attention kernels read key/value head `h // G` in place instead of a copy of the KV cache per call |
+| `rope` | `x * cos + rotate_half(x) * sin` after the `rotate_half` pass (transformers' `apply_rotary_pos_emb`; also on a slice, Param2's partial rotary), `cos`/`sin` broadcast to `x` and not requiring grad | `paras::rope(x, cos, sin)`: one launch instead of four |
+| `add_rms_norm` | `h = a + b` followed by `paras::rms_norm(h, w, eps)` (a decoder layer's residual add and the norm after it); `h` keeps its other users | `paras::add_rms_norm(a, b, w, eps)` = `(h, norm, rstd)` in one launch |
 
 Method, function and operator spellings are all recognised (`x.pow(2)`,
 `torch.pow(x, 2)`, `x ** 2`). A pattern is rewritten only when the fused
@@ -149,7 +153,8 @@ the ParaS kernel, so SwiGLU is fused in every dtype.
 **Fused kernels are bit-exact with the eager decomposition** on the same
 device: they perform the same rounding steps in the same order (RMSNorm
 reuses the eager reduction, `reduce_outer`, with the same shape, so even the
-summation order matches). Fusing therefore cannot change a model's result --
+summation order matches; RoPE rounds each product before the add, with
+floating-point contraction off so no fused multiply-add skips a rounding). Fusing therefore cannot change a model's result --
 which matters for mixture-of-experts models, where a one-ulp difference can
 flip a top-k routing decision. `tests/test_optimizer.py` asserts
 `torch.equal` between fused and eager outputs.

@@ -32,6 +32,7 @@ registered ParaS backward kernel (see ops.py) rather than the backward of the
 original decomposition.
 """
 
+import math
 import operator
 from collections import Counter
 from typing import Optional
@@ -124,10 +125,14 @@ def _no_mutation_within(nodes) -> bool:
     inserted at the last node and reads its operands there, so an in-place
     update of an operand inside the pattern's span would change its result."""
     members = set(nodes)
-    graph_nodes = list(next(iter(members)).graph.nodes)
-    positions = [graph_nodes.index(n) for n in members]
-    return not any(_may_mutate(n) and n not in members
-                   for n in graph_nodes[min(positions):max(positions) + 1])
+    first, last = min(members), max(members)
+    n = first
+    while True:
+        if n not in members and _may_mutate(n):
+            return False
+        if n is last:
+            return True
+        n = n.next
 
 
 def _erase(gm: fx.GraphModule, nodes) -> None:
@@ -273,7 +278,11 @@ def fuse_rms_norm(gm: fx.GraphModule) -> int:
         with gm.graph.inserting_before(node):
             fused = gm.graph.call_function(torch.ops.paras.rms_norm.default, (x, weight, eps))
             out = gm.graph.call_function(operator.getitem, (fused, 0))
-        out.meta["example_value"] = node.meta.get("example_value")
+        out_v = node.meta.get("example_value")
+        out.meta["example_value"] = out_v
+        if isinstance(out_v, torch.Tensor):
+            rows = out_v.numel() // out_v.shape[-1] if out_v.dim() else 1
+            fused.meta["example_value"] = (out_v, out_v.new_empty((rows,), dtype=torch.float32))
         node.replace_all_uses_with(out)
         _erase(gm, [node] + pattern)
         count += 1
@@ -394,10 +403,233 @@ def fuse_rotate_half(gm: fx.GraphModule) -> int:
     return count
 
 
+def _full_slice(x) -> bool:
+    return isinstance(x, slice) and x.start is None and x.stop is None and x.step is None
+
+
+def _repeat_kv_source(node):
+    """(x, G) if `node` is repeat_kv(x, G) with private intermediates."""
+    if _op(node) != "reshape":
+        return None
+    expand = node.args[0]
+    if _op(expand) != "expand" or not _private(expand, {node}):
+        return None
+    unsq = expand.args[0]
+    name = _op(unsq)
+    if name == "getitem":
+        index = unsq.args[1] if len(unsq.args) == 2 else None
+        if not (isinstance(index, tuple) and len(index) >= 3 and index[2] is None and
+                all(_full_slice(i) for i in index[:2]) and
+                all(_full_slice(i) or i is Ellipsis for i in index[3:])):
+            return None
+    elif name == "unsqueeze":
+        if unsq.args[1:] != (2,) or unsq.kwargs:
+            return None
+    else:
+        return None
+    if not _private(unsq, {expand}):
+        return None
+    x = unsq.args[0]
+    xv, ev, rv = _value(x), _value(expand), _value(node)
+    if xv is None or ev is None or rv is None or xv.dim() != 4 or ev.dim() != 5 or rv.dim() != 4:
+        return None
+    B, Hk, L, D = xv.shape
+    G = ev.shape[2]
+    if not isinstance(G, int) or G < 2:
+        return None
+    if tuple(ev.shape) != (B, Hk, G, L, D) or tuple(rv.shape) != (B, Hk * G, L, D):
+        return None
+    return x, G
+
+
+def fuse_gqa_attention(gm: fx.GraphModule) -> int:
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not F.scaled_dot_product_attention:
+            continue
+        if len(node.args) != 3 or node.kwargs.get("enable_gqa", False):
+            continue
+        if node.kwargs.get("dropout_p", 0.0) != 0.0:
+            continue
+        q, k, v = node.args
+        ks, vs = _repeat_kv_source(k), _repeat_kv_source(v)
+        if ks is None or vs is None or ks[1] != vs[1]:
+            continue
+        if not (_private(k, {node}) and _private(v, {node}) and _on_paras(q, ks[0], vs[0])):
+            continue
+        if not _no_mutation_within([node, k, v, k.args[0], v.args[0], k.args[0].args[0], v.args[0].args[0]]):
+            continue
+        node.args = (q, ks[0], vs[0])
+        node.kwargs = {**node.kwargs, "enable_gqa": True}
+        for rk in (k, v):
+            expand = rk.args[0]
+            unsq = expand.args[0]
+            _erase(gm, [rk, expand, unsq])
+        count += 1
+    return count
+
+def _mul_operands(node):
+    if _op(node) != "mul":
+        return None
+    return _operands(node)
+
+
+def _rope_parts(add):
+    """(x, cos, sin, mul_a, mul_b, rot) if `add` is x*cos + rotate_half(x)*sin."""
+    ops = _operands(add)
+    if ops is None:
+        return None
+    for left, right in (ops, ops[::-1]):
+        la, ra = _mul_operands(left), _mul_operands(right)
+        if la is None or ra is None:
+            continue
+        for rot, sin in (ra, ra[::-1]):
+            if not (isinstance(rot, fx.Node) and rot.op == "call_function" and
+                    rot.target is torch.ops.paras.rotate_half.default):
+                continue
+            x = rot.args[0]
+            for xa, cos in (la, la[::-1]):
+                if xa is x:
+                    return x, cos, sin, left, right, rot
+    return None
+
+
+def fuse_rope(gm: fx.GraphModule) -> int:
+    count = 0
+    for node in list(gm.graph.nodes):
+        if _op(node) != "add" or node.kwargs:
+            continue
+        parts = _rope_parts(node)
+        if parts is None:
+            continue
+        x, cos, sin, mul_a, mul_b, rot = parts
+        xv, cv, sv, ov = _value(x), _value(cos), _value(sin), _value(node)
+        if xv is None or cv is None or sv is None or ov is None:
+            continue
+        if not (xv.dtype == cv.dtype == sv.dtype == ov.dtype and xv.dtype.is_floating_point):
+            continue
+        if cv.requires_grad or sv.requires_grad:
+            continue
+        try:
+            if (tuple(torch.broadcast_shapes(xv.shape, cv.shape, sv.shape)) != tuple(xv.shape)
+                    or tuple(ov.shape) != tuple(xv.shape)):
+                continue
+        except RuntimeError:
+            continue
+        if not _on_paras(x, cos, sin):
+            continue
+        if not (_private(mul_a, {node}) and _private(mul_b, {node}) and _private(rot, {mul_b})):
+            continue
+        if not _no_mutation_within([node, mul_a, mul_b, rot]):
+            continue
+        with gm.graph.inserting_before(node):
+            fused = gm.graph.call_function(torch.ops.paras.rope.default, (x, cos, sin))
+        fused.meta["example_value"] = node.meta.get("example_value")
+        node.replace_all_uses_with(fused)
+        _erase(gm, [node, mul_a, mul_b, rot])
+        count += 1
+    return count
+
+
+def fuse_add_rms_norm(gm: fx.GraphModule) -> int:
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not torch.ops.paras.rms_norm.default:
+            continue
+        h, w, eps = node.args
+        if _op(h) != "add" or h.kwargs:
+            continue
+        ops = _operands(h)
+        if ops is None or not all(isinstance(t, fx.Node) for t in ops):
+            continue
+        a, b = ops
+        av, bv, hv = _value(a), _value(b), _value(h)
+        if av is None or bv is None or hv is None:
+            continue
+        if not (tuple(av.shape) == tuple(bv.shape) == tuple(hv.shape) and
+                av.dtype == bv.dtype == hv.dtype):
+            continue
+        if not _on_paras(a, b):
+            continue
+        if not all(u.op == "call_function" and u.target is operator.getitem for u in node.users):
+            continue
+        if isinstance(w, fx.Node) and w > h:
+            continue
+        if not _no_mutation_within([h, node]):
+            continue
+        with gm.graph.inserting_after(h):
+            fused = gm.graph.call_function(torch.ops.paras.add_rms_norm.default, (a, b, w, eps))
+        with gm.graph.inserting_after(fused):
+            parts = [gm.graph.call_function(operator.getitem, (fused, i)) for i in range(3)]
+        norm_value = node.meta.get("example_value")
+        parts[0].meta["example_value"] = h.meta.get("example_value")
+        if isinstance(norm_value, (tuple, list)) and len(norm_value) == 2:
+            parts[1].meta["example_value"], parts[2].meta["example_value"] = norm_value
+            fused.meta["example_value"] = (h.meta.get("example_value"), *norm_value)
+        else:
+            for u in node.users:
+                parts[1 + u.args[1]].meta["example_value"] = u.meta.get("example_value")
+        for u in list(node.users):
+            u.replace_all_uses_with(parts[1] if u.args[1] == 0 else parts[2])
+            gm.graph.erase_node(u)
+        gm.graph.erase_node(node)
+        h.replace_all_uses_with(parts[0])
+        gm.graph.erase_node(h)
+        count += 1
+    return count
+
+
+_SDPA_KWARGS = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
+
+
+def fuse_sdpa_bool_mask(gm: fx.GraphModule) -> int:
+    if torch.is_grad_enabled():
+        return 0
+    count = 0
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not F.scaled_dot_product_attention:
+            continue
+        if len(node.args) != 3 or not set(node.kwargs) <= _SDPA_KWARGS:
+            continue
+        mask = node.kwargs.get("attn_mask")
+        if not isinstance(mask, fx.Node) or node.kwargs.get("dropout_p", 0.0) != 0.0:
+            continue
+        q, k, v = node.args
+        qv, kv, vv, mv = _value(q), _value(k), _value(v), _value(mask)
+        if qv is None or kv is None or vv is None or mv is None or mv.dtype != torch.bool:
+            continue
+        if qv.dim() != 4 or any(t.requires_grad for t in (qv, kv, vv)):
+            continue
+        if kv.shape[1] != qv.shape[1] and not node.kwargs.get("enable_gqa", False):
+            continue
+        if not _on_paras(q, k, v, mask):
+            continue
+        scale = node.kwargs.get("scale")
+        if scale is None:
+            scale = 1.0 / math.sqrt(qv.shape[-1])
+        if not isinstance(scale, (int, float)):
+            continue
+        is_causal = node.kwargs.get("is_causal", False)
+        if not isinstance(is_causal, bool):
+            continue
+        with gm.graph.inserting_before(node):
+            fused = gm.graph.call_function(torch.ops.paras.sdpa.default,
+                                           (q, k, v, mask, float(scale), is_causal))
+        fused.meta["example_value"] = node.meta.get("example_value")
+        node.replace_all_uses_with(fused)
+        gm.graph.erase_node(node)
+        count += 1
+    return count
+
+
 PASSES = {
     "rms_norm": fuse_rms_norm,
     "swiglu": fuse_swiglu,
     "rotate_half": fuse_rotate_half,
+    "gqa_attention": fuse_gqa_attention,
+    "sdpa_bool_mask": fuse_sdpa_bool_mask,
+    "rope": fuse_rope,
+    "add_rms_norm": fuse_add_rms_norm,
 }
 
 

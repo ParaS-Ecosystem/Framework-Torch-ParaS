@@ -380,3 +380,64 @@ def test_sdpa_flash_block_masks(device):
         F.scaled_dot_product_attention(q, k, v, attn_mask=m)
         m.zero_()
         assert torch.equal(F.scaled_dot_product_attention(q, k, v, attn_mask=m).cpu(), plain.cpu())
+
+
+def test_sdpa_decode_kernel_cases(device):
+    torch.manual_seed(0)
+    cases = [
+        (1, 32, 1, 1, 64, 64, torch.bfloat16, None, False),
+        (1, 32, 1, 255, 64, 64, torch.bfloat16, None, False),
+        (2, 8, 1, 1000, 128, 128, torch.bfloat16, "float", False),
+        (1, 4, 1, 8192, 64, 64, torch.float16, "bool", False),
+        (1, 4, 1, 9000, 64, 64, torch.bfloat16, None, False),
+        (1, 4, 3, 40, 80, 48, torch.float32, None, True),
+        (2, 6, 16, 300, 64, 64, torch.bfloat16, "float", True),
+    ]
+    for B, H, Lq, Lk, D, Dv, dt, mask, causal in cases:
+        q = torch.randn(B, H, Lq, D, dtype=dt)
+        k = torch.randn(B, H, Lk, D, dtype=dt)
+        v = torch.randn(B, H, Lk, Dv, dtype=dt)
+        m = None
+        if mask == "float":
+            m = torch.randn(B, 1, Lq, Lk, dtype=dt).clamp(max=0) * 4
+            m[..., Lk // 3: Lk // 2] = torch.finfo(dt).min
+        elif mask == "bool":
+            m = torch.rand(B, 1, Lq, Lk) > 0.3
+        ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float(),
+                                             attn_mask=None if m is None else (m if m.dtype == torch.bool else m.float()),
+                                             is_causal=causal)
+        out = F.scaled_dot_product_attention(q.to(device), k.to(device), v.to(device),
+                                             attn_mask=None if m is None else m.to(device),
+                                             is_causal=causal)
+        tol = 2e-2 if dt != torch.float32 else 1e-4
+        err = (out.cpu().float() - ref).abs().max().item()
+        assert err < tol, (B, H, Lq, Lk, D, Dv, dt, mask, causal, err)
+    q = torch.randn(1, 8, 1, 64, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 1, 77, 64, dtype=torch.bfloat16).expand(1, 2, 4, 77, 64).reshape(1, 8, 77, 64)
+    v = torch.randn(1, 2, 1, 77, 64, dtype=torch.bfloat16).expand(1, 2, 4, 77, 64)
+    vd = v.to(device).reshape(1, 8, 77, 64)
+    ref = F.scaled_dot_product_attention(q.float(), k.float(), v.reshape(1, 8, 77, 64).float())
+    out = F.scaled_dot_product_attention(q.to(device), k.to(device), vd)
+    assert (out.cpu().float() - ref).abs().max().item() < 2e-2
+
+
+def _near(actual, expected, msg, tol=1e-5):
+    """Max error relative to the reference's largest magnitude (at least 1)."""
+    actual, expected = actual.cpu().float(), expected.cpu().float()
+    assert actual.shape == expected.shape, (msg, actual.shape, expected.shape)
+    err = ((actual - expected).abs().max() / expected.abs().max().clamp_min(1.0)).item()
+    assert err <= tol, f"{msg}: relative error {err:.3e} > {tol:.1e}"
+
+
+def test_reductions_around_work_group_rows(device):
+    torch.manual_seed(0)
+    for cols in (255, 256, 1000, 4096, 16384, 16385):
+        x = torch.randn(5, cols)
+        xd = x.to(device)
+        _near(xd.sum(-1), x.double().sum(-1).float(), f"sum {cols}", tol=1e-4)
+        _near(xd.mean(-1), x.mean(-1), f"mean {cols}", tol=1e-5)
+        _near(xd.amax(-1), x.amax(-1), f"amax {cols}", tol=0)
+        _near(torch.softmax(xd, -1), torch.softmax(x, -1), f"softmax {cols}", tol=1e-5)
+        _near(torch.log_softmax(xd, -1), torch.log_softmax(x, -1), f"log_softmax {cols}", tol=1e-4)
+        xb = x.bfloat16()
+        _near(xb.to(device).float().pow(2).mean(-1), xb.float().pow(2).mean(-1), f"bf16 mean {cols}", tol=1e-4)
