@@ -55,7 +55,9 @@ __all__ = [
     "reset_runtime_stats",
     "set_strict",
     "is_strict",
+    "compile",
     "nn",
+    "optimizer",
 ]
 
 
@@ -168,3 +170,8 @@ def _register() -> None:
 
 
 _register()
+
+from . import optimizer  # noqa: E402
+from .optimizer import compile  # noqa: E402,F401
+
+optimizer.register()

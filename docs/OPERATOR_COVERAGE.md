@@ -12,13 +12,22 @@ Counted from the `TORCH_LIBRARY_IMPL` blocks in `csrc/ops/*.cpp`
 
 | | Count |
 |---|---|
-| aten registrations, `PrivateUse1` | 213 |
-| aten registrations, `AutogradPrivateUse1` (`linear`, `max_pool2d`) | 2 |
-| **Total aten kernel registrations** | **215** |
-| Distinct aten operators (overloads collapsed, e.g. `sort` / `sort.stable`) | 170 |
+| aten registrations, `PrivateUse1` | 236 |
+| aten registrations, `AutogradPrivateUse1` (`max_pool2d`) | 1 |
+| **Total aten kernel registrations** | **237** |
+| Distinct aten operators (overloads collapsed, e.g. `sort` / `sort.stable`) | 184 |
 | Custom ops, `paras::` namespace (`fused_ops.cpp`) | 6 |
 | Custom ops, `torch_paras::` namespace (`rms_swiglu_ops.cpp`, also registered for CPU) | 1 |
-| **Total native ops** | **222** |
+| **Total native ops** | **244** |
+
+CompositeImplicitAutograd operators (`linear`, `matmul`, `reshape`,
+`contiguous`, `repeat_interleave`, `rms_norm`) are deliberately **not**
+registered: a PrivateUse1 kernel for them would bypass autograd (and make
+AOTAutograd trace them as leaves without a derivative). They decompose into
+the kernels counted here. Operators that PyTorch gives a derivative formula of
+their own (`_safe_softmax`, `silu_backward`,
+`_scaled_dot_product_fused_attention_overrideable`) are safe to register and
+are, as on CUDA.
 
 Everything else goes through the boxed CPU fallback registered in
 `tensor_ops.cpp`.
@@ -27,20 +36,20 @@ Everything else goes through the boxed CPU fallback registered in
 
 | File | aten | custom | Total |
 |---|---|---|---|
-| `pointwise_ops.cpp` | 108 | — | 108 |
-| `tensor_ops.cpp` | 34 | — | 34 |
-| `vision_ops.cpp` | 20 | — | 20 |
-| `indexing_ops.cpp` | 16 | — | 16 |
-| `scatter_ops.cpp` | 8 | — | 8 |
+| `pointwise_ops.cpp` | 126 | — | 126 |
+| `tensor_ops.cpp` | 30 | — | 30 |
+| `indexing_ops.cpp` | 21 | — | 21 |
+| `vision_ops.cpp` | 19 | — | 19 |
+| `scatter_ops.cpp` | 12 | — | 12 |
 | `creation_ops.cpp` | 7 | — | 7 |
 | `loss_ops.cpp` | 7 | — | 7 |
 | `random_ops.cpp` | 7 | — | 7 |
 | `fused_ops.cpp` | — | 6 | 6 |
 | `norm_ops.cpp` | 4 | — | 4 |
-| `rms_swiglu_ops.cpp` | 1 | 1 | 2 |
+| `sdpa_ops.cpp` | 2 | — | 2 |
 | `sort_ops.cpp` | 2 | — | 2 |
-| `attention_ops.cpp` | 1 | — | 1 |
-| **Total** | **215** | **7** | **222** |
+| `rms_swiglu_ops.cpp` | — | 1 | 1 |
+| **Total** | **237** | **7** | **244** |
 
 ## Status Legend
 
@@ -64,22 +73,23 @@ Everything else goes through the boxed CPU fallback registered in
 | Activations + backward (`relu`, `sigmoid`, `tanh`, `silu`, `gelu`, `hardtanh`, `hardswish`, `hardsigmoid`, `leaky_relu`, `threshold_backward`, `logit`, `log_sigmoid`, `clamp`, `clamp_min`) | 32 | Native | Partial | `test_pointwise_ops.py` | `hardswish` untested |
 | Comparisons (`eq/ne/lt/gt/le/ge`, Tensor and Scalar) | 12 | Native | Yes | `test_pointwise_ops.py` | |
 | Bitwise (`and`, `or`, `xor`, `not`) | 4 | Native | Yes | `test_pointwise_ops.py` | |
-| Reductions (`sum`, `mean`, `prod`, `amax`, `amin`, `argmax`, `min`, `max`, `dot`) | 9 | Native | Yes | `test_pointwise_ops.py` | |
+| Reductions (`sum`, `mean`, `prod`, `amax`, `amin`, `argmax`, `min`, `max`, `dot`, `any`, `all`, `linalg_vector_norm`) | 16 | Native | Yes | `test_pointwise_ops.py`, `test_device_blas_and_runtime.py` | Bool inputs supported; long rows use a two-level (striped) reduction |
+| Logical / predicates (`logical_not`, `isneginf`, `isposinf`, `isin`, `floor_divide`) | 7 | Native | Yes | `test_device_blas_and_runtime.py` | Needed by attention masks and `generate()` |
 | `cat` | 2 | Native | Yes | `test_pointwise_ops.py` | |
 | Softmax / log-softmax + backward | 8 | Native | Yes | `test_pointwise_ops.py` | |
 | `cumsum` | 3 | Native | Yes | `test_pointwise_ops.py` | |
-| Sort / top-k / `max.dim` / `min.dim` / `argsort` | 12 | Partial | Yes | `test_pointwise_ops.py`, `test_matmul_sort_creation_ops.py` | `sort`/`topk` rows longer than `PTSYCL_SORT_NAIVE_MAX` (4096) fall back to CPU |
-| Indexing (`gather`, `index_select`, `index_copy`, `index.Tensor`, `index_put`, `where`, `triu`, `tril`) | 16 | Native | Yes | `test_indexing_ops.py` | |
-| Scatter / `masked_fill` | 8 | Native | **No** | — | No parity test yet |
-| Matrix multiply (`mm`, `bmm`, `addmm`, `linear`) | 4 | Native | Yes | `test_matmul_sort_creation_ops.py`, `test_vision_ops.py` | `linear` registered at `AutogradPrivateUse1` |
+| Sort / top-k / `max.dim` / `min.dim` / `argsort` | 12 | Native | Yes | `test_pointwise_ops.py`, `test_matmul_sort_creation_ops.py`, `test_device_blas_and_runtime.py` | On the device, no length limit: rank sort (rows <= 8192) or bitonic network; exact keys, NaN largest, stable |
+| Indexing (`gather`, `index_select`, `index_copy`, `index_add`, `index.Tensor`, `index_put`, `_index_put_impl_`, `nonzero`, `repeat_interleave.Tensor`, `where`, `triu`, `tril`) | 22 | Native | Yes | `test_indexing_ops.py`, `test_device_blas_and_runtime.py` | Accumulating `index_put_` covers every dtype (Half/BFloat16 accumulate in fp32) |
+| Scatter / `scatter_add` / `masked_fill` | 11 | Native | Yes | `test_device_blas_and_runtime.py` | |
+| Matrix multiply (`mm`, `bmm`, `addmm`) | 3 | Native | Yes | `test_matmul_sort_creation_ops.py`, `test_device_blas_and_runtime.py` | GPU: device GEMM through CLAP (fp32/fp64/fp16/bf16); `linear`/`matmul` decompose into these |
 | Convolution (`convolution_overrideable` + backward) | 2 | Native | **No** | — | No parity test yet |
 | Pooling (`_adaptive_avg_pool2d` ± backward, `avg_pool2d` ± backward, `max_pool2d`) | 5 | Native | Partial | `test_vision_ops.py` | Only adaptive avg pool tested; `max_pool2d` registered at `AutogradPrivateUse1` |
 | Upsampling (`nearest2d`, `_nearest_exact2d`, `bilinear2d`, each ± backward) | 6 | Native | Partial | `test_vision_ops.py` | Only `upsample_nearest2d` forward tested |
 | Batch / layer norm (`native_batch_norm`, `native_layer_norm`, each ± backward) | 4 | Native | **No** | — | No parity test in repo yet |
-| RMS norm (`aten::rms_norm`) | 1 | Native | Yes | `test_attention_norm_ops.py` | |
+| RMS norm (`aten::rms_norm`) | — | Composite | Yes | `test_attention_norm_ops.py` | Decomposes into pow/mean/rsqrt/mul kernels |
 | Losses (`mse_loss`, `binary_cross_entropy`, `nll_loss`, with backward) | 7 | Native | Partial | `test_pointwise_ops.py` | `nll_loss` covered only via log_softmax chain; MSE and BCE untested |
 | RNG / dropout (`uniform_`, `normal_`, `bernoulli_`, `native_dropout` ± backward, `multinomial`) | 7 | Native | Yes | `test_random_ops.py` | Statistical checks, not exact-value |
-| Scaled dot-product attention (`_scaled_dot_product_attention_math`) | 1 | Native | Yes | `test_attention_norm_ops.py` | Causal, masks, GQA covered |
+| Scaled dot-product attention (`_fused_sdp_choice`, `_scaled_dot_product_fused_attention_overrideable`) | 2 | Native (inference) / Composite (training) | Yes | `test_attention_norm_ops.py` | Inference: fused path (decode: 3 kernels; prefill on AMD: vendor GEMMs with fp32 scores around one row-softmax kernel), as accurate as the fp32 math path. Training, dropout, unusual masks and `sdpa_kernel(MATH)`: PyTorch's math decomposition |
 | Multi-head attention (`_native_multi_head_attention` ± out, `_transform_bias_rescale_qkv`) | 3 | Native | **No** | — | No parity test yet |
 | Custom fused: `paras::rms_norm`, `swiglu`, `rotate_half` + backward | 6 | Native | Yes | `test_fused_ops.py` | Call via `torch.ops.paras.*` |
 | Custom fused: `torch_paras::swiglu` | 1 | Native (+CPU) | Yes | `test_attention_norm_ops.py` | Call via `torch.ops.torch_paras.swiglu` |
@@ -87,14 +97,15 @@ Everything else goes through the boxed CPU fallback registered in
 
 ## Known Gaps
 
-- Untested native kernels: scatter/`masked_fill`, convolution, batch/layer
+- Untested native kernels: `masked_fill`, convolution, batch/layer
   norm, multi-head attention, MSE/BCE losses, `avg_pool2d`, `max_pool2d`,
   non-nearest upsampling, and all vision backward kernels.
 - `swiglu` exists twice with different schemas: `paras::swiglu(gate, up)`
   in `fused_ops.cpp` and `torch_paras::swiglu(x, gate)` in
   `rms_swiglu_ops.cpp`. Consider consolidating.
-- No fallback-ratio measurement tooling yet for full models (tracked in
-  `docs/MODEL_VALIDATION.md` and Roadmap Milestone 3).
+- Convolution, pooling, upsampling and batch/layer norm still stage their
+  operands through host memory; `torch_paras.runtime_stats()` counts those
+  transfers, and strict mode (`PTSYCL_STRICT=1`) rejects any CPU fallback.
 - Autograd (backward-pass) coverage isn't tracked separately from forward
   coverage yet.
 
@@ -115,3 +126,5 @@ Everything else goes through the boxed CPU fallback registered in
    ```
    This includes the `torch_paras::swiglu` CPU registration, so
    subtract 1 for the native count.
+6. To see what a model actually runs off-device, run it once with
+   `torch_paras.reset_runtime_stats()` / `torch_paras.runtime_stats()`.

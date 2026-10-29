@@ -32,6 +32,8 @@ namespace ptsycl::clap_dnn {
 bool try_sigmoid_forward(const at::Tensor& self, at::Tensor& out);
 bool try_silu_forward(const at::Tensor& self, at::Tensor& out);
 
+bool activation_uses_vendor(int device_index, const std::string& dtype);
+
 bool is_enabled() noexcept;
 void reset_stats() noexcept;
 std::int64_t call_count() noexcept;

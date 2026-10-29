@@ -95,7 +95,9 @@ def _run_interleaved_cached_tensors(
 
     vendor = _gpu_dnn_vendor()[0]
     torch_paras._C.clap_dnn_reset_stats()
-    expected_calls = 3 * len(devices)
+    calls = 3 * len(devices)
+    on_paras = name == "silu" and vendor == "MIOpen"
+    expected_calls = 0 if on_paras else calls
 
     for _ in range(3):
         for x, out in zip(
@@ -119,8 +121,9 @@ def _run_interleaved_cached_tensors(
         f"{name}: expected {expected_calls} {vendor} calls, got {vendor_calls} "
         f"(last_backend={last_backend!r}, fallbacks={fallbacks})"
     )
-    assert fallbacks == 0
-    assert vendor.lower() in last_backend.lower()
+    assert fallbacks == (calls if on_paras else 0)
+    if not on_paras:
+        assert vendor.lower() in last_backend.lower()
 
 
 def test_clap_dnn_interleaved_cached_tensors(

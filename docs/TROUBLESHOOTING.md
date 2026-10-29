@@ -17,9 +17,8 @@ this file in the same PR.
   `PARAS_HOME`, `PTSYCL_GCC_TOOLCHAIN`, `PTSYCL_LLVM_DIR`,
   `PTSYCL_CUDA_HOME`, and `PTSYCL_PYTHON` — a stale environment from a
   previous shell session is a common cause of confusing errors.
-- The build is intentionally single-threaded (`-j1`) because `parascc`
-  names temporary files with second-resolution timestamps; a full CUDA
-  build taking ~15 minutes is expected, not a sign something is stuck.
+- `scripts/build.sh` builds in parallel. If an older `parascc` that names
+  temporary files by timestamp is in use, set `PTSYCL_BUILD_JOBS=1`.
 
 ### Wrong GPU architecture / CUDA build targets the wrong compute capability
 
@@ -73,6 +72,34 @@ or check `build/cpu` vs `build/cuda` to see which was built most recently.
   `docs/OPERATOR_COVERAGE.md` for whether the failing area has known
   gaps already.
 
+### `MIOpen ... attempt to write a readonly database` / `miopenActivationForward status=5`
+
+CLAP-DNN reached MIOpen, but MIOpen cannot write its kernel database (its
+default lives inside the installation). Point it at a writable directory:
+
+```bash
+export MIOPEN_USER_DB_PATH=$HOME/.cache/miopen/db
+export MIOPEN_CUSTOM_CACHE_DIR=$HOME/.cache/miopen/cache
+```
+
+### `CLAP-DNN ROCM backend unavailable, using ParaS kernels: ... missing symbol miopenGetLayerNormBackwardWorkspaceSize`
+
+CLAP-DNN requires MIOpen's layer-norm backward entry points; the MIOpen that
+ships with PyTorch's ROCm wheels does not have them, so the ROCm DNN backend
+cannot load. Torch-ParaS reports this once and runs sigmoid/SiLU on its own
+kernels (results are correct). CLAP-Library releases that load these two
+symbols optionally fix this; otherwise use a MIOpen that provides them, or
+build with `PTSYCL_ENABLE_CLAP=OFF` (CLAP BLAS is unaffected).
+
+### `opt_ready_stream && opt_parent_stream INTERNAL ASSERT FAILED` in a CUDA/ROCm backward
+
+Once `torch_paras` is imported, PyTorch treats the `paras` (PrivateUse1)
+backend as the process's accelerator (`torch.accelerator.current_accelerator()`),
+and its autograd engine tracks streams for that accelerator only: a backward
+pass on `cuda` tensors in the same process then fails with this assertion.
+Inference on both backends in one process works; run CUDA/ROCm training
+before importing `torch_paras`, or in a separate process.
+
 ### A model produces different output on `paras` vs `cpu`/`cuda`
 
 - Check `docs/OPERATOR_COVERAGE.md` for whether the ops involved are
@@ -91,6 +118,16 @@ or check `build/cpu` vs `build/cuda` to see which was built most recently.
   `docs/MODEL_VALIDATION.md` and `docs/OPERATOR_COVERAGE.md`.
 - If a *native* kernel regressed, see `docs/BENCHMARKS.md` and consider
   filing a performance-regression issue.
+- Host waiting on the GPU: Torch-ParaS sets `PARAS_ASYNC_KERNELS=1` so ParaS
+  returns from kernel launches, memsets and device copies without waiting.
+  ParaS-Compiler builds without that option wait after every command (for
+  Param2-17B decode, about 70 % of each token). Setting
+  `PARAS_ASYNC_KERNELS=0` restores synchronous launches, which helps when
+  locating a failing kernel.
+- bf16 matrix multiplies running as fp32 (`[ptsycl op] gemm.clap_device_fp32`
+  with `PTSYCL_LOG=2`): the installed CLAP's rocBLAS bf16 GEMM is
+  rejected by rocBLAS; a CLAP-Library with the bf16 datatype fix runs them
+  in bf16.
 
 ## Device Issues
 
