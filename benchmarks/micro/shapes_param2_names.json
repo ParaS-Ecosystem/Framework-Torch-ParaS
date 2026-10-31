@@ -1,0 +1,1 @@
+{"2048x3072": "qkv", "2048x2048": "o_proj / expert", "2048x9216": "dense gate/up", "9216x2048": "dense down", "2048x64": "router", "2048x128008": "lm_head"}

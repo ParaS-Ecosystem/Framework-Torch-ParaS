@@ -1,0 +1,17 @@
+{
+ "machine": "MI300X",
+ "gemm_geomean_speedup_paras_vs_native": {
+  "param2": 1.4571,
+  "operatorx": 1.3153
+ },
+ "gemm_shapes": {
+  "param2": 48,
+  "operatorx": 1635
+ },
+ "mem_bw_peak_gbps": {
+  "native": 3774.5,
+  "ParaS": 3741.8,
+  "native, ubenchX original script": 3852.6,
+  "InferenceX published MI300X (2026-10-09)": 3571.8
+ }
+}
