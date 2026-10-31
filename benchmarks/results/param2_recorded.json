@@ -1,0 +1,159 @@
+{
+ "model": "bharatgenai/Param2-17B-A2.4B-Thinking@65373af52e60e57dcb1ef235ffb827b8abdb4551",
+ "precision": "bfloat16",
+ "metrics": {
+  "decode b1": "decode, batch 1, 128 input tokens, 128 new: median time per output token (ms)",
+  "decode b16": "decode, batch 16, 128 input tokens, 128 new: median time per output token (ms)",
+  "prefill 2048": "prefill, batch 1, 2048 tokens: median latency (ms)",
+  "prefill 4096": "prefill, batch 1, 4096 tokens: median latency (ms)"
+ },
+ "configurations": [
+  "native eager",
+  "paras eager",
+  "paras fused",
+  "native compiled",
+  "paras compiled"
+ ],
+ "machines": {
+  "MI300X": {
+   "reference": {
+    "decode b1|native eager": 41.437,
+    "decode b1|paras eager": 30.114,
+    "decode b1|paras fused": 17.323,
+    "decode b1|native compiled": 45.859,
+    "decode b1|paras compiled": 9.9,
+    "decode b16|native eager": 118.847,
+    "decode b16|paras eager": 66.039,
+    "decode b16|paras fused": 21.014,
+    "decode b16|native compiled": 149.779,
+    "decode b16|paras compiled": 17.237,
+    "prefill 2048|native eager": 163.839,
+    "prefill 2048|paras eager": 137.14,
+    "prefill 2048|paras fused": 102.524,
+    "prefill 2048|native compiled": 195.635,
+    "prefill 2048|paras compiled": 96.697,
+    "prefill 4096|native eager": 180.931,
+    "prefill 4096|paras eager": 158.545,
+    "prefill 4096|paras fused": 188.259,
+    "prefill 4096|native compiled": 237.752,
+    "prefill 4096|paras compiled": 180.522
+   },
+   "published": {
+    "decode b1|native eager": 39.9,
+    "decode b1|paras eager": 27.68,
+    "decode b1|paras fused": 17.81,
+    "decode b1|native compiled": 50.27,
+    "decode b1|paras compiled": 10.17,
+    "decode b16|native eager": 116.4,
+    "decode b16|paras eager": 74.08,
+    "decode b16|paras fused": 21.43,
+    "decode b16|native compiled": 172.5,
+    "decode b16|paras compiled": 16.99,
+    "prefill 2048|native eager": 157.0,
+    "prefill 2048|paras eager": 137.1,
+    "prefill 2048|paras fused": 100.8,
+    "prefill 2048|native compiled": 212.2,
+    "prefill 2048|paras compiled": 96.3,
+    "prefill 4096|native eager": 186.7,
+    "prefill 4096|paras eager": 160.4,
+    "prefill 4096|paras fused": 186.1,
+    "prefill 4096|native compiled": 248.3,
+    "prefill 4096|paras compiled": 179.0
+   },
+   "greedy_digests": {
+    "native eager": {
+     "1": "b733fa9b8a9b",
+     "16": "d39835397da0"
+    },
+    "paras eager": {
+     "1": "d678cdb02878",
+     "16": "3183da2585b4"
+    },
+    "paras fused": {
+     "1": "c638cbd804c3",
+     "16": "f5131abe10e1"
+    },
+    "native compiled": {
+     "1": "02b2e0b28320",
+     "16": "90fe7e16623b"
+    },
+    "paras compiled": {
+     "1": "c638cbd804c3",
+     "16": "f5131abe10e1"
+    }
+   },
+   "perplexity": {
+    "native bfloat16": 17.5206,
+    "paras bfloat16": 17.5452
+   }
+  },
+  "GH200": {
+   "reference": {
+    "decode b1|native eager": 53.821,
+    "decode b1|paras eager": 44.123,
+    "decode b1|paras fused": 31.221,
+    "decode b1|native compiled": 61.053,
+    "decode b1|paras compiled": 17.099,
+    "decode b16|native eager": 167.055,
+    "decode b16|paras eager": 127.63,
+    "decode b16|paras fused": 38.106,
+    "decode b16|native compiled": 196.815,
+    "decode b16|paras compiled": 21.684,
+    "prefill 2048|native eager": 218.483,
+    "prefill 2048|paras eager": 255.555,
+    "prefill 2048|paras fused": 171.349,
+    "prefill 2048|native compiled": 258.093,
+    "prefill 2048|paras compiled": 163.453,
+    "prefill 4096|native eager": 225.747,
+    "prefill 4096|paras eager": 317.667,
+    "prefill 4096|paras fused": 221.043,
+    "prefill 4096|native compiled": 298.139,
+    "prefill 4096|paras compiled": 261.484
+   },
+   "published": {
+    "decode b1|native eager": 50.3,
+    "decode b1|paras eager": 45.66,
+    "decode b1|paras fused": 28.34,
+    "decode b1|native compiled": 71.49,
+    "decode b1|paras compiled": 17.15,
+    "decode b16|native eager": 144.6,
+    "decode b16|paras eager": 131.5,
+    "decode b16|paras fused": 32.63,
+    "decode b16|native compiled": 219.0,
+    "decode b16|paras compiled": 21.54,
+    "prefill 2048|native eager": 197.8,
+    "prefill 2048|paras eager": 263.8,
+    "prefill 2048|paras fused": 152.4,
+    "prefill 2048|native compiled": 287.8,
+    "prefill 2048|paras compiled": 156.6,
+    "prefill 4096|native eager": 216.7,
+    "prefill 4096|paras eager": 333.6,
+    "prefill 4096|paras fused": 213.7,
+    "prefill 4096|native compiled": 319.2,
+    "prefill 4096|paras compiled": 253.3
+   },
+   "greedy_digests": {
+    "native eager": {
+     "1": "1e4038d1dbbb",
+     "16": "c37a373648fc"
+    },
+    "paras eager": {
+     "1": "c20c4fe5b7f9",
+     "16": "4014f66bfbd0"
+    },
+    "paras fused": {
+     "1": "8c4ae6f6ce6b",
+     "16": "aad398305e97"
+    },
+    "native compiled": {
+     "1": "8c4ae6f6ce6b",
+     "16": "b764b794f0a7"
+    },
+    "paras compiled": {
+     "1": "8c4ae6f6ce6b",
+     "16": "aad398305e97"
+    }
+   }
+  }
+ }
+}
