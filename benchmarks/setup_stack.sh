@@ -129,6 +129,7 @@ if ! "$PY" -c "import torch, transformers, pyarrow, cmake, ninja" 2>/dev/null; t
   pipi "$PY" transformers==4.55.2 tokenizers==0.21.4 accelerate==1.14.0 safetensors==0.8.0 \
     huggingface_hub==0.36.2 hf-xet==1.6.0 pyarrow==26.0.0 psutil==7.2.2 cmake==3.31.6 ninja==1.13.0
 fi
+"$PY" -c "import pytest" 2>/dev/null || pipi "$PY" -r "$SRC/Framework-Torch-ParaS/requirements-test.txt"
 "$PY" -c "import torch, transformers; print('PyTorch', torch.__version__, '| transformers', transformers.__version__)"
 IXPY=$WORK/ixclient/bin/python
 if ! "$IXPY" -c "import aiohttp, transformers" 2>/dev/null; then

@@ -29,6 +29,9 @@ benchmarks/reproduce_param2.sh                  # Param2-17B, five configuration
 benchmarks/reproduce_inferencex.sh              # InferenceX serving, three configurations
 ```
 
+The environment also holds the Torch-ParaS test suite's requirements, so `tests/run_all.py` of the built source tree
+(`$REPRO_WORK/src/Framework-Torch-ParaS`) runs with `$PTSYCL_PYTHON` after `source $REPRO_WORK/env.sh`.
+
 `setup_stack.sh` needs no GPU, so it can run on a build node; the two `reproduce_*.sh` scripts must run on
 the GPU machine with the same `REPRO_WORK` path. Options of `setup_stack.sh`:
 - `REPRO_HF_HOME`: a Hugging Face cache that already holds the model, to avoid a second 35 GB download. Every model file is checked against the pinned revision either way: SHA-256 for the weights, the Git blob hash for the rest.
