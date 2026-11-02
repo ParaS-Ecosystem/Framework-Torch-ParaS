@@ -4,8 +4,91 @@
 
 #include <memory>
 #include <unordered_map>
+#include <stdexcept>
+#include <string>
+
+#include <cstdint>
+#include <dlfcn.h>
 
 namespace {
+
+#if defined(PTSYCL_CLAP_BLAS_CUDA) || defined(PTSYCL_BACKEND_CUDA)
+
+extern "C" int cudaGetDevice(int*);
+extern "C" int cudaSetDevice(int);
+
+using CuPointerGetAttributeFn =
+    int (*)(void*, int, std::uintptr_t);
+
+CuPointerGetAttributeFn cu_pointer_get_attribute()
+{
+    static CuPointerGetAttributeFn fn = [] {
+        void* lib = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!lib)
+            throw std::runtime_error("Unable to load libcuda.so.1");
+
+        void* sym = dlsym(lib, "cuPointerGetAttribute");
+        if (!sym)
+            throw std::runtime_error(
+                "Unable to load cuPointerGetAttribute");
+
+        return reinterpret_cast<CuPointerGetAttributeFn>(sym);
+    }();
+
+    return fn;
+}
+
+class CudaDeviceGuard {
+public:
+    explicit CudaDeviceGuard(const void* ptr)
+    {
+        int ptr_device = -1;
+
+        // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9
+        const int driver_status =
+            cu_pointer_get_attribute()(
+                &ptr_device,
+                9,
+                reinterpret_cast<std::uintptr_t>(ptr));
+
+        if (driver_status != 0) {
+            throw std::runtime_error(
+                "cuPointerGetAttribute DEVICE_ORDINAL failed: " +
+                std::to_string(driver_status));
+        }
+
+        const int get_status = cudaGetDevice(&previous_device_);
+        if (get_status != 0) {
+            throw std::runtime_error(
+                "cudaGetDevice failed: " +
+                std::to_string(get_status));
+        }
+
+        if (previous_device_ != ptr_device) {
+            const int set_status = cudaSetDevice(ptr_device);
+            if (set_status != 0) {
+                throw std::runtime_error(
+                    "cudaSetDevice failed: " +
+                    std::to_string(set_status));
+            }
+
+            restore_ = true;
+
+        }
+    }
+
+    ~CudaDeviceGuard() noexcept
+    {
+        if (restore_)
+            (void)cudaSetDevice(previous_device_);
+    }
+
+private:
+    int previous_device_ = -1;
+    bool restore_ = false;
+};
+
+#endif
 
 thread_local std::unique_ptr<clap::IBlasBackend> cached_cpu_backend;
 
@@ -121,6 +204,12 @@ extern "C" bool ptsycl_clap_blas_gemm_device_raw(
     int backend_type) noexcept
 {
     try {
+#if defined(PTSYCL_CLAP_BLAS_CUDA) || defined(PTSYCL_BACKEND_CUDA)
+        std::unique_ptr<CudaDeviceGuard> cuda_device_guard;
+        if (backend_type == 1)
+            cuda_device_guard = std::make_unique<CudaDeviceGuard>(out);
+#endif
+
         const auto type =
             backend_type == 1
                 ? clap::BackendType::CUDA

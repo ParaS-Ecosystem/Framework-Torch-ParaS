@@ -324,12 +324,24 @@ if(PTSYCL_ENABLE_CLAP OR PTSYCL_ENABLE_CLAP_BLAS)
                 "Host C++ compiler not found: ${PTSYCL_CLAP_HOST_CXX}")
         endif()
 
+        set(PTSYCL_CLAP_WRAPPER_BACKEND_DEFINE "")
+        if(PTSYCL_FLAVOR_DEFINE STREQUAL "PTSYCL_BACKEND_SYCL")
+            if(PTSYCL_PARASDEVICE_TARGET MATCHES "^cuda:")
+                set(PTSYCL_CLAP_WRAPPER_BACKEND_DEFINE
+                    "-DPTSYCL_CLAP_BLAS_CUDA")
+            elseif(PTSYCL_PARASDEVICE_TARGET MATCHES "^hip:")
+                set(PTSYCL_CLAP_WRAPPER_BACKEND_DEFINE
+                    "-DPTSYCL_CLAP_BLAS_ROCM")
+            endif()
+        endif()
+
         add_custom_command(
             OUTPUT "${PTSYCL_CLAP_WRAPPER_OBJ}"
             COMMAND "${PTSYCL_CLAP_HOST_CXX}"
                 -std=c++17
                 -fPIC
                 -O3
+                "${PTSYCL_CLAP_WRAPPER_BACKEND_DEFINE}"
                 "-I${PTSYCL_CLAP_INCLUDE_DIR}"
                 -c
                 "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ops/clap_blas_wrapper.cpp"
